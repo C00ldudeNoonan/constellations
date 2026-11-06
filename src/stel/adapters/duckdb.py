@@ -399,6 +399,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 WarehouseCapability.ATOMIC_PARENT_CHILD_REPLACE,
                 WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
+                WarehouseCapability.ORDERED_TABULAR_READS,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
@@ -1388,7 +1389,8 @@ class DuckDBAdapter(WarehouseAdapter):
             )
             reader = self._arrow_relation_reader(
                 cursor,
-                f"SELECT {projection} FROM {table_ref}{where_sql}",
+                f"SELECT {projection} FROM {table_ref}{where_sql}"
+                f"{self._order_sql(request)}",
                 params,
                 request.batch_size,
             )
@@ -1480,6 +1482,19 @@ class DuckDBAdapter(WarehouseAdapter):
             raise failure from failure_cause
         raise AssertionError("unreachable DuckDB table snapshot state")
 
+    def _order_sql(self, request: TableReadRequest) -> str:
+        """The ORDER BY a snapshot read and its validation re-read share.
+
+        NULLS FIRST is explicit: DuckDB defaults to NULLS LAST and BigQuery to
+        FIRST, and the contract is one order on every adapter.
+        """
+        if not request.order_by:
+            return ""
+        return " ORDER BY " + ", ".join(
+            f"{self.quote_ident(column)} ASC NULLS FIRST"
+            for column in request.order_by
+        )
+
     def _current_table_digest(self, request: TableReadRequest) -> str:
         cursor = self._cursor()
         params: list[Any] = []
@@ -1499,9 +1514,13 @@ class DuckDBAdapter(WarehouseAdapter):
                 if request.columns is None
                 else ", ".join(self.quote_ident(column) for column in request.columns)
             )
+            # The same order as the read being validated: the digest is over the
+            # rows in sequence, so a re-read in storage order would disagree
+            # with an ordered stream of an unchanged table.
             reader = self._arrow_relation_reader(
                 cursor,
-                f"SELECT {projection} FROM {table_ref}{where_sql}",
+                f"SELECT {projection} FROM {table_ref}{where_sql}"
+                f"{self._order_sql(request)}",
                 params,
                 request.batch_size,
             )

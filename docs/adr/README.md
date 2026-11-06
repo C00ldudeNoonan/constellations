@@ -61,6 +61,7 @@ history (issue #311).
 | [0049](0049-context-assembly-is-an-offline-experiment-before-serving-policy.md) | Context assembly is evaluated on frozen governed evidence before changing serving policy | accepted |
 | [0050](0050-a-backend-identity-covers-the-options-it-reaches.md) | A backend's identity covers the options definitions it reaches, not the whole options module | accepted |
 | [0051](0051-warehouse-native-vector-search-is-a-query-time-read-not-a-retrieval-store.md) | Warehouse-native vector search is a query-time read over the embeddings table, not a `RetrievalStore`; a `bigquery` store is deferred | accepted |
+| [0052](0052-embed-reads-its-upstream-in-the-targets-layout-order.md) | Embed reads its upstream in the target's partition-then-cluster order, through an `ordered_tabular_reads` adapter capability, so the pruned MERGE and reuse read-back prune | accepted |
 
 ## When to write one
 

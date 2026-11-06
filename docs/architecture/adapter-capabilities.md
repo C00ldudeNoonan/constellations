@@ -158,6 +158,11 @@ failure can temporarily leave the target unavailable.
   reads are unavailable.
 - Serving-sink publication requires `streaming_tabular_reads`; a pushed
   predicate additionally requires `tabular_predicate_pushdown`.
+- An embed model whose target declares a partition or clustering layout reads
+  its upstream with `order_by`, which requires `ordered_tabular_reads`, so
+  that each window is narrow in the columns its MERGE prunes on
+  ([ADR-0052](../adr/0052-embed-reads-its-upstream-in-the-targets-layout-order.md)).
+  Adapters without the capability read unordered and prune less.
 
 `compile` checks every model. Commands with selectors check the selected model
 workload, so an unsupported unselected model does not block an otherwise valid

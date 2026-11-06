@@ -26,6 +26,7 @@ import pytest
 from stel.adapters import LayoutPruningColumns
 from stel.adapters.base import NO_LAYOUT_PRUNING
 from stel.adapters.duckdb import DuckDBAdapter
+from stel.execution.checkpoint import FlushPublisher
 from stel.execution.contracts import RunError
 from stel.execution.embed import _EmbeddingReuseReader
 from stel.providers.deterministic import DeterministicEmbeddingProvider
@@ -1300,3 +1301,108 @@ def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(
             "symbol",
         ]
         assert ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)) in lookup
+
+
+# ─── windows are cut in layout order (issue #749) ────────────────────────────
+
+# Interleaved on purpose, in the order a warehouse is free to return them: each
+# neighbouring pair differs in symbol and in month, so windows cut from the
+# stream as it comes would span both symbols and both months.
+_UNORDERED_CHUNKS = [
+    ("c1", "AAPL", date(2026, 1, 5)),
+    ("c2", "MSFT", date(2026, 2, 9)),
+    ("c3", "AAPL", date(2026, 2, 2)),
+    ("c4", "MSFT", date(2026, 1, 7)),
+    ("c5", "AAPL", date(2026, 1, 6)),
+    ("c6", "MSFT", date(2026, 2, 10)),
+    ("c7", "AAPL", date(2026, 2, 3)),
+    ("c8", "MSFT", date(2026, 1, 8)),
+]
+_LAYOUT_ORDERED_WINDOWS = [["c1", "c5"], ["c4", "c8"], ["c3", "c7"], ["c2", "c6"]]
+
+
+def _layout_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An embed project whose upstream is the interleaved table above and whose
+    target declares a layout. DuckDB declares none of its own, so the layout the
+    BigQuery adapter would report for `sec_chunk_embeddings` is supplied."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        connection.execute(
+            "CREATE OR REPLACE TABLE docs.document_chunks "
+            "(chunk_id VARCHAR, text VARCHAR, filing_date DATE, symbol VARCHAR)"
+        )
+        connection.executemany(
+            "INSERT INTO docs.document_chunks VALUES (?, ?, ?, ?)",
+            [(cid, f"text {cid}", filed, symbol) for cid, symbol, filed in _UNORDERED_CHUNKS],
+        )
+    finally:
+        connection.close()
+    monkeypatch.setattr(
+        DuckDBAdapter,
+        "layout_pruning_columns",
+        lambda self, options: LayoutPruningColumns("filing_date", ("symbol",)),
+    )
+    return project
+
+
+def _record_windows(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """The ids of each window as it publishes, in publication order."""
+    windows: list[list[str]] = []
+    original = FlushPublisher.publish
+
+    def recording(self: FlushPublisher, *, state_records: Sequence[Any], **kwargs: Any) -> None:
+        windows.append([record.record_key for record in state_records])
+        original(self, state_records=state_records, **kwargs)
+
+    monkeypatch.setattr(FlushPublisher, "publish", recording)
+    return windows
+
+
+def test_windows_are_cut_narrow_in_the_targets_layout_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #749: a 128-row window drawn from across a 3.67M-row corpus spanned
+    nearly every month and dozens of symbols, so the pruned MERGE and the reuse
+    read-back skipped nothing -- ~46 GiB of BigQuery per window. Read in
+    partition-then-cluster order, each window is one symbol in one month, which
+    is the range the batch predicates are then built from."""
+    project = _layout_project(tmp_path, monkeypatch)
+    windows = _record_windows(monkeypatch)
+
+    run_project(project, select="document_embeddings")
+
+    assert windows == _LAYOUT_ORDERED_WINDOWS
+    placed = {cid: (symbol, filed) for cid, symbol, filed in _UNORDERED_CHUNKS}
+    for window in windows:
+        assert len({placed[cid][0] for cid in window}) == 1
+        assert len({placed[cid][1].month for cid in window}) == 1
+
+
+def test_a_resumed_run_cuts_the_windows_the_failed_run_had_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume has to cut the same windows (issue #749). The order ends in the
+    id, so rows tied on date and symbol break the same way on every read, and
+    the rows still to do keep their relative order. Without that, the windows
+    after a failure would be a different cut of the same rows and could be as
+    wide as the unordered ones."""
+    project = _layout_project(tmp_path, monkeypatch)
+    windows = _record_windows(monkeypatch)
+
+    with pytest.MonkeyPatch.context() as failing:
+        _fail_after(4, failing)
+        with pytest.raises(RunError):
+            run_project(project, select="document_embeddings")
+    # Two windows landed; the third died mid-way and is unpublished.
+    assert _embedded_count(project) == 4
+    published = windows[:2]
+    assert published == _LAYOUT_ORDERED_WINDOWS[:2]
+    windows.clear()
+
+    run_project(project, select="document_embeddings")
+
+    assert windows == _LAYOUT_ORDERED_WINDOWS[2:]
+    assert _embedded_count(project) == len(_UNORDERED_CHUNKS)

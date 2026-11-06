@@ -35,6 +35,7 @@ from ..adapters import (
     StateValue,
     TableSnapshotGenerationChangedError,
     WarehouseAdapter,
+    WarehouseCapability,
     layout_pruning_predicates,
 )
 from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
@@ -220,17 +221,27 @@ def _run_embed_model(
     # first provider call, and only on the *resume* path, where the run being
     # resumed has already proven the corpus is large (issue #401 follow-up).
     skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
+    layout_pruning = adapter.layout_pruning_columns(warehouse_opts)
     reuse_reader = (
         _EmbeddingReuseReader(
             adapter,
             model.name,
             config=config,
             config_hash=identity.config_hash,
-            pruning=adapter.layout_pruning_columns(warehouse_opts),
+            pruning=layout_pruning,
             timings=timings,
         )
         if is_incremental and not rebuild_target
         else None
+    )
+    # Windows are cut from the upstream stream, so their layout locality is the
+    # stream's. Every run benefits, a rebuild included: only its first window
+    # replaces the target, and each later one is a pruned MERGE.
+    read_order = _layout_read_order(
+        adapter,
+        layout_pruning,
+        upstream_columns=schema_probe.columns,
+        id_field=config.id_field,
     )
     # `resolve_embedding_options` above has already refused a profile block
     # naming another provider, so a block that exists is this model's.
@@ -435,6 +446,7 @@ def _run_embed_model(
             upstream,
             batch_size=_INPUT_BATCH_ROWS,
             predicate=list(read_predicates),
+            order_by=read_order or None,
         ) as snapshot:
             _refuse_unpublishable_upstream_columns(
                 snapshot.schema.names,
@@ -845,6 +857,43 @@ def _open_response_cache(
             f"Embed model '{model_name}': embedding.cache_path could not be "
             f"opened [{type(error).__name__}]"
         ) from None
+
+
+def _layout_read_order(
+    adapter: WarehouseAdapter,
+    pruning: LayoutPruningColumns,
+    *,
+    upstream_columns: Sequence[str],
+    id_field: str,
+) -> tuple[str, ...]:
+    """The column order to read the upstream in, so that each window of rows is
+    narrow in the target's partition and cluster columns (issue #749).
+
+    The pruned MERGE and the reuse read-back build their predicates from the
+    batch's own min/max and distinct values, so they prune exactly as far as
+    the batch is local. Rows in whatever order the warehouse returns them span
+    the whole corpus -- a 128-row window covered nearly every month and dozens
+    of symbols on a 3.67M-row table, and pruned almost nothing. Sorted by the
+    partition column, then the cluster columns, a window is a few symbols in a
+    few months.
+
+    The id comes last: it makes the order total, so a resumed run cuts the same
+    windows from the rows still to do. Layout columns the upstream does not
+    carry are left out -- the batch cannot be local in a column it lacks -- and
+    an adapter that cannot order a read, or a target with no layout, reads
+    unordered as before.
+    """
+    if not adapter.supports(WarehouseCapability.ORDERED_TABULAR_READS):
+        return ()
+    available = set(upstream_columns)
+    layout = tuple(
+        column
+        for column in pruning.columns
+        if column in available and column != id_field
+    )
+    if not layout:
+        return ()
+    return (*layout, id_field)
 
 
 def _validate_upstream_ids(

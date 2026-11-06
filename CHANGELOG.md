@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.25.0 - 2026-11-06
 
 - Embed reads its upstream in the target's partition-then-cluster order, so each
   window is narrow in the columns the layout-pruned MERGE and the reuse read-back

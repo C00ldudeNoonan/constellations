@@ -77,6 +77,7 @@ def _report_segment_progress(monkeypatch: pytest.MonkeyPatch) -> None:
                 completed=min(max(pulled["pages"] - 1, 0), 2),
                 rows=pulled["rows"],
                 generation="generation-a",
+                predicates="",
             )
 
         snapshot._batches = counted()

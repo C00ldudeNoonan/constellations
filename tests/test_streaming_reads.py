@@ -687,7 +687,10 @@ def _bigquery_adapter(client: _FakeBigQueryClient) -> BigQueryAdapter:
 
 
 def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> None:
-    sentinel = "sensitive-policy-literal"
+    # The newline keeps this on the query path: a value that cannot be written
+    # as a row-restriction literal is not segmented (issue #754), and it is the
+    # query path's binding that this test pins.
+    sentinel = "sensitive-policy-\nliteral"
     client = _FakeBigQueryClient(
         {
             "record_id": pa.array(["a", "b", "c"]),

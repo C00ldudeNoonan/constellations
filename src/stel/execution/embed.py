@@ -13,7 +13,7 @@ import concurrent.futures
 import logging
 import threading
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import closing, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from functools import partial
@@ -33,6 +33,7 @@ from ..adapters import (
     StateRecord,
     StateScope,
     StateValue,
+    TableReadSnapshot,
     TableSnapshotGenerationChangedError,
     WarehouseAdapter,
     WarehouseCapability,
@@ -442,11 +443,13 @@ def _run_embed_model(
         # no correspondence with the id pass above -- which matters, because
         # `table_snapshot` does not promise an ordering and the two passes are
         # separate snapshots.
-        with adapter.table_snapshot(
+        with _open_upstream_snapshot(
+            adapter,
             upstream,
+            model_name=model.name,
             batch_size=_INPUT_BATCH_ROWS,
-            predicate=list(read_predicates),
-            order_by=read_order or None,
+            predicates=list(read_predicates),
+            read_order=read_order,
         ) as snapshot:
             _refuse_unpublishable_upstream_columns(
                 snapshot.schema.names,
@@ -894,6 +897,64 @@ def _layout_read_order(
     if not layout:
         return ()
     return (*layout, id_field)
+
+
+@contextmanager
+def _open_upstream_snapshot(
+    adapter: WarehouseAdapter,
+    upstream: str,
+    *,
+    model_name: str,
+    batch_size: int,
+    predicates: list[ReadPredicate],
+    read_order: tuple[str, ...],
+) -> Iterator[TableReadSnapshot]:
+    """Open the upstream read, in `read_order` when there is one.
+
+    The ordering is a cost optimization, never a correctness requirement: a
+    window is correct however its rows were chosen, and only its pruning
+    depends on locality. So an ordered open that fails -- a warehouse can
+    refuse to sort a result this wide and this large (BigQuery's
+    "resources exceeded") -- falls back to the unordered read instead of
+    ending a run that has paid for nothing yet. The cost of the fallback is
+    the pre-#749 publish bill, so it is said out loud, not absorbed.
+
+    Only a failure to *open* is caught: the `yield` is outside the `try`, so an
+    error while streaming rows still ends the run. A changed table is not
+    retried either, because the unordered read would meet the same change.
+    The unordered read is the original call, with no `order_by` keyword, so an
+    adapter that predates the parameter is never handed it.
+    """
+    with ExitStack() as stack:
+        snapshot: TableReadSnapshot | None = None
+        if read_order:
+            try:
+                snapshot = stack.enter_context(
+                    adapter.table_snapshot(
+                        upstream,
+                        batch_size=batch_size,
+                        predicate=predicates,
+                        order_by=read_order,
+                    )
+                )
+            except TableSnapshotGenerationChangedError:
+                raise
+            except AdapterError as error:
+                log.warning(
+                    "Embed model '%s': reading '%s' in layout order failed (%s); "
+                    "reading it unordered. Publishing will prune less, so expect "
+                    "a larger warehouse bill for this run.",
+                    model_name,
+                    upstream,
+                    error,
+                )
+        if snapshot is None:
+            snapshot = stack.enter_context(
+                adapter.table_snapshot(
+                    upstream, batch_size=batch_size, predicate=predicates
+                )
+            )
+        yield snapshot
 
 
 def _validate_upstream_ids(

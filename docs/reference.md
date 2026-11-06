@@ -1875,6 +1875,38 @@ target does not have (declared after the table was built) is dropped from the
 lookup rather than failing it. A `DATETIME` layout column is bound as
 `DATETIME`, not as the `TIMESTAMP` a Python `datetime` otherwise binds as.
 
+**An `embed:` model reads its upstream in layout order** (issue #749). The
+batch's own values prune only as far as the batch is *local* in them, and an
+upstream read in whatever order the warehouse returns it spans the whole corpus:
+on astrolabe's table a 128-row window covered nearly every month and dozens of
+symbols, the range and the list were true of almost every block, and each window
+billed about 46 GiB before the provider was called. So when the target declares a
+layout, embed reads the upstream sorted by the partition column, then each
+clustering column, then the id (ascending, NULLs first), and a window becomes a
+few symbols in a few months. Only layout columns the upstream carries are used,
+and a target with no layout reads as before.
+
+- **The id ends the order**, so ties break the same way on every read and a
+  resumed run cuts the windows the failed run had left from the rows still to
+  do. This holds on BigQuery because a one-stream Storage Read session returns a
+  sorted query result in the order it was written; the Storage Read API does not
+  promise that, and a credential-gated test (`STEL_BQ_TEST_PROJECT`) checks it
+  against the real service. If it ever failed, windows would lose their locality
+  and the run would cost what it did before, with the same rows published.
+- **It costs a sort.** On BigQuery the ordered read is a query that sorts the
+  upstream, billed on the columns it reads, and on DuckDB the table is sorted
+  once to stream and once to validate the snapshot. Embed's upstream read was
+  already a `SELECT *` query on BigQuery, so the bytes read do not change.
+- **A warehouse that refuses the sort does not end the run.** A result this wide
+  and this large can fail to sort (BigQuery's "resources exceeded"). Ordering
+  only buys pruning, so embed logs a warning and reads the upstream unordered:
+  every window is still correct, the publish prunes less, and the bill for that
+  run is the pre-#749 one. Only a failure to *open* the ordered read falls back;
+  one that breaks while streaming ends the run.
+- **It needs the `ordered_tabular_reads` adapter capability**, which DuckDB and
+  BigQuery have. An adapter without it reads unordered. `transform:` merges are
+  not covered: they share the pruned MERGE, not this read.
+
 Both apply to the *declared* layout. An incremental target keeps its physical
 layout until `--full-refresh`, so a predicate on a column the table is not
 actually partitioned or clustered on skips nothing, and excludes nothing

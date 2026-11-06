@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import pickle
+import random
 import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -6103,3 +6104,77 @@ def test_a_snapshot_read_publishes_full_pages_end_to_end() -> None:
         f"pages were {pages}; the Storage Read stream's own batch sizes are "
         "reaching the publish loop instead of the configured batch_size (#452)"
     )
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_ordered_snapshot_arrives_in_order() -> None:
+    """Issue #749. Embed cuts its windows from this stream, and resume
+    determinism rests on a one-stream Storage Read session returning a query's
+    sorted destination table in the order it was written -- observed behaviour
+    the Storage Read API does not document. The fake storage client replays
+    whatever it is given, so only the real service can say whether the
+    assumption holds. Both shapes embed uses are read: a projection, and
+    `SELECT *`."""
+    rng = random.Random(749)
+    symbols = ["AAPL", "MSFT", "GOOG", "AMZN"]
+    rows = [
+        {
+            "id": f"id{index:05d}",
+            # Every 50th filing date is NULL: NULLS FIRST has to hold here too.
+            "filing_date": (
+                None
+                if index % 50 == 0
+                else date(2026, 1, 1) + timedelta(days=(index * 7) % 90)
+            ),
+            "symbol": symbols[index % len(symbols)],
+        }
+        for index in range(3000)
+    ]
+    rng.shuffle(rows)
+    expected = sorted(
+        rows,
+        key=lambda row: (
+            row["filing_date"] is not None,
+            row["filing_date"] or date.min,
+            row["symbol"],
+            row["id"],
+        ),
+    )
+    order_by = ("filing_date", "symbol", "id")
+
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "stel_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "filings",
+                pl.DataFrame(
+                    rows,
+                    schema={
+                        "id": pl.String,
+                        "filing_date": pl.Date,
+                        "symbol": pl.String,
+                    },
+                ),
+            )
+            for columns in (("id", "filing_date", "symbol"), None):
+                seen: list[str] = []
+                with adapter.table_snapshot(
+                    "filings", columns=columns, batch_size=400, order_by=order_by
+                ) as snapshot:
+                    for batch in snapshot:
+                        frame = pl.from_arrow(batch)
+                        assert isinstance(frame, pl.DataFrame)
+                        seen.extend(frame["id"].to_list())
+                assert seen == [row["id"] for row in expected], columns
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()

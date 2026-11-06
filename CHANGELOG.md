@@ -7,8 +7,9 @@
   prune on. Against a 3.67M-row BigQuery embeddings table those windows spanned
   nearly every month and dozens of symbols and pruned almost nothing. DuckDB and
   BigQuery gain an `ordered_tabular_reads` capability; the id ends the order, so a
-  resumed run cuts the windows the failed run had left. The prune guard is
-  unchanged (issue #749, ADR-0052).
+  resumed run cuts the windows the failed run had left. If the warehouse refuses
+  the sort, embed warns and reads unordered rather than failing the run. The prune
+  guard is unchanged (issue #749, ADR-0052).
 
 - Experimental `stel.context_assembly` and `stel.context_assembly_eval` Python
   APIs compare relevance/document order, exact-offset overlap removal, and bounded

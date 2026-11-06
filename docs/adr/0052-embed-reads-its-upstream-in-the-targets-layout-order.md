@@ -36,7 +36,14 @@ few symbols in a few months, and the existing pruning does its job unchanged.
   direct Storage Read and the key-segmented read cannot sort. The session
   reads the sorted destination table through one stream.
 - Embed asks only when the target declares a layout and the upstream carries at
-  least one of its columns. Otherwise the read is unchanged.
+  least one of its columns. Otherwise the read is unchanged, and the call carries
+  no `order_by` keyword at all, so an adapter that predates it is never handed it.
+- **An ordered open that fails falls back to the unordered read**, with a warning
+  that says the publish will prune less. Ordering buys pruning and nothing else, so
+  a warehouse refusing to sort a wide, large result (BigQuery's "resources
+  exceeded") must not end a run that has embedded nothing yet. Only the open falls
+  back: a read that fails while streaming has already put rows in a window and ends
+  the run. A changed table is not retried.
 
 ## Alternatives rejected
 
@@ -62,9 +69,16 @@ few symbols in a few months, and the existing pruning does its job unchanged.
   this adds the sort and nothing else.
 - Resume determinism depends on a BigQuery single-stream session returning a
   sorted destination table in the order it was written. That is how it
-  behaves, not something the Storage Read API documents. If it ever stopped,
-  windows would lose locality and cost would return to the old level; results
-  would stay correct.
+  behaves, not something the Storage Read API documents. A credential-gated test
+  (`STEL_BQ_TEST_PROJECT`) reads a shuffled 3,000-row table back in both shapes
+  embed uses and fails without the `ORDER BY`; it shows the mechanism, not that it
+  holds at corpus scale. If it ever stopped holding, windows would lose locality
+  and cost would return to the old level; results would stay correct.
+- The sort of a wide `SELECT *` at corpus scale is not exercised by any test. The
+  fallback above is the answer to it failing, and a run that took it is visible in
+  the warning. Sorting only the layout columns and id, and fetching text by id,
+  would avoid sorting wide rows; it was not built because it needs the text fetched
+  per window, which costs a scan of the text column each time.
 - **Not changed: the strays guard.** #749 asked for the prune guard to be
   scoped to the batch's range. That cannot be done: the guard exists to find
   target rows whose key is in the batch and whose layout values are *outside*

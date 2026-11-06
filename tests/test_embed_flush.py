@@ -12,6 +12,7 @@ cadence changes execution, never output.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -23,7 +24,7 @@ import duckdb
 import polars as pl
 import pytest
 
-from stel.adapters import LayoutPruningColumns
+from stel.adapters import AdapterError, LayoutPruningColumns
 from stel.adapters.base import NO_LAYOUT_PRUNING
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.execution.checkpoint import FlushPublisher
@@ -1406,3 +1407,119 @@ def test_a_resumed_run_cuts_the_windows_the_failed_run_had_left(
 
     assert windows == _LAYOUT_ORDERED_WINDOWS[2:]
     assert _embedded_count(project) == len(_UNORDERED_CHUNKS)
+
+
+def _snapshot_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """The keyword arguments of each `table_snapshot` open, in order."""
+    calls: list[dict[str, Any]] = []
+    original = DuckDBAdapter.table_snapshot
+
+    @contextmanager
+    def recording(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        calls.append(kwargs)
+        with original(self, *args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", recording)
+    return calls
+
+
+def test_a_run_with_no_layout_never_passes_order_by(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #752: embed used to hand `order_by=None` to every adapter on
+    every run. An adapter or double whose `table_snapshot` predates the keyword
+    would then fail a run that gains nothing from ordering. An unordered read is
+    the call it always was."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    calls = _snapshot_calls(monkeypatch)
+
+    run_project(project, select="document_embeddings")
+
+    assert calls
+    assert all("order_by" not in call for call in calls)
+
+
+def test_a_layout_run_opens_its_window_read_in_layout_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _layout_project(tmp_path, monkeypatch)
+    calls = _snapshot_calls(monkeypatch)
+
+    run_project(project, select="document_embeddings")
+
+    ordered = [call["order_by"] for call in calls if "order_by" in call]
+    assert ordered == [("filing_date", "symbol", "chunk_id")]
+
+
+def test_an_ordered_open_that_fails_falls_back_to_an_unordered_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review of #752: the ordered read sorts the whole upstream, and a
+    warehouse can refuse that (BigQuery's 'resources exceeded' on a wide
+    result). Ordering only buys pruning; no window is wrong without it. So the
+    run takes the pre-#749 read and says what that costs, rather than dying
+    before it has embedded anything."""
+    project = _layout_project(tmp_path, monkeypatch)
+    original = DuckDBAdapter.table_snapshot
+    opens: list[bool] = []
+
+    @contextmanager
+    def refusing_to_sort(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        opens.append("order_by" in kwargs)
+        if "order_by" in kwargs:
+            raise AdapterError("simulated: result too large to sort")
+        with original(self, *args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", refusing_to_sort)
+
+    with caplog.at_level(logging.WARNING, logger="stel.execution.embed"):
+        run_project(project, select="document_embeddings")
+
+    assert _embedded_count(project) == len(_UNORDERED_CHUNKS)
+    # The id pass opens unordered too; the window read tried ordered, then not.
+    assert opens.count(True) == 1
+    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "reading it unordered" in warning
+    assert "simulated: result too large to sort" in warning
+
+
+def test_a_failure_while_streaming_an_ordered_read_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the *open* falls back. A read that fails part-way has already
+    yielded rows into a window, and re-reading unordered would hand the run
+    those rows twice; the failure has to end the run."""
+    project = _layout_project(tmp_path, monkeypatch)
+    original = DuckDBAdapter.table_snapshot
+    ordered_opens = 0
+
+    class _FailingSnapshot:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def __iter__(self) -> Iterator[Any]:
+            raise AdapterError("simulated: stream broke")
+
+    @contextmanager
+    def breaking(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        nonlocal ordered_opens
+        with original(self, *args, **kwargs) as snapshot:
+            if "order_by" in kwargs:
+                ordered_opens += 1
+                yield _FailingSnapshot(snapshot)
+            else:
+                yield snapshot
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", breaking)
+
+    with pytest.raises(AdapterError, match="stream broke"):
+        run_project(project, select="document_embeddings")
+
+    assert ordered_opens == 1

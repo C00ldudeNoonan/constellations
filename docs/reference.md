@@ -410,6 +410,7 @@ stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--accept-cost] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
+stel plan --pending [--select EXPR] [--json] [--dry-run] [--include-changed]  # upstream rows waiting for a run; exit 3 when any, 0 when none
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -802,6 +803,48 @@ target, and preflight — and writes `target/plan.json`, which `--json` prints
 to stdout for an orchestrator gate. `stel plan` itself never fails on a large
 reprocess; it reports, and its footer names the models a run would refuse
 under the guard below.
+
+### Asking whether there is work: `stel plan --pending`
+
+`stel plan` compares code versions against rows already published, so it
+cannot see rows that arrived upstream since the last run. `--pending` asks that
+question, for an orchestrator deciding whether to start a run. Per selected
+embed, chunk or incremental transform model it reports, from the data and
+`stel_state` alone:
+
+- **`new_rows`**: distinct upstream keys with no state row. Exact. A NULL key
+  is never counted (no run publishes one). The key column must be a string or
+  an integer: state keys are stored as text, and only those types print the
+  same in every warehouse, so any other key type reports `unsupported`.
+- **`partition_min` / `partition_max` / `oldest_pending`**: the span of the
+  pending rows in the model's partition column, and the oldest value, so a
+  caller can build a `--read-filter` that narrows the run or alert on
+  staleness. **`cluster_distinct`** is the distinct count of the first cluster
+  column. These need the target to declare `partition_by` / `cluster_by`
+  columns that the upstream also carries; otherwise they are null.
+- **`deleted_rows`**: state rows whose upstream row is gone, counted
+  separately from `new_rows`, since a subset run never deletes them. A full run
+  does delete them, so a model with deleted rows is `pending`.
+- **`changed_rows`** is null unless you pass `--include-changed`, and
+  `changed_reason` says why. A changed row has a state row, and telling it from
+  an unchanged one needs the row's content fingerprint, which reads every
+  column of the upstream. The default report reads the key, partition and
+  cluster columns only, so it can run at sensor frequency; `--include-changed`
+  streams the whole upstream for embed and chunk models and counts rows whose
+  input fingerprint differs from the one state recorded (the runners' own
+  fingerprint, so it cannot drift). Price it first with `--dry-run`. A
+  transform's fingerprint also covers its reference tables, so it stays null.
+  A row whose only change is the model's `code_version` is `stel plan`'s
+  business, not this count.
+
+Any other kind reports `unsupported`; an upstream that does not exist yet
+reports `upstream_missing`. The exit code is **3** when any model has pending
+rows and **0** when none do (1 is an error), so a sensor can branch without
+parsing. `--dry-run` reads nothing, so it exits 0 whatever is waiting, and
+`upstream_missing` and `unsupported` models are not pending; read the `status`
+in the JSON when that distinction matters. `--json` prints `target/pending.json` (`schema_version: 1`).
+`--dry-run` reads nothing and, on BigQuery, prints the bytes the two
+statements would bill; DuckDB does not bill by bytes, so it reports null.
 
 ### Refusing to spend: `on_code_change`
 
@@ -6544,6 +6587,11 @@ run results under `target-path`:
   next run would reprocess (with `reprocess_is_upper_bound` when an upstream
   change makes that a ceiling), the upstream models that caused it, and the
   estimated provider calls. `schema_version: 1`. `--json` prints it.
+- **`pending.json`** — written by `stel plan --pending`: per selected model,
+  status (`pending`, `none`, `unsupported`, `upstream_missing`, `dry_run`),
+  `new_rows`, `deleted_rows`, the partition span and oldest pending value,
+  the first cluster column's distinct count, and the bytes estimate.
+  `changed_rows` is null unless `--include-changed`. `schema_version: 1`. `--json` prints it.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`stel docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `stel docs serve`.

@@ -55,6 +55,11 @@ from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .orphans import find_orphans, format_orphans
 from .paths import resolve_within_project
+from .pending import (
+    format_pending_table,
+    pending_project,
+    write_pending_artifact,
+)
 from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
 from .profile import (
     ProfileError,
@@ -1044,6 +1049,32 @@ def _model_kind(model: ModelConfig) -> str:
     is_flag=True,
     help="Print target/plan.json to stdout instead of the table.",
 )
+@click.option(
+    "--pending",
+    is_flag=True,
+    help=(
+        "Report upstream rows no state row covers yet (new) and state rows "
+        "whose upstream row is gone (deleted), per model, reading key and "
+        "layout columns only. Exits 3 when any model has pending rows, 0 when "
+        "none; writes target/pending.json."
+    ),
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    help="With --pending: print the bytes estimate and read nothing.",
+)
+@click.option(
+    "--include-changed",
+    "include_changed",
+    is_flag=True,
+    help=(
+        "With --pending: also count rows whose input changed since they were "
+        "published. Reads every column of the upstream, so price it first "
+        "with --dry-run."
+    ),
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -1053,6 +1084,9 @@ def plan(
     exclude: str | None,
     reprocess_all: bool,
     json_output: bool,
+    pending: bool,
+    dry_run: bool,
+    include_changed: bool,
     verbose: int,
     diagnostics_file: Path | None,
 ) -> None:
@@ -1068,6 +1102,34 @@ def plan(
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
     _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=json_output)
+    if (dry_run or include_changed) and not pending:
+        raise click.UsageError("--dry-run and --include-changed apply to --pending only.")
+    if pending:
+        if reprocess_all:
+            raise click.UsageError("--reprocess-all does not apply to --pending.")
+        try:
+            report = pending_project(
+                project_dir,
+                select=select,
+                exclude=exclude,
+                target=target,
+                profiles_dir=profiles_dir,
+                dry_run=dry_run,
+                include_changed=include_changed,
+            )
+        except _CONFIG_ERRORS as e:
+            raise ConfigClickError(str(e)) from e
+        except (SelectionError, PlanError) as e:
+            raise click.ClickException(str(e)) from e
+        pending_artifact = write_pending_artifact(project_dir, report)
+        if json_output:
+            click.echo(pending_artifact.read_text(encoding="utf-8"))
+        elif not report.models:
+            click.echo("No models selected.")
+        else:
+            for line in format_pending_table(report):
+                click.echo(line)
+        ctx.exit(report.exit_code)
     try:
         result = plan_project(
             project_dir,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,9 @@ from .transforms import transform_code_version_identity
 from .vocabulary_sources import require_resolved_vocabularies
 
 _HASH_CHUNK_SIZE = 1024 * 1024
+# 8 bytes: enough to tell two values of one field apart in a plan line, short
+# enough to read.
+_COMPONENT_DIGEST_SIZE = 8
 _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
     {
         "api_key_env",
@@ -97,7 +101,7 @@ _LLM_EXECUTION_FIELDS = frozenset(
 )
 
 
-def compute_code_version(
+def code_version_payload(
     *,
     extraction: ExtractionConfig | None,
     transform: TransformConfig | None,
@@ -117,7 +121,11 @@ def compute_code_version(
     agent_context: AgentContextConfig | None = None,
     unique_key: str | None = None,
     on_schema_change: str | None = None,
-) -> str:
+) -> dict[str, Any]:
+    """The mapping `code_version` is the digest of (issue #750).
+
+    Split out so the same mapping can be broken into its identity fields: a
+    digest alone cannot say which input moved."""
     payload: dict[str, Any] = {
         # flush_every shapes execution (memory/flush cadence), never output
         # content — including it would invalidate every model's incremental
@@ -245,9 +253,48 @@ def compute_code_version(
                 _hash_file(sql_file) if sql_file.exists() else "missing"
             )
 
-    canonical = canonical_json(payload)
+    return payload
+
+
+def _digest_payload(payload: Mapping[str, Any]) -> str:
     return hashlib.blake2b(
-        canonical.encode(), digest_size=HASH_DIGEST_SIZE
+        canonical_json(payload).encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+
+
+def compute_code_version(**inputs: Any) -> str:
+    return _digest_payload(code_version_payload(**inputs))
+
+
+@dataclass(frozen=True)
+class CodeIdentity:
+    """A model's `code_version` and the identity fields it was derived from.
+
+    `components` maps a field name to a short digest of its value, one level
+    deep so a nested entry such as `extraction.backend_implementation` is named
+    on its own. Digests, not values: options and prompts can be sensitive, and
+    this is persisted (issue #750)."""
+
+    code_version: str
+    components: dict[str, str]
+
+
+def identity_components(payload: Mapping[str, Any]) -> dict[str, str]:
+    components: dict[str, str] = {}
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if isinstance(value, Mapping) and value:
+            for sub_key, sub_value in value.items():
+                components[f"{key}.{sub_key}"] = _component_digest(sub_value)
+        else:
+            components[key] = _component_digest(value)
+    return components
+
+
+def _component_digest(value: Any) -> str:
+    return hashlib.blake2b(
+        canonical_json(value).encode(), digest_size=_COMPONENT_DIGEST_SIZE
     ).hexdigest()
 
 
@@ -258,6 +305,31 @@ def compute_model_code_version(
     *,
     resolved: ResolvedProfile | None = None,
 ) -> str:
+    return compute_model_code_identity(
+        model, project, project_dir, resolved=resolved
+    ).code_version
+
+
+def compute_model_code_identity(
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    *,
+    resolved: ResolvedProfile | None = None,
+) -> CodeIdentity:
+    payload = _model_code_version_payload(model, project, project_dir, resolved=resolved)
+    return CodeIdentity(
+        code_version=_digest_payload(payload), components=identity_components(payload)
+    )
+
+
+def _model_code_version_payload(
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    *,
+    resolved: ResolvedProfile | None = None,
+) -> dict[str, Any]:
     effective_extraction: dict[str, Any] | None = None
     require_resolved_vocabularies(project)
     effective_transform: dict[str, Any] | None = None
@@ -332,7 +404,7 @@ def compute_model_code_version(
             ).to_dict(),
         }
 
-    return compute_code_version(
+    return code_version_payload(
         extraction=model.extraction,
         transform=model.transform,
         ml=model.ml,

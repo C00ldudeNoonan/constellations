@@ -2235,8 +2235,11 @@ to see the plan first."""
             if request.cluster_column is not None
             else None
         )
+        # Distinct keys, not rows: a key repeated upstream is one record to
+        # the runners. A NULL key never matches a state row, so it is left
+        # out rather than reported as pending forever.
         select = [
-            "COUNT(*)",
+            f"COUNT(DISTINCT up.{key})",
             f"MIN(up.{partition})" if partition else "NULL",
             f"MAX(up.{partition})" if partition else "NULL",
             f"COUNT(DISTINCT up.{cluster})" if cluster else "NULL",
@@ -2247,7 +2250,7 @@ to see the plan first."""
         )
         new_sql = (
             f"SELECT {', '.join(select)} FROM {upstream} AS up "
-            f"WHERE NOT EXISTS ({in_state}"
+            f"WHERE up.{key} IS NOT NULL AND NOT EXISTS ({in_state}"
             f"AND st.record_key = {self.cast_to_text(f'up.{key}')})"
         )
         deleted_sql = (
@@ -2258,7 +2261,10 @@ to see the plan first."""
         )
         if not state_exists:
             # Nothing has been published, so every upstream row is new.
-            all_sql = f"SELECT {', '.join(select)} FROM {upstream} AS up"
+            all_sql = (
+                f"SELECT {', '.join(select)} FROM {upstream} AS up "
+                f"WHERE up.{key} IS NOT NULL"
+            )
             return all_sql, "SELECT 0", []
         scope = request.scope
         return (

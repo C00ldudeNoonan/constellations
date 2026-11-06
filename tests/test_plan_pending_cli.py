@@ -152,3 +152,24 @@ def test_include_changed_requires_pending(rag_project: Path) -> None:
     )
     assert result.exit_code == 2
     assert "--pending" in result.output
+
+
+def test_deleted_only_rows_make_a_model_pending(rag_project: Path) -> None:
+    """A run deletes state for rows gone upstream, so a model whose only
+    difference is an orphaned state row still has work (issue #751)."""
+    run_project(rag_project)
+    project, _, _ = load_project(rag_project)
+    resolved = resolve_profile(project, rag_project, target=None, profiles_dir=None)
+    with create_adapter(resolved.warehouse, project_dir=rag_project) as adapter:
+        state = f"{adapter.schema_ref}.{adapter.quote_ident('stel_state')}"
+        adapter.execute(
+            f"INSERT INTO {state} SELECT * REPLACE ('orphan-key' AS record_key) FROM {state} "
+            "WHERE model_name = 'chunk_embeddings' LIMIT 1"
+        )
+
+    code, report = _pending(rag_project, "--select", "chunk_embeddings")
+
+    assert code == 3
+    (model,) = report["models"]
+    assert (model["status"], model["new_rows"], model["deleted_rows"]) == ("pending", 0, 1)
+    assert "no upstream row" in model["reason"]

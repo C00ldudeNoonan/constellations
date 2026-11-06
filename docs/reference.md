@@ -812,7 +812,10 @@ question, for an orchestrator deciding whether to start a run. Per selected
 embed, chunk or incremental transform model it reports, from the data and
 `stel_state` alone:
 
-- **`new_rows`**: upstream rows whose key has no state row. Exact.
+- **`new_rows`**: distinct upstream keys with no state row. Exact. A NULL key
+  is never counted (no run publishes one). The key column must be a string or
+  an integer: state keys are stored as text, and only those types print the
+  same in every warehouse, so any other key type reports `unsupported`.
 - **`partition_min` / `partition_max` / `oldest_pending`**: the span of the
   pending rows in the model's partition column, and the oldest value, so a
   caller can build a `--read-filter` that narrows the run or alert on
@@ -820,7 +823,8 @@ embed, chunk or incremental transform model it reports, from the data and
   column. These need the target to declare `partition_by` / `cluster_by`
   columns that the upstream also carries; otherwise they are null.
 - **`deleted_rows`**: state rows whose upstream row is gone, counted
-  separately, since a subset run never deletes them.
+  separately from `new_rows`, since a subset run never deletes them. A full run
+  does delete them, so a model with deleted rows is `pending`.
 - **`changed_rows`** is null unless you pass `--include-changed`, and
   `changed_reason` says why. A changed row has a state row, and telling it from
   an unchanged one needs the row's content fingerprint, which reads every
@@ -836,7 +840,9 @@ embed, chunk or incremental transform model it reports, from the data and
 Any other kind reports `unsupported`; an upstream that does not exist yet
 reports `upstream_missing`. The exit code is **3** when any model has pending
 rows and **0** when none do (1 is an error), so a sensor can branch without
-parsing. `--json` prints `target/pending.json` (`schema_version: 1`).
+parsing. `--dry-run` reads nothing, so it exits 0 whatever is waiting, and
+`upstream_missing` and `unsupported` models are not pending; read the `status`
+in the JSON when that distinction matters. `--json` prints `target/pending.json` (`schema_version: 1`).
 `--dry-run` reads nothing and, on BigQuery, prints the bytes the two
 statements would bill; DuckDB does not bill by bytes, so it reports null.
 

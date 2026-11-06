@@ -95,3 +95,43 @@ def test_dry_run_reads_nothing(tmp_path: Path) -> None:
 
     assert summary.new_rows == 0
     assert summary.estimated_bytes is None  # DuckDB does not bill by bytes
+
+
+def test_null_keys_are_skipped_and_repeated_keys_count_once(tmp_path: Path) -> None:
+    """A NULL key never matches a state row, and a repeated key is one record
+    to the runners, so neither may inflate `new_rows` (issue #751)."""
+    with _adapter(tmp_path) as adapter:
+        _seed_upstream(adapter, [(1, "2026-01-05", "AAA"), (1, "2026-01-06", "AAA")])
+        adapter.execute(
+            f"INSERT INTO {adapter.table_ref('chunks')} VALUES (NULL, DATE '2026-01-07', 'AAA')"
+        )
+        adapter.upsert_state(StateScope("embeddings"), [StateRecord("9", "fp", "v1")])
+
+        summary = adapter.pending_upstream(_request(), dry_run=False)
+        fresh = adapter.pending_upstream(_request(scope=StateScope("never_run")), dry_run=False)
+
+    assert summary.new_rows == 1
+    assert fresh.new_rows == 1
+
+
+def test_a_key_type_whose_text_differs_by_warehouse_is_unsupported(tmp_path: Path) -> None:
+    """State keys are Python `str(value)`; `CAST(true AS VARCHAR)` is 'true', so
+    comparing them in SQL would report every row as new and deleted."""
+    from types import SimpleNamespace
+
+    from stel.pending import PendingSource, _pending_for_model
+
+    with _adapter(tmp_path) as adapter:
+        adapter.execute(f"CREATE TABLE {adapter.table_ref('flags')} (flag BOOLEAN)")
+        model = SimpleNamespace(name="m", kind_label=lambda: "embed")
+
+        result = _pending_for_model(
+            model,  # ty: ignore[invalid-argument-type]
+            PendingSource("flags", "flag"),
+            adapter=adapter,
+            dry_run=False,
+            include_changed=False,
+        )
+
+    assert result.status == "unsupported"
+    assert "string and integer" in result.reason

@@ -136,6 +136,7 @@ class PendingReport:
     target: dict[str, Any]
     generated_at: str
     dry_run: bool
+    artifact_dir: Path
 
     @property
     def has_pending(self) -> bool:
@@ -226,11 +227,26 @@ def _pending_for_model(
             upstream=source.upstream,
             key_column=source.key_column,
         )
-    available = set(adapter.read_table_schema(source.upstream).columns)
+    schema = adapter.read_table_schema(source.upstream)
+    available = set(schema.columns)
     if source.key_column not in available:
         raise PlanError(
             f"Model '{model.name}': upstream '{source.upstream}' has no "
             f"`{source.key_column}` column. Available: {sorted(available)}"
+        )
+    key_type = schema.schema[source.key_column]
+    if not (key_type == pl.String or key_type.is_integer()):
+        # State keys are Python `str(value)`; only strings and integers have
+        # the same text in every warehouse's CAST, so any other type would
+        # report every row as both new and deleted.
+        return ModelPending(
+            model.name,
+            kind,
+            "unsupported",
+            f"key column `{source.key_column}` is {key_type}; only string and "
+            "integer keys can be compared with state from SQL",
+            upstream=source.upstream,
+            key_column=source.key_column,
         )
     layout = adapter.layout_pruning_columns(warehouse_options(adapter, model))
     partition = layout.range_column if layout.range_column in available else None
@@ -248,6 +264,12 @@ def _pending_for_model(
         ),
         dry_run=dry_run,
     )
+    identity: dict[str, Any] = {
+        "upstream": source.upstream,
+        "key_column": source.key_column,
+        "partition_column": partition,
+        "cluster_column": cluster,
+    }
     changed_reason = CHANGED_REASON
     if source.fingerprint is None:
         changed_reason = TRANSFORM_CHANGED_REASON
@@ -266,33 +288,29 @@ def _pending_for_model(
             kind,
             "dry_run",
             "dry run: nothing was read",
-            upstream=source.upstream,
-            key_column=source.key_column,
-            partition_column=partition,
-            cluster_column=cluster,
+            **identity,
             estimated_bytes=estimated,
             changed_reason=changed_reason,
         )
     changed_rows = (
         _count_changed(model, source, adapter=adapter) if full_scan else None
     )
-    pending = summary.new_rows > 0 or bool(changed_rows)
+    # A run deletes state (and the rows it published) for upstream rows that
+    # are gone, so removals are work too.
+    pending = summary.new_rows > 0 or summary.deleted_rows > 0 or bool(changed_rows)
     return ModelPending(
         model.name,
         kind,
         "pending" if pending else "none",
         (
-            _pending_reason(summary.new_rows, changed_rows)
+            _pending_reason(summary.new_rows, summary.deleted_rows, changed_rows)
             if pending
-            else "every upstream key has a state row"
+            else "every upstream key has a state row and no state row is orphaned"
         ),
-        upstream=source.upstream,
-        key_column=source.key_column,
+        **identity,
         new_rows=summary.new_rows,
-        partition_column=partition,
         partition_min=_render(summary.partition_min),
         partition_max=_render(summary.partition_max),
-        cluster_column=cluster,
         cluster_distinct=summary.cluster_distinct,
         deleted_rows=summary.deleted_rows,
         estimated_bytes=summary.estimated_bytes,
@@ -301,8 +319,10 @@ def _pending_for_model(
     )
 
 
-def _pending_reason(new_rows: int, changed_rows: int | None) -> str:
+def _pending_reason(new_rows: int, deleted_rows: int, changed_rows: int | None) -> str:
     reason = f"{new_rows} upstream row(s) have no state row"
+    if deleted_rows:
+        reason += f"; {deleted_rows} state row(s) have no upstream row"
     if changed_rows:
         reason += f"; {changed_rows} have a different input fingerprint"
     return reason
@@ -406,14 +426,13 @@ def pending_project(
         },
         generated_at=datetime.now(UTC).isoformat(),
         dry_run=dry_run,
+        artifact_dir=(project_dir / project.target_path).resolve(),
     )
 
 
 def write_pending_artifact(project_dir: Path, report: PendingReport) -> Path:
-    project = load_project(project_dir)[0]
-    target_dir = (project_dir / project.target_path).resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
-    out = target_dir / PENDING_FILENAME
+    report.artifact_dir.mkdir(parents=True, exist_ok=True)
+    out = report.artifact_dir / PENDING_FILENAME
     out.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
     return out
 

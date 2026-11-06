@@ -36,6 +36,7 @@ class SerializedAdapter:
         batch_size: int = 10_000,
         predicate: Any = None,
         key_column: str | None = None,
+        order_by: Sequence[str] | None = None,
     ) -> Iterator[TableReadSnapshot]:
         """Guard the open; stream unlocked (issue #432).
 
@@ -59,6 +60,7 @@ class SerializedAdapter:
                 batch_size=batch_size,
                 predicate=predicate,
                 key_column=key_column,
+                order_by=order_by,
             )
             snapshot = manager.__enter__()
         try:

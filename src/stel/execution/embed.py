@@ -13,7 +13,7 @@ import concurrent.futures
 import logging
 import threading
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import closing, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from functools import partial
@@ -33,8 +33,10 @@ from ..adapters import (
     StateRecord,
     StateScope,
     StateValue,
+    TableReadSnapshot,
     TableSnapshotGenerationChangedError,
     WarehouseAdapter,
+    WarehouseCapability,
     layout_pruning_predicates,
 )
 from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
@@ -220,17 +222,27 @@ def _run_embed_model(
     # first provider call, and only on the *resume* path, where the run being
     # resumed has already proven the corpus is large (issue #401 follow-up).
     skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
+    layout_pruning = adapter.layout_pruning_columns(warehouse_opts)
     reuse_reader = (
         _EmbeddingReuseReader(
             adapter,
             model.name,
             config=config,
             config_hash=identity.config_hash,
-            pruning=adapter.layout_pruning_columns(warehouse_opts),
+            pruning=layout_pruning,
             timings=timings,
         )
         if is_incremental and not rebuild_target
         else None
+    )
+    # Windows are cut from the upstream stream, so their layout locality is the
+    # stream's. Every run benefits, a rebuild included: only its first window
+    # replaces the target, and each later one is a pruned MERGE.
+    read_order = _layout_read_order(
+        adapter,
+        layout_pruning,
+        upstream_columns=schema_probe.columns,
+        id_field=config.id_field,
     )
     # `resolve_embedding_options` above has already refused a profile block
     # naming another provider, so a block that exists is this model's.
@@ -431,10 +443,13 @@ def _run_embed_model(
         # no correspondence with the id pass above -- which matters, because
         # `table_snapshot` does not promise an ordering and the two passes are
         # separate snapshots.
-        with adapter.table_snapshot(
+        with _open_upstream_snapshot(
+            adapter,
             upstream,
+            model_name=model.name,
             batch_size=_INPUT_BATCH_ROWS,
-            predicate=list(read_predicates),
+            predicates=list(read_predicates),
+            read_order=read_order,
         ) as snapshot:
             _refuse_unpublishable_upstream_columns(
                 snapshot.schema.names,
@@ -845,6 +860,101 @@ def _open_response_cache(
             f"Embed model '{model_name}': embedding.cache_path could not be "
             f"opened [{type(error).__name__}]"
         ) from None
+
+
+def _layout_read_order(
+    adapter: WarehouseAdapter,
+    pruning: LayoutPruningColumns,
+    *,
+    upstream_columns: Sequence[str],
+    id_field: str,
+) -> tuple[str, ...]:
+    """The column order to read the upstream in, so that each window of rows is
+    narrow in the target's partition and cluster columns (issue #749).
+
+    The pruned MERGE and the reuse read-back build their predicates from the
+    batch's own min/max and distinct values, so they prune exactly as far as
+    the batch is local. Rows in whatever order the warehouse returns them span
+    the whole corpus -- a 128-row window covered nearly every month and dozens
+    of symbols on a 3.67M-row table, and pruned almost nothing. Sorted by the
+    partition column, then the cluster columns, a window is a few symbols in a
+    few months.
+
+    The id comes last: it makes the order total, so a resumed run cuts the same
+    windows from the rows still to do. Layout columns the upstream does not
+    carry are left out -- the batch cannot be local in a column it lacks -- and
+    an adapter that cannot order a read, or a target with no layout, reads
+    unordered as before.
+    """
+    if not adapter.supports(WarehouseCapability.ORDERED_TABULAR_READS):
+        return ()
+    available = set(upstream_columns)
+    layout = tuple(
+        column
+        for column in pruning.columns
+        if column in available and column != id_field
+    )
+    if not layout:
+        return ()
+    return (*layout, id_field)
+
+
+@contextmanager
+def _open_upstream_snapshot(
+    adapter: WarehouseAdapter,
+    upstream: str,
+    *,
+    model_name: str,
+    batch_size: int,
+    predicates: list[ReadPredicate],
+    read_order: tuple[str, ...],
+) -> Iterator[TableReadSnapshot]:
+    """Open the upstream read, in `read_order` when there is one.
+
+    The ordering is a cost optimization, never a correctness requirement: a
+    window is correct however its rows were chosen, and only its pruning
+    depends on locality. So an ordered open that fails -- a warehouse can
+    refuse to sort a result this wide and this large (BigQuery's
+    "resources exceeded") -- falls back to the unordered read instead of
+    ending a run that has paid for nothing yet. The cost of the fallback is
+    the pre-#749 publish bill, so it is said out loud, not absorbed.
+
+    Only a failure to *open* is caught: the `yield` is outside the `try`, so an
+    error while streaming rows still ends the run. A changed table is not
+    retried either, because the unordered read would meet the same change.
+    The unordered read is the original call, with no `order_by` keyword, so an
+    adapter that predates the parameter is never handed it.
+    """
+    with ExitStack() as stack:
+        snapshot: TableReadSnapshot | None = None
+        if read_order:
+            try:
+                snapshot = stack.enter_context(
+                    adapter.table_snapshot(
+                        upstream,
+                        batch_size=batch_size,
+                        predicate=predicates,
+                        order_by=read_order,
+                    )
+                )
+            except TableSnapshotGenerationChangedError:
+                raise
+            except AdapterError as error:
+                log.warning(
+                    "Embed model '%s': reading '%s' in layout order failed (%s); "
+                    "reading it unordered. Publishing will prune less, so expect "
+                    "a larger warehouse bill for this run.",
+                    model_name,
+                    upstream,
+                    error,
+                )
+        if snapshot is None:
+            snapshot = stack.enter_context(
+                adapter.table_snapshot(
+                    upstream, batch_size=batch_size, predicate=predicates
+                )
+            )
+        yield snapshot
 
 
 def _validate_upstream_ids(

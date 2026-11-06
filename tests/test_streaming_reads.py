@@ -271,7 +271,7 @@ def test_duckdb_snapshot_open_and_generation_failures_sanitize_causes(
         )
 
         with pytest.raises(AdapterError, match="generation could not be validated") as digest_error:
-            adapter._current_table_digest(TableReadRequest("records", None, 1, (), None))
+            adapter._current_table_digest(TableReadRequest("records", None, 1, (), None, ()))
         assert (
             str(_sanitized_native_cause(digest_error.value, sentinel))
             == "Native adapter error type: RuntimeError"
@@ -340,11 +340,11 @@ def test_streaming_read_request_validation_and_capability_guard(
             pass
 
     with pytest.raises(AdapterError, match="batch_size"):
-        TableReadRequest("records", None, 0, (), None)
+        TableReadRequest("records", None, 0, (), None, ())
     with pytest.raises(AdapterError, match="duplicate names"):
-        TableReadRequest("records", ("id", "id"), 1, (), None)
+        TableReadRequest("records", ("id", "id"), 1, (), None, ())
     with pytest.raises(AdapterError, match="key_column must be included"):
-        TableReadRequest("records", ("value",), 1, (), "id")
+        TableReadRequest("records", ("value",), 1, (), "id", ())
 
     monkeypatch.setattr(
         type(adapter),
@@ -735,6 +735,68 @@ def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> Non
     for _sql, job_config in client.queries:
         assert job_config.query_parameters[0].value == sentinel
         assert job_config.use_query_cache is False
+
+
+def test_bigquery_ordered_read_sorts_in_the_query_and_skips_the_unordered_paths() -> None:
+    """Issue #749: an embed window is cut from this stream, so its order is the
+    window's layout locality. The two paths that cannot order -- the direct
+    Storage Read of an unfiltered projected read, and the key-segmented read --
+    are what an unordered read of this shape takes, so an ordered one has to
+    leave both. The sort has to run in the query, whose sorted destination the
+    one-stream session then reads back in order."""
+    data = {
+        "record_id": pa.array(["a", "b", "c"]),
+        "filing_date": pa.array([3, 1, 2]),
+    }
+
+    unordered_client = _FakeBigQueryClient(data)
+    unordered = _bigquery_adapter(unordered_client)
+    storage = unordered._bqstorage_client
+    assert isinstance(storage, _FakeBigQueryStorageClient)
+    # No query runs on the direct path, so nothing else would hand the fake
+    # session its table.
+    storage.payload = pa.table(dict(data))
+    with unordered.table_snapshot(
+        "records", columns=("record_id", "filing_date"), key_column="record_id"
+    ) as snapshot:
+        list(snapshot)
+    # The contrast that gives the test its meaning: this shape reads the table
+    # directly, with no query job of its own.
+    assert unordered_client.job is None
+
+    client = _FakeBigQueryClient(data)
+    with _bigquery_adapter(client).table_snapshot(
+        "records",
+        columns=("record_id", "filing_date"),
+        key_column="record_id",
+        order_by=("filing_date", "record_id"),
+    ) as snapshot:
+        list(snapshot)
+
+    assert client.job is not None
+    [payload_sql] = [
+        sql
+        for sql, _cfg in client.queries
+        if "COUNT(DISTINCT" not in sql and "COUNTIF" not in sql
+    ]
+    assert payload_sql.endswith(
+        "ORDER BY `filing_date` ASC NULLS FIRST, `record_id` ASC NULLS FIRST"
+    )
+    # Neither the snapshot clock nor the segment boundaries of a segmented read.
+    assert not any("CURRENT_TIMESTAMP()" in sql for sql, _cfg in client.queries)
+    assert not any("ROW_NUMBER()" in sql for sql, _cfg in client.queries)
+
+
+def test_bigquery_ordered_read_refuses_a_column_the_table_lacks() -> None:
+    client = _FakeBigQueryClient({"record_id": pa.array(["a"])})
+
+    with pytest.raises(AdapterError, match="missing column"):
+        with _bigquery_adapter(client).table_snapshot(
+            "records", order_by=("nope", "record_id")
+        ):
+            pass
+
+    assert client.job is None
 
 
 def test_bigquery_snapshot_binds_a_datetime_predicate_as_the_columns_type() -> None:

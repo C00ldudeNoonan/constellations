@@ -1430,6 +1430,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
                 WarehouseCapability.ICEBERG_TABLE_FORMAT,
+                WarehouseCapability.ORDERED_TABULAR_READS,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
@@ -2482,8 +2483,13 @@ class BigQueryAdapter(WarehouseAdapter):
             # A keyed, unfiltered read is cut into resumable segments pinned to
             # one instant (issue #614). It runs its own key-domain check as of
             # that instant, so it returns before the live-table check below.
+            #
+            # Not an ordered one: segments are cut and resumed in key order,
+            # so a read ordered by anything else cannot be one of them.
             segmented_key = (
-                self._segmented_key(request, initial_table) if not where_sql else None
+                self._segmented_key(request, initial_table)
+                if not where_sql and not request.order_by
+                else None
             )
             if segmented_key is not None:
                 key, key_type = segmented_key
@@ -2496,9 +2502,23 @@ class BigQueryAdapter(WarehouseAdapter):
                     )
             if request.key_column is not None:
                 self._validate_read_key_domain(request, where_sql, params)
+            # ORDER BY runs in the query, so the sorted result is what the
+            # destination table holds; the one-stream session below reads it
+            # back in that order (issue #749). NULLS FIRST is stated rather than
+            # left to BigQuery's default so the contract is one order on every
+            # adapter.
+            order_sql = (
+                " ORDER BY "
+                + ", ".join(
+                    f"{self.quote_ident(column)} ASC NULLS FIRST"
+                    for column in request.order_by
+                )
+                if request.order_by
+                else ""
+            )
             sql = (
                 f"SELECT {projection} FROM "
-                f"{self.table_ref(request.table)}{where_sql}"
+                f"{self.table_ref(request.table)}{where_sql}{order_sql}"
             )
 
             # An unfiltered, explicitly projected read never needs a query
@@ -2515,7 +2535,7 @@ class BigQueryAdapter(WarehouseAdapter):
             # into a Storage Read `row_restriction` was explicitly out of
             # scope for this fix, and the failing shape in practice (a search
             # publish reading its own embeddings table back) is unfiltered.
-            if not where_sql and request.columns is not None:
+            if not where_sql and request.columns is not None and not request.order_by:
                 job = None
                 session = self._open_storage_read_session_for_table(
                     table_id, list(request.columns)

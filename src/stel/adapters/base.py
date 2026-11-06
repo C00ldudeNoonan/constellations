@@ -586,6 +586,11 @@ class WarehouseCapability(StrEnum):
     SCHEMA_EVOLUTION = "schema_evolution"
     STREAMING_TABULAR_READS = "streaming_tabular_reads"
     TABULAR_PREDICATE_PUSHDOWN = "tabular_predicate_pushdown"
+    # A snapshot read can be asked for rows in a column order (issue #749). The
+    # order is a property of the read, not of the table: it is what lets a
+    # consumer cut batches that are narrow in the target's partition and cluster
+    # columns.
+    ORDERED_TABULAR_READS = "ordered_tabular_reads"
     PAGED_STATE_RECONCILIATION = "paged_state_reconciliation"
     ATOMIC_STATE_SCOPE_REPLACE = "atomic_state_scope_replace"
     ATOMIC_PARENT_CHILD_REPLACE = "atomic_parent_child_replace"
@@ -786,10 +791,17 @@ class TableReadRequest:
     batch_size: int
     predicates: tuple[ReadPredicate, ...]
     key_column: str | None
+    # Ascending, NULLs first, in this column order. A consumer that needs the
+    # same rows in the same order on a rerun ends the list with a unique column.
+    order_by: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if not self.table:
             raise AdapterError("Table read name must not be empty")
+        if any(not column for column in self.order_by):
+            raise AdapterError("Table read order_by columns must not be empty")
+        if len(self.order_by) != len(set(self.order_by)):
+            raise AdapterError("Table read order_by contains duplicate names")
         if not 1 <= self.batch_size <= 100_000:
             raise AdapterError("Table read batch_size must be between 1 and 100000")
         if self.columns is not None:
@@ -813,10 +825,11 @@ class TableReadRequest:
             columns.update(self.columns)
         if self.key_column is not None:
             columns.add(self.key_column)
+        columns.update(self.order_by)
         return frozenset(columns)
 
     def _fingerprint_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "table": self.table,
             "columns": self.columns,
             "predicates": [
@@ -824,6 +837,11 @@ class TableReadRequest:
             ],
             "key_column": self.key_column,
         }
+        # Only when set: an unordered request must hash exactly as it did before
+        # order_by existed, because a BigQuery resume point is keyed by it.
+        if self.order_by:
+            payload["order_by"] = list(self.order_by)
+        return payload
 
 
 # A membership predicate past this many distinct values is not pushed. Both
@@ -1739,12 +1757,19 @@ to see the plan first."""
         batch_size: int = 10_000,
         predicate: ReadPredicate | Sequence[ReadPredicate] | None = None,
         key_column: str | None = None,
+        order_by: Sequence[str] | None = None,
     ) -> Iterator[TableReadSnapshot]:
         """Open a bounded, projected, immutable relation snapshot.
 
-        Predicates are combined with logical AND. Ordering is unspecified; a
-        consumer needing deterministic reconciliation must use a separately
-        advertised ordered-read capability.
+        Predicates are combined with logical AND. Ordering is unspecified
+        unless `order_by` names columns, which needs the
+        `ORDERED_TABULAR_READS` capability: rows then arrive ascending in that
+        column order, NULLs first. The list must end in a column that is
+        unique within the read: that makes the order total, so a rerun over the
+        same relation yields the same sequence, and an adapter that validates a
+        snapshot by re-reading it is not misled by ties it broke differently
+        (issue #749). An ordered read gives up whatever the adapter does to
+        resume or fan out an unordered one.
 
         With `key_column`, the snapshot refuses a key domain containing NULLs
         or duplicates before yielding its first batch. This is a contract, not
@@ -1768,7 +1793,13 @@ to see the plan first."""
             batch_size=batch_size,
             predicates=predicates,
             key_column=key_column,
+            order_by=tuple(order_by) if order_by is not None else (),
         )
+        if request.order_by:
+            self.require_capability(
+                WarehouseCapability.ORDERED_TABULAR_READS,
+                operation="ordered table reads",
+            )
         if request.predicates:
             self.require_capability(
                 WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,

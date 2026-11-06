@@ -12,6 +12,7 @@ cadence changes execution, never output.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -23,9 +24,10 @@ import duckdb
 import polars as pl
 import pytest
 
-from stel.adapters import LayoutPruningColumns
+from stel.adapters import AdapterError, LayoutPruningColumns
 from stel.adapters.base import NO_LAYOUT_PRUNING
 from stel.adapters.duckdb import DuckDBAdapter
+from stel.execution.checkpoint import FlushPublisher
 from stel.execution.contracts import RunError
 from stel.execution.embed import _EmbeddingReuseReader
 from stel.providers.deterministic import DeterministicEmbeddingProvider
@@ -1300,3 +1302,224 @@ def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(
             "symbol",
         ]
         assert ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)) in lookup
+
+
+# ─── windows are cut in layout order (issue #749) ────────────────────────────
+
+# Interleaved on purpose, in the order a warehouse is free to return them: each
+# neighbouring pair differs in symbol and in month, so windows cut from the
+# stream as it comes would span both symbols and both months.
+_UNORDERED_CHUNKS = [
+    ("c1", "AAPL", date(2026, 1, 5)),
+    ("c2", "MSFT", date(2026, 2, 9)),
+    ("c3", "AAPL", date(2026, 2, 2)),
+    ("c4", "MSFT", date(2026, 1, 7)),
+    ("c5", "AAPL", date(2026, 1, 6)),
+    ("c6", "MSFT", date(2026, 2, 10)),
+    ("c7", "AAPL", date(2026, 2, 3)),
+    ("c8", "MSFT", date(2026, 1, 8)),
+]
+_LAYOUT_ORDERED_WINDOWS = [["c1", "c5"], ["c4", "c8"], ["c3", "c7"], ["c2", "c6"]]
+
+
+def _layout_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An embed project whose upstream is the interleaved table above and whose
+    target declares a layout. DuckDB declares none of its own, so the layout the
+    BigQuery adapter would report for `sec_chunk_embeddings` is supplied."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        connection.execute(
+            "CREATE OR REPLACE TABLE docs.document_chunks "
+            "(chunk_id VARCHAR, text VARCHAR, filing_date DATE, symbol VARCHAR)"
+        )
+        connection.executemany(
+            "INSERT INTO docs.document_chunks VALUES (?, ?, ?, ?)",
+            [(cid, f"text {cid}", filed, symbol) for cid, symbol, filed in _UNORDERED_CHUNKS],
+        )
+    finally:
+        connection.close()
+    monkeypatch.setattr(
+        DuckDBAdapter,
+        "layout_pruning_columns",
+        lambda self, options: LayoutPruningColumns("filing_date", ("symbol",)),
+    )
+    return project
+
+
+def _record_windows(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """The ids of each window as it publishes, in publication order."""
+    windows: list[list[str]] = []
+    original = FlushPublisher.publish
+
+    def recording(self: FlushPublisher, *, state_records: Sequence[Any], **kwargs: Any) -> None:
+        windows.append([record.record_key for record in state_records])
+        original(self, state_records=state_records, **kwargs)
+
+    monkeypatch.setattr(FlushPublisher, "publish", recording)
+    return windows
+
+
+def test_windows_are_cut_narrow_in_the_targets_layout_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #749: a 128-row window drawn from across a 3.67M-row corpus spanned
+    nearly every month and dozens of symbols, so the pruned MERGE and the reuse
+    read-back skipped nothing -- ~46 GiB of BigQuery per window. Read in
+    partition-then-cluster order, each window is one symbol in one month, which
+    is the range the batch predicates are then built from."""
+    project = _layout_project(tmp_path, monkeypatch)
+    windows = _record_windows(monkeypatch)
+
+    run_project(project, select="document_embeddings")
+
+    assert windows == _LAYOUT_ORDERED_WINDOWS
+    placed = {cid: (symbol, filed) for cid, symbol, filed in _UNORDERED_CHUNKS}
+    for window in windows:
+        assert len({placed[cid][0] for cid in window}) == 1
+        assert len({placed[cid][1].month for cid in window}) == 1
+
+
+def test_a_resumed_run_cuts_the_windows_the_failed_run_had_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume has to cut the same windows (issue #749). The order ends in the
+    id, so rows tied on date and symbol break the same way on every read, and
+    the rows still to do keep their relative order. Without that, the windows
+    after a failure would be a different cut of the same rows and could be as
+    wide as the unordered ones."""
+    project = _layout_project(tmp_path, monkeypatch)
+    windows = _record_windows(monkeypatch)
+
+    with pytest.MonkeyPatch.context() as failing:
+        _fail_after(4, failing)
+        with pytest.raises(RunError):
+            run_project(project, select="document_embeddings")
+    # Two windows landed; the third died mid-way and is unpublished.
+    assert _embedded_count(project) == 4
+    published = windows[:2]
+    assert published == _LAYOUT_ORDERED_WINDOWS[:2]
+    windows.clear()
+
+    run_project(project, select="document_embeddings")
+
+    assert windows == _LAYOUT_ORDERED_WINDOWS[2:]
+    assert _embedded_count(project) == len(_UNORDERED_CHUNKS)
+
+
+def _snapshot_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """The keyword arguments of each `table_snapshot` open, in order."""
+    calls: list[dict[str, Any]] = []
+    original = DuckDBAdapter.table_snapshot
+
+    @contextmanager
+    def recording(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        calls.append(kwargs)
+        with original(self, *args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", recording)
+    return calls
+
+
+def test_a_run_with_no_layout_never_passes_order_by(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #752: embed used to hand `order_by=None` to every adapter on
+    every run. An adapter or double whose `table_snapshot` predates the keyword
+    would then fail a run that gains nothing from ordering. An unordered read is
+    the call it always was."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    calls = _snapshot_calls(monkeypatch)
+
+    run_project(project, select="document_embeddings")
+
+    assert calls
+    assert all("order_by" not in call for call in calls)
+
+
+def test_a_layout_run_opens_its_window_read_in_layout_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _layout_project(tmp_path, monkeypatch)
+    calls = _snapshot_calls(monkeypatch)
+
+    run_project(project, select="document_embeddings")
+
+    ordered = [call["order_by"] for call in calls if "order_by" in call]
+    assert ordered == [("filing_date", "symbol", "chunk_id")]
+
+
+def test_an_ordered_open_that_fails_falls_back_to_an_unordered_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review of #752: the ordered read sorts the whole upstream, and a
+    warehouse can refuse that (BigQuery's 'resources exceeded' on a wide
+    result). Ordering only buys pruning; no window is wrong without it. So the
+    run takes the pre-#749 read and says what that costs, rather than dying
+    before it has embedded anything."""
+    project = _layout_project(tmp_path, monkeypatch)
+    original = DuckDBAdapter.table_snapshot
+    opens: list[bool] = []
+
+    @contextmanager
+    def refusing_to_sort(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        opens.append("order_by" in kwargs)
+        if "order_by" in kwargs:
+            raise AdapterError("simulated: result too large to sort")
+        with original(self, *args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", refusing_to_sort)
+
+    with caplog.at_level(logging.WARNING, logger="stel.execution.embed"):
+        run_project(project, select="document_embeddings")
+
+    assert _embedded_count(project) == len(_UNORDERED_CHUNKS)
+    # The id pass opens unordered too; the window read tried ordered, then not.
+    assert opens.count(True) == 1
+    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "reading it unordered" in warning
+    assert "simulated: result too large to sort" in warning
+
+
+def test_a_failure_while_streaming_an_ordered_read_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the *open* falls back. A read that fails part-way has already
+    yielded rows into a window, and re-reading unordered would hand the run
+    those rows twice; the failure has to end the run."""
+    project = _layout_project(tmp_path, monkeypatch)
+    original = DuckDBAdapter.table_snapshot
+    ordered_opens = 0
+
+    class _FailingSnapshot:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def __iter__(self) -> Iterator[Any]:
+            raise AdapterError("simulated: stream broke")
+
+    @contextmanager
+    def breaking(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        nonlocal ordered_opens
+        with original(self, *args, **kwargs) as snapshot:
+            if "order_by" in kwargs:
+                ordered_opens += 1
+                yield _FailingSnapshot(snapshot)
+            else:
+                yield snapshot
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", breaking)
+
+    with pytest.raises(AdapterError, match="stream broke"):
+        run_project(project, select="document_embeddings")
+
+    assert ordered_opens == 1

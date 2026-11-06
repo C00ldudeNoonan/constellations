@@ -734,6 +734,10 @@ class SnapshotResumePoint:
     # reports it. A resumed read reports this one, not the current table's, since
     # its rows are the content as of `snapshot_time`.
     generation: str
+    # Identity of the row predicates the boundaries were cut under, "" for none.
+    # The boundaries partition the key domain of one filtered relation, so a
+    # point is only a valid place to continue a read of that same relation.
+    predicates: str
 
     def __post_init__(self) -> None:
         if not self.snapshot_time:
@@ -755,6 +759,7 @@ class SnapshotResumePoint:
                 "completed": self.completed,
                 "rows": self.rows,
                 "generation": self.generation,
+                "predicates": self.predicates,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -779,6 +784,9 @@ class SnapshotResumePoint:
                 completed=int(payload["completed"]),
                 rows=int(payload["rows"]),
                 generation=str(payload["generation"]),
+                # A stamp written before predicated reads were segmented has no
+                # key, and every such read was unfiltered.
+                predicates=str(payload.get("predicates", "")),
             )
         except (ValueError, KeyError, TypeError, AdapterError):
             return None

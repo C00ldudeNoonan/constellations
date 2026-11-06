@@ -5833,10 +5833,10 @@ def test_an_unfiltered_projected_snapshot_skips_the_query_entirely() -> None:
     ]
 
 
-def test_a_predicated_snapshot_still_uses_the_query_path() -> None:
-    """A predicate keeps the query path even with explicit columns --
-    translating predicates into a Storage Read `row_restriction` was
-    explicitly out of scope for this fix."""
+def test_a_predicated_snapshot_without_a_key_uses_the_query_path() -> None:
+    """A predicate with no key column keeps the query path even with explicit
+    columns: only a keyed read has segments to restrict, and a keyed predicated
+    read is cut into them instead (issue #754, tests/test_segmented_snapshot.py)."""
     payload = pa.table({"chunk_id": ["a"], "symbol": ["AAPL"]})
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = ["chunk_id", "symbol"]
@@ -5996,14 +5996,16 @@ def test_key_validation_carries_the_read_predicates() -> None:
     adapter, client = _snapshot_adapter(
         {"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]}
     )
-    # A predicated read keeps the query path, so it takes the key-domain
-    # aggregate and then the payload job, not the segmented read's statements.
+    # A predicate with no safe restriction literal (a control character) keeps
+    # the query path, so it takes the key-domain aggregate and then the payload
+    # job. A writable one is segmented, and its as-of key-domain check carries
+    # the predicates too (issue #754, tests/test_segmented_snapshot.py).
     payload = pa.table({"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]})
     client.query_results = [
         _FakeJob(rows=[(0, 0)]),
         _FakeSnapshotJob(payload),
     ]
-    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL")
+    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL\t")
     with adapter.table_snapshot(
         "chunks", key_column="chunk_id", predicate=predicate
     ) as snapshot:

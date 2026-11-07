@@ -46,8 +46,9 @@ The supported paths for a deployed model today are:
   the built-in `vllm` provider (`supports_custom_base_url`, JSON-schema
   structured output).
 - **Any other endpoint**: a Python transform that calls it. Transforms run as
-  trusted code, so this adds no core surface, but it also gets none of the
-  provider seam's retry, accounting or credential-protection behaviour.
+  trusted code, so this adds no core surface, but it does not get the provider
+  seam's retry, accounting or credential-protection behaviour by default; the
+  transform author supplies them.
 
 ## Revisit when
 
@@ -64,6 +65,11 @@ statement that drift is undetectable); and a `vertex.endpoint` `ml:` provider
 with project, location, endpoint resource, timeout, a versioned
 request/response mapping, bounded payload, batch and concurrency, retries, a
 fake prediction client for tests and a credential-gated live test.
+
+This condition governs `ml:` scoring. A custom endpoint that returns embeddings
+is a different shape: it would reopen the `EmbeddingProvider` question
+(vector count and dimension validation), not this one, and would need its own
+decision.
 
 ## Alternatives rejected
 

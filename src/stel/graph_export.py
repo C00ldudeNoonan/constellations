@@ -66,6 +66,8 @@ _RELATION_COLUMNS = (
     "directed",
     "method",
     "status",
+    "confidence",
+    "sentence_index",
     "extractor",
     "extractor_version",
 )
@@ -82,8 +84,8 @@ class _Linked:
     entity_id: str
     entity_namespace: str
     canonical_id: str
-    resolver: str
-    resolver_version: str
+    resolver: str | None
+    resolver_version: str | None
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,25 @@ class GraphExport:
     # Relation rows the graph left out, by reason, so a count that looks short
     # is explained rather than discovered.
     edges_skipped: dict[str, int]
+
+
+def _text(value: object) -> str | None:
+    # A null stays null; `str(None)` would export the string "None".
+    return None if value is None else str(value)
+
+
+def _number(value: object) -> float | None:
+    # NaN is not JSON; a missing score is null, not an error at write time.
+    if isinstance(value, float) and value != value:
+        return None
+    return value if isinstance(value, int | float) else None
+
+
+def _clean_entity_name(entity_name: str) -> str:
+    cleaned = entity_name.strip()
+    if not cleaned:
+        raise GraphExportError("entity_name must not be empty")
+    return cleaned
 
 
 def _require_columns(frame: pl.DataFrame, required: Sequence[str], model: str) -> None:
@@ -115,9 +136,14 @@ def _linked_mentions(links: pl.DataFrame, entity_name: str) -> dict[str, _Linked
     fails the export instead of letting row order pick a side.
     """
     mentions: dict[str, _Linked] = {}
-    for row in links.iter_rows(named=True):
+    matched = links.filter(
+        (pl.col("status") == "matched")
+        & pl.col("canonical_id").is_not_null()
+        & pl.col("entity_namespace").is_not_null()
+    )
+    for row in matched.iter_rows(named=True):
         canonical = row["canonical_id"]
-        if row["status"] != "matched" or canonical is None or not str(canonical):
+        if not str(canonical):
             continue
         namespace = str(row["entity_namespace"])
         linked = _Linked(
@@ -126,8 +152,8 @@ def _linked_mentions(links: pl.DataFrame, entity_name: str) -> dict[str, _Linked
             ),
             entity_namespace=namespace,
             canonical_id=str(canonical),
-            resolver=str(row["resolver"]),
-            resolver_version=str(row["resolver_version"]),
+            resolver=_text(row["resolver"]),
+            resolver_version=_text(row["resolver_version"]),
         )
         mention_id = str(row["mention_id"])
         known = mentions.get(mention_id)
@@ -168,9 +194,9 @@ def _edge(row: dict[str, Any], subject: _Linked, obj: _Linked) -> dict[str, Any]
         "relation_type": str(row["relation_type"]),
         "directed": bool(row["directed"]),
         "method": str(row["method"]),
-        "confidence": row.get("confidence"),
+        "confidence": _number(row["confidence"]),
         "document_id": str(row["document_id"]),
-        "sentence_index": row.get("sentence_index"),
+        "sentence_index": row["sentence_index"],
         "extractor": str(row["extractor"]),
         "extractor_version": str(row["extractor_version"]),
         "subject_resolver": subject.resolver,
@@ -196,20 +222,22 @@ def build_graph(
     relation (co-occurrence) is written once with its ends in `entity_id`
     order, so the same pair never appears as two edges that differ only in
     which mention came first.
+
+    The skip reasons are exclusive and checked in the order `not_asserted`,
+    `unlinked_mention`, `self_relation`: a row is counted under the first that
+    applies, so a non-asserted row never also counts as unlinked.
     """
-    entity_name = entity_name.strip()
-    if not entity_name:
-        raise GraphExportError("entity_name must not be empty")
+    entity_name = _clean_entity_name(entity_name)
     _require_columns(links, _LINK_COLUMNS, "linking model")
     _require_columns(relations, _RELATION_COLUMNS, "relation model")
 
     mentions = _linked_mentions(links, entity_name)
     terms = declared_terms(vocabularies)
     parents = class_parents(classes)
-    nodes = {
-        linked.entity_id: _node(linked, entity_name, terms, parents)
-        for linked in mentions.values()
-    }
+    nodes: dict[str, dict[str, Any]] = {}
+    for linked in mentions.values():
+        if linked.entity_id not in nodes:
+            nodes[linked.entity_id] = _node(linked, entity_name, terms, parents)
 
     skipped = {"not_asserted": 0, "unlinked_mention": 0, "self_relation": 0}
     edges: dict[str, dict[str, Any]] = {}
@@ -258,8 +286,12 @@ def _jsonl(rows: Sequence[Mapping[str, Any]]) -> bytes:
 def _write_file(path: Path, payload: bytes) -> None:
     # Replaced rather than rewritten so a reader never sees half a file.
     scratch = path.with_name(path.name + ".tmp")
-    scratch.write_bytes(payload)
-    scratch.replace(path)
+    try:
+        scratch.write_bytes(payload)
+        scratch.replace(path)
+    except BaseException:
+        scratch.unlink(missing_ok=True)
+        raise
 
 
 def write_graph_export(
@@ -276,6 +308,9 @@ def write_graph_export(
     each file, and no timestamp, so unchanged inputs give identical bytes.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    # A manifest left by an earlier export would vouch for files about to be
+    # replaced, so it goes first: a directory with a manifest is then complete.
+    (output_dir / GRAPH_MANIFEST_FILENAME).unlink(missing_ok=True)
     payloads = {
         NODES_FILENAME: (_jsonl(graph.nodes), len(graph.nodes)),
         EDGES_FILENAME: (_jsonl(graph.edges), len(graph.edges)),
@@ -315,8 +350,7 @@ def export_graph(
     from .profile import resolve_profile
 
     # Checked before the project, profile or warehouse is touched.
-    if not entity_name.strip():
-        raise GraphExportError("entity_name must not be empty")
+    entity_name = _clean_entity_name(entity_name)
     project_path = Path(project_dir)
     project, _, _ = load_project(project_path)
     resolved = resolve_profile(

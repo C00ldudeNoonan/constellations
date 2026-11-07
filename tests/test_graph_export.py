@@ -357,6 +357,66 @@ def test_the_files_are_deterministic_and_the_manifest_digests_them(tmp_path: Pat
     assert "Café" in {node["canonical_id"] for node in nodes}
 
 
+def test_a_failed_re_export_leaves_no_manifest_and_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest from an earlier export must not vouch for half-replaced files."""
+    out = tmp_path / "g"
+    write_graph_export(_two_node_graph(), out, linking_model="l", relation_model="r")
+    assert (out / GRAPH_MANIFEST_FILENAME).exists()
+
+    real_replace = Path.replace
+
+    def fail_on_edges(self: Path, target: Any) -> Any:
+        if Path(target).name == EDGES_FILENAME:
+            raise OSError("disk full")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_on_edges)
+    with pytest.raises(OSError, match="disk full"):
+        write_graph_export(_two_node_graph(), out, linking_model="l", relation_model="r")
+    assert not (out / GRAPH_MANIFEST_FILENAME).exists()
+    assert not list(out.glob("*.tmp"))
+
+
+def test_a_link_without_a_namespace_is_not_a_node() -> None:
+    links = _links([{"mention_id": "m1", "canonical_id": "A"}])
+    links = links.with_columns(pl.lit(None, dtype=pl.String()).alias("entity_namespace"))
+    graph = _build(links, _relations([]))
+    assert graph.nodes == ()
+
+
+def test_a_null_resolver_stays_null_and_nan_confidence_is_null() -> None:
+    links = _links(
+        [
+            {"mention_id": "m1", "canonical_id": "A", "resolver": None},
+            {"mention_id": "m2", "canonical_id": "B"},
+        ]
+    )
+    graph = _build(
+        links,
+        _relations(
+            [
+                {
+                    "relation_id": "r",
+                    "subject_mention_id": "m1",
+                    "object_mention_id": "m2",
+                    "confidence": float("nan"),
+                }
+            ]
+        ),
+    )
+    (edge,) = graph.edges
+    assert edge["confidence"] is None
+    assert None in {edge["subject_resolver"], edge["object_resolver"]}
+
+
+def test_a_relation_model_without_confidence_is_refused() -> None:
+    links = _links([{"mention_id": "m1", "canonical_id": "A"}])
+    with pytest.raises(GraphExportError, match=r"relation model is missing.*confidence"):
+        _build(links, _relations([]).drop("confidence"))
+
+
 def test_lines_end_in_a_bare_newline_on_every_platform(tmp_path: Path) -> None:
     out = write_graph_export(
         _two_node_graph(), tmp_path / "g", linking_model="l", relation_model="r"

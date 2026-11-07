@@ -3534,6 +3534,21 @@ class BigQueryAdapter(WarehouseAdapter):
             job_metadata=job_metadata,
         )
 
+    def cast_to_text(self, expression: str) -> str:
+        return f"CAST({expression} AS STRING)"
+
+    def estimate_query_bytes(self, sql: str, params: list[Any]) -> int | None:
+        bigquery = _bigquery()
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        if params:
+            job_config.query_parameters = to_query_parameters(params)
+        try:
+            job = self.client.query(sql, job_config=job_config)
+        except Exception as e:
+            raise AdapterError(f"Query dry-run failed [{type(e).__name__}]") from e
+        total = getattr(job, "total_bytes_processed", None)
+        return None if total is None else int(total)
+
     def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
         bigquery = _bigquery()
         job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)

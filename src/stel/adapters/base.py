@@ -426,6 +426,40 @@ class StateScopeSummary:
 
 
 @dataclass(frozen=True)
+class PendingUpstreamRequest:
+    """What `pending_upstream` should compare (issue #751).
+
+    `key_column` is the upstream column the model's state keys are the
+    stringified value of. `partition_column` and `cluster_column` are layout
+    columns the *upstream* carries, or None; the summary reports a span over
+    the first and a distinct count over the second.
+    """
+
+    scope: StateScope
+    upstream: str
+    key_column: str
+    partition_column: str | None = None
+    cluster_column: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingUpstreamSummary:
+    """Upstream rows with no state row, and state rows with no upstream row.
+
+    `new_rows` is exact. It says nothing about rows whose content changed: a
+    changed row has a state row, and telling it apart needs the row's content
+    fingerprint, which no kind computes from key and layout columns alone.
+    """
+
+    new_rows: int
+    partition_min: Any | None
+    partition_max: Any | None
+    cluster_distinct: int | None
+    deleted_rows: int
+    estimated_bytes: int | None
+
+
+@dataclass(frozen=True)
 class StateGeneration:
     """A model's state scope, cheaply enough to tell whether it changed since
     a sync watermark last recorded it (issue #611).
@@ -2305,6 +2339,110 @@ to see the plan first."""
                 f"{new_code_version}, but recording the adoption failed: {error}"
             ) from error
         return moving
+
+    # ─── pending upstream rows (issue #751) ───────────────────────────────
+
+    def cast_to_text(self, expression: str) -> str:
+        """`expression` as the text type state keys are stored in."""
+        return f"CAST({expression} AS VARCHAR)"
+
+    def estimate_query_bytes(self, sql: str, params: list[Any]) -> int | None:
+        """Bytes `sql` would bill, or None where the warehouse does not bill by
+        bytes scanned. Reads nothing."""
+        del sql, params
+        return None
+
+    def _pending_upstream_sql(
+        self, request: PendingUpstreamRequest, *, state_exists: bool
+    ) -> tuple[str, str, list[Any]]:
+        """The new-rows and deleted-rows statements and their shared parameters.
+
+        Key, partition and cluster columns only: neither statement names a wide
+        column, so a columnar warehouse bills those columns and nothing else."""
+        upstream = self.table_ref(request.upstream)
+        state = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        key = self.quote_ident(request.key_column)
+        partition = (
+            self.quote_ident(request.partition_column)
+            if request.partition_column is not None
+            else None
+        )
+        cluster = (
+            self.quote_ident(request.cluster_column)
+            if request.cluster_column is not None
+            else None
+        )
+        # Distinct keys, not rows: a key repeated upstream is one record to
+        # the runners. A NULL key never matches a state row, so it is left
+        # out rather than reported as pending forever.
+        select = [
+            f"COUNT(DISTINCT up.{key})",
+            f"MIN(up.{partition})" if partition else "NULL",
+            f"MAX(up.{partition})" if partition else "NULL",
+            f"COUNT(DISTINCT up.{cluster})" if cluster else "NULL",
+        ]
+        in_state = (
+            f"SELECT 1 FROM {state} AS st WHERE st.model_name = ? "
+            "AND st.state_scope = ? AND st.target_identity = ? "
+        )
+        new_sql = (
+            f"SELECT {', '.join(select)} FROM {upstream} AS up "
+            f"WHERE up.{key} IS NOT NULL AND NOT EXISTS ({in_state}"
+            f"AND st.record_key = {self.cast_to_text(f'up.{key}')})"
+        )
+        deleted_sql = (
+            f"SELECT COUNT(*) FROM {state} AS st WHERE st.model_name = ? "
+            "AND st.state_scope = ? AND st.target_identity = ? "
+            f"AND NOT EXISTS (SELECT 1 FROM {upstream} AS up "
+            f"WHERE {self.cast_to_text(f'up.{key}')} = st.record_key)"
+        )
+        if not state_exists:
+            # Nothing has been published, so every upstream row is new.
+            all_sql = (
+                f"SELECT {', '.join(select)} FROM {upstream} AS up "
+                f"WHERE up.{key} IS NOT NULL"
+            )
+            return all_sql, "SELECT 0", []
+        scope = request.scope
+        return (
+            new_sql,
+            deleted_sql,
+            [scope.model_name, scope.stage, scope.target_identity],
+        )
+
+    def pending_upstream(
+        self, request: PendingUpstreamRequest, *, dry_run: bool
+    ) -> PendingUpstreamSummary:
+        """Count the upstream rows the model's state has never seen.
+
+        Read-only, and it reads the key, partition and cluster columns plus
+        stel's own state table. With `dry_run` it runs nothing and returns only
+        the byte estimate (zeros elsewhere). An absent state table means
+        nothing has been published, so every upstream row is new."""
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES, operation="pending upstream rows"
+        )
+        new_sql, deleted_sql, params = self._pending_upstream_sql(
+            request, state_exists=self.table_column_names(STATE_TABLE) is not None
+        )
+        estimates = [
+            self.estimate_query_bytes(new_sql, params),
+            self.estimate_query_bytes(deleted_sql, params),
+        ]
+        known = [value for value in estimates if value is not None]
+        estimated = sum(known) if known else None
+        if dry_run:
+            return PendingUpstreamSummary(0, None, None, None, 0, estimated)
+        found = self.rows(new_sql, params)[0]
+        deleted = self.rows(deleted_sql, params)[0][0]
+        return PendingUpstreamSummary(
+            new_rows=int(found[0]),
+            partition_min=found[1],
+            partition_max=found[2],
+            cluster_distinct=None if found[3] is None else int(found[3]),
+            deleted_rows=int(deleted),
+            estimated_bytes=estimated,
+        )
 
     def state_generation(self, scope: StateScope) -> StateGeneration | None:
         """`scope`'s row count and most recent `last_run_at`, or None when it

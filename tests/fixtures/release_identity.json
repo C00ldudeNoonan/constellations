@@ -22,7 +22,7 @@
     },
     "backend:llm": {
       "extraction.backend": "8ab5e0ec8db1481b",
-      "extraction.backend_implementation": "24a58c11b714179d",
+      "extraction.backend_implementation": "fca791b0b0771872",
       "extraction.inference": "4a404b088580f445",
       "extraction.options": "01322121aebb532a"
     },
@@ -153,11 +153,5 @@
       "transform_code_hash": "5cf5f1773b155e4e"
     }
   },
-  "intended_changes": [
-    {
-      "case": "backend:llm",
-      "field": "extraction.backend_implementation",
-      "reason": "#751 moved the embed row fingerprint into execution/embed.py as embed_input_fingerprint(); the fingerprint is unchanged, so after upgrading run `stel plan` and `stel adopt --select <model>` for llm models rather than reprocessing."
-    }
-  ]
+  "intended_changes": []
 }

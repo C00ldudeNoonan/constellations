@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.25.0 - 2026-11-07
 
 - `stel adopt --select <model>` records that a `code_version` change left a model's
   output unchanged: it restamps the model's published rows in `stel_state` to the
@@ -12,6 +12,25 @@
   onward, and says "not recorded" for older ones. A new release gate compares each
   built-in backend's and transform's identity with the previous release and fails on an
   unannounced move (issue #750, ADR-0053).
+
+- A BigQuery snapshot read that carries predicates is now cut into key segments and
+  resumes from its last completed segment, like an unfiltered keyed read. Before, it
+  went through a query job with no resume points, so a failure late in a large
+  partition read restarted it. The key-domain check and the segment boundaries run over
+  the predicated rows at the pinned snapshot instant, and every read session carries
+  the predicates as a row restriction beside its key range. A resume point records the
+  identity of the filter it was cut under and is refused under any other. A predicate
+  with no safe literal (wrong type for the column, a control character) keeps the query
+  path, as does a read with no key (issue #754).
+
+- `stel plan --pending` reports, per embed, chunk and incremental transform model, the
+  upstream rows waiting for a run: new rows (an upstream key with no state row), their
+  partition span, the oldest value and the first-cluster distinct count, and rows
+  deleted upstream. It reads key and layout columns and `stel_state` only, exits 3 when
+  anything is pending and 0 when not, and `--dry-run` prices its statements on BigQuery.
+  `--include-changed` also counts rows whose input fingerprint moved; it streams every
+  upstream column, so it is opt-in, and a transform reports it as null because its
+  fingerprint covers reference tables (issue #751).
 
 - Embed reads its upstream in the target's partition-then-cluster order, so each
   window is narrow in the columns the layout-pruned MERGE and the reuse read-back
@@ -34,8 +53,16 @@
   not all of `backends/options.py`. An edit to one backend's options, such as the LLM
   `temperature` default in 0.24.0, no longer re-keys the JSON, HTML, PDF, Markdown or
   email backends (issue #572, ADR-0050). The first run after upgrading re-keys every
-  `extraction:` model once, because the identity algorithm changed; if 0.24.0 already
-  made your rows stale, upgrade before rebuilding so the corpus is rewritten once.
+  `extraction:` model once, because the identity algorithm changed. That re-key moves
+  no output: run `stel plan`, then `stel adopt --select <model>` to restamp the rows
+  instead of rewriting the corpus. `stel plan` reports the moved fields as "not
+  recorded" for rows published before this release. If 0.24.0 already made your rows
+  stale, adopt them the same way.
+- The `llm` backend's `extraction.backend_implementation` also moves in this release,
+  because the embed row fingerprint now lives in `execution/embed.py` as
+  `embed_input_fingerprint()` (issue #751). The fingerprint itself is unchanged, so
+  `llm:` models re-key once with no change to what they publish: run `stel plan` and
+  `stel adopt --select <model>` rather than reprocessing.
 
 ## v0.24.1 - 2026-11-03
 

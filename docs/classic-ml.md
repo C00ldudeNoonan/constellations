@@ -200,6 +200,12 @@ runtime would otherwise ignore them. Generic scikit-learn or third-party model
 files are not accepted yet; pretrained artifacts must use the stel schema and
 payload contract described below.
 
+`ml:` scores locally only: every provider fits and predicts against an artifact on
+disk, and none calls a remote endpoint. To use a model deployed elsewhere, serve it
+behind an OpenAI-compatible API and use the `vllm` provider from an `llm:` model, or
+call the endpoint from a Python transform. The reasons, and what would change this,
+are in [ADR-0054](adr/0054-ml-scores-locally-a-remote-scorer-is-not-yet-an-ml-provider.md).
+
 ## Artifact Contract
 
 Artifacts should live under `target/artifacts/<model_name>/` by default unless

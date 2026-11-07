@@ -63,6 +63,7 @@ history (issue #311).
 | [0051](0051-warehouse-native-vector-search-is-a-query-time-read-not-a-retrieval-store.md) | Warehouse-native vector search is a query-time read over the embeddings table, not a `RetrievalStore`; a `bigquery` store is deferred | accepted |
 | [0052](0052-embed-reads-its-upstream-in-the-targets-layout-order.md) | Embed reads its upstream in the target's partition-then-cluster order, through an `ordered_tabular_reads` adapter capability, so the pruned MERGE and reuse read-back prune | accepted |
 | [0053](0053-a-restamp-records-that-a-version-change-left-the-output-unchanged.md) | `stel adopt` restamps state when a version change left output unchanged; plan names the moved identity field; releases are gated on identity | accepted |
+| [0054](0054-ml-scores-locally-a-remote-scorer-is-not-yet-an-ml-provider.md) | `ml:` scores locally; a remote scorer (a Vertex custom prediction endpoint) is not yet an `ml:` provider, and not an `InferenceProvider` either | accepted |
 
 ## When to write one
 

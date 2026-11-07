@@ -410,6 +410,7 @@ stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--accept-cost] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
+stel adopt --select EXPR [--exclude EXPR] [--dry-run]  # record that a code_version change left the output unchanged (restamps stel_state only)
 stel plan --pending [--select EXPR] [--json] [--dry-run] [--include-changed]  # upstream rows waiting for a run; exit 3 when any, 0 when none
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
@@ -795,7 +796,7 @@ vectors and cost nothing (see below). Set a run budget's `max_cost_usd` when
 you need a cap. `plan.json` carries the estimate per model as
 `estimated_cost_usd`, the rows it was priced at as `priced_rows`, the run log it was read from as `metadata.cost_source`,
 and the target's [cost threshold](#asking-before-a-costly-run-confirm_cost_above_usd)
-as `metadata.confirm_cost_above_usd` (plan schema version 3). A refusal under
+as `metadata.confirm_cost_above_usd` (plan schema version 4). A refusal under
 `on_code_change: fail` names the estimate.
 
 A plan connects to the warehouse the way a run does — the same profile,
@@ -803,6 +804,42 @@ target, and preflight — and writes `target/plan.json`, which `--json` prints
 to stdout for an orchestrator gate. `stel plan` itself never fails on a large
 reprocess; it reports, and its footer names the models a run would refuse
 under the guard below.
+
+### What moved, and adopting a change that changed nothing
+
+When a model is `changed`, the reason line names the identity fields behind its
+`code_version` that differ from the version most stale rows carry, as short
+digests (never values: a prompt or an option can be sensitive):
+
+```
+raw_documents  extraction  incremental  changed  20281  20281
+  code_version differs for 20281 of 20281 published rows; moved: extraction.backend_implementation (505f19ab42c0d7e1 to f0b7a39c6d2e5b48)
+```
+
+`plan.json` carries the same as `identity_changes` (`field`, `before`, `after`),
+with `identity_recorded: false` when the old fields were never on record. stel
+records them after each clean run (`stel_code_identity`), so a release that
+moves a version can be explained from the run before it; rows published before
+that run are reported as "not recorded" instead of guessed at.
+
+If the field that moved is one you have checked cannot change this model's
+output -- a release that edited a module the backend never reads -- record that
+instead of paying for a rewrite:
+
+```bash
+stel plan  --select raw_documents
+stel adopt --select raw_documents --dry-run   # rows and versions, nothing written
+stel adopt --select raw_documents
+```
+
+`stel adopt` rewrites `code_version` in `stel_state` for the selected models to
+the current value, and nothing else: no source is discovered, no provider is
+called, no model table is read or written. Each restamp is appended to
+`stel_adoption_log` (model, old and new `code_version`, rows, who, when).
+`--select` is required; select a model and its descendants (`raw_documents+`)
+only if you checked each. Adopting is your statement that the output is
+unchanged; stel does not verify it. An output column that copies `code_version`
+keeps its old value until that row is next rewritten for another reason.
 
 ### Asking whether there is work: `stel plan --pending`
 

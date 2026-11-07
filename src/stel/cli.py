@@ -17,6 +17,7 @@ from .adapters import (
     create_adapter,
     plan_name_migration,
 )
+from .adopt import adopt_project
 from .checks import TestResult, run_project_tests
 from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
 from .cli_services.context import ConfigClickError
@@ -1179,6 +1180,77 @@ def plan(
             )
             for line in projection.describe():
                 click.echo(line)
+
+
+@cli.command()
+@click.option(
+    "--select",
+    "select",
+    required=True,
+    help=(
+        "Selector expression for the models to adopt (e.g. 'sec_document_registry'). "
+        "Required: adopting is a statement about named models, never a default."
+    ),
+)
+@click.option("--exclude", default=None, help="Selector expression for models to skip.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Report the rows that would be restamped and change nothing.",
+)
+@_verbose_option
+@_project_context_options
+@click.pass_context
+def adopt(
+    ctx: click.Context,
+    select: str,
+    exclude: str | None,
+    dry_run: bool,
+    verbose: int,
+    diagnostics_file: Path | None,
+) -> None:
+    """Record that a code_version change left the output unchanged.
+
+    After `stel plan` shows a model's code_version moved and you have checked
+    its output would not, this restamps the model's published rows to the
+    current code_version so the next run skips them -- no rewrite, no provider
+    call, no model table touched. Only stel's state table changes; each
+    restamp is logged to stel_adoption_log with who, when, and the old and new
+    versions. A model's own `code_version` output column keeps its old value
+    until that row is next rewritten.
+    """
+    project_dir: Path = ctx.obj["project_dir"]
+    _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=False)
+    try:
+        results = adopt_project(
+            project_dir,
+            select=select,
+            exclude=exclude,
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            dry_run=dry_run,
+        )
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except (SelectionError, PlanError, AdapterError) as e:
+        raise click.ClickException(str(e)) from e
+    if not results:
+        click.echo("No models selected.")
+        return
+    verb = "would restamp" if dry_run else "restamped"
+    for result in results:
+        if result.status == "adopted":
+            old = ", ".join(f"{v[:12]} ({n} rows)" for v, n in result.adopted_rows.items())
+            click.echo(
+                f"{result.model}: {verb} {result.rows} rows from {old} "
+                f"to {result.code_version[:12]}"
+            )
+        elif result.status == "current":
+            click.echo(f"{result.model}: already at {result.code_version[:12]}; nothing to adopt")
+        elif result.status == "empty":
+            click.echo(f"{result.model}: no published state; nothing to adopt")
+        else:
+            click.echo(f"{result.model}: materialization full keeps no state; nothing to adopt")
 
 
 def _parse_deletion_approvals(values: Sequence[str]) -> dict[str, str]:

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +50,8 @@ from .profile import ResolvedProfile, resolve_embedding_options, resolve_profile
 from .providers import ProviderError
 from .retrieval import StoreRole, create_store
 from .versioning import (
-    compute_model_code_version,
+    CodeIdentity,
+    compute_model_code_identity,
     describe_model_inference,
     describe_model_llm,
 )
@@ -60,7 +62,9 @@ log = logging.getLogger(__name__)
 PLAN_FILENAME = "plan.json"
 # 2: `estimated_cost_usd` per model and `cost_source` in metadata (issue #665).
 # 3: `confirm_cost_above_usd` in metadata, the target's cost guard (issue #586).
-PLAN_SCHEMA_VERSION = 3
+# 4: `identity_changes` and `identity_recorded` per model, the identity fields
+# behind a moved code_version (issue #750).
+PLAN_SCHEMA_VERSION = 4
 
 PlanStatus = Literal["new", "unchanged", "changed", "cascade", "full"]
 
@@ -78,6 +82,35 @@ PRICED_RUNS = 5
 
 class PlanError(RuntimeError):
     """A plan could not be produced from this project and profile."""
+
+
+@dataclass(frozen=True)
+class IdentityChange:
+    """One identity field of a model's code_version that moved (issue #750).
+
+    `before` / `after` are short digests of the field's value, `None` when the
+    field was absent on that side. Digests, never values: a prompt or an option
+    can be sensitive, and a plan is a written artifact."""
+
+    field: str
+    before: str | None
+    after: str | None
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {"field": self.field, "before": self.before, "after": self.after}
+
+    def describe(self) -> str:
+        return f"{self.field} ({self.before or 'absent'} to {self.after or 'absent'})"
+
+
+def diff_identity(
+    before: Mapping[str, str], after: Mapping[str, str]
+) -> tuple[IdentityChange, ...]:
+    return tuple(
+        IdentityChange(name, before.get(name), after.get(name))
+        for name in sorted(before.keys() | after.keys())
+        if before.get(name) != after.get(name)
+    )
 
 
 @dataclass(frozen=True)
@@ -121,6 +154,14 @@ class ModelPlan:
     #: fewer for an embed model under `--reprocess-all`, whose flag-only rows
     #: reuse their vectors (issue #655). None when the model is unpriced.
     priced_rows: int | None = None
+    #: The identity fields that moved between the version most stale rows
+    #: carry and the current one (issue #750). Empty when no row is stale or
+    #: when `identity_recorded` is False.
+    identity_changes: tuple[IdentityChange, ...] = ()
+    #: Whether the stale rows' old identity fields were on record. None when
+    #: no row is stale; False for rows published before stel kept the record,
+    #: in which case the plan cannot name what moved.
+    identity_recorded: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +183,8 @@ class ModelPlan:
             "reprocess_policy": self.reprocess_policy,
             "reprocess_limit": self.reprocess_limit,
             "priced_rows": self.priced_rows,
+            "identity_changes": [change.to_dict() for change in self.identity_changes],
+            "identity_recorded": self.identity_recorded,
         }
 
 
@@ -281,30 +324,77 @@ def plan_models(
     roots: set[str] = set()
     plans: list[ModelPlan] = []
     for model in planned:
-        code_version = compute_model_code_version(
+        identity = compute_model_code_identity(
             model, project, project_dir, resolved=resolved
         )
-        counts = adapter.state_code_version_counts(
-            _state_scope(model, project=project, resolved=resolved)
-        )
+        code_version = identity.code_version
+        scope = state_scope_for(model, project=project, resolved=resolved)
+        counts = adapter.state_code_version_counts(scope)
+        changes, recorded = _moved_identity(adapter, scope, counts, identity)
         caused_by = tuple(sorted(dag.ancestors(model.name) & roots))
         plan = _classify(
             model,
             code_version=code_version,
             counts=counts,
+            identity_changes=changes,
+            identity_recorded=recorded,
             caused_by=caused_by,
             resolved=resolved,
             project=project,
             project_dir=project_dir,
             reprocess_all=reprocess_all,
         )
+        plan = replace(plan, identity_changes=changes, identity_recorded=recorded)
         if plan.status == "changed":
             roots.add(model.name)
         plans.append(plan)
     return plans
 
 
-def _state_scope(
+def record_published_identity(
+    model: ModelConfig,
+    *,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+) -> None:
+    """Keep the identity fields behind the code_version `model` just published
+    under, so a later `stel plan` can name what moved (issue #750).
+
+    A `full` model keeps no state rows and so nothing to compare."""
+    if model.search is None and model.materialization == "full":
+        return
+    identity = compute_model_code_identity(model, project, project_dir, resolved=resolved)
+    adapter.record_code_identity(
+        state_scope_for(model, project=project, resolved=resolved),
+        identity.code_version,
+        identity.components,
+    )
+
+
+def _moved_identity(
+    adapter: WarehouseAdapter,
+    scope: StateScope,
+    counts: Mapping[str, int],
+    identity: CodeIdentity,
+) -> tuple[tuple[IdentityChange, ...], bool | None]:
+    """Which identity fields separate the stale rows from the current version.
+
+    Compared against the stale version most rows carry; a scope straddling
+    several is mid-migration and the largest group is the question the
+    operator has. None when nothing is stale."""
+    stale = {v: n for v, n in counts.items() if v != identity.code_version}
+    if not stale:
+        return (), None
+    dominant = max(stale, key=lambda version: stale[version])
+    recorded = adapter.read_code_identity(scope, [dominant]).get(dominant)
+    if recorded is None:
+        return (), False
+    return diff_identity(recorded, identity.components), True
+
+
+def state_scope_for(
     model: ModelConfig, *, project: ProjectConfig, resolved: ResolvedProfile
 ) -> StateScope:
     """The scope the model's execution path reads its state from.
@@ -345,6 +435,8 @@ def _classify(
     *,
     code_version: str,
     counts: dict[str, int],
+    identity_changes: tuple[IdentityChange, ...],
+    identity_recorded: bool | None,
     caused_by: tuple[str, ...],
     resolved: ResolvedProfile,
     project: ProjectConfig,
@@ -390,6 +482,15 @@ def _classify(
         status = "changed"
         rows, upper_bound = (state_rows, True) if caused_by else (stale_rows, False)
         reason = f"code_version differs for {stale_rows} of {state_rows} published rows"
+        if identity_changes:
+            reason += "; moved: " + ", ".join(c.describe() for c in identity_changes)
+        elif identity_recorded is False:
+            reason += (
+                "; the fields behind the old version were not recorded "
+                "(published before stel kept them), so what moved is unknown"
+            )
+        elif identity_recorded:
+            reason += "; no recorded identity field differs, so only its digest moved"
         if caused_by:
             reason += f"; upstream {upstream} changed as well"
     elif caused_by:

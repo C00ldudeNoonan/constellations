@@ -1,0 +1,163 @@
+{
+  "cases": {
+    "backend:email": {
+      "extraction.backend": "87a71c6af56cb4ee",
+      "extraction.backend_implementation": "0e67c3f7d010f441",
+      "extraction.options": "49adf2385fa5ef89"
+    },
+    "backend:html": {
+      "extraction.backend": "42f8b1cc826f5a05",
+      "extraction.backend_implementation": "b2355c94034fd7a9",
+      "extraction.options": "49adf2385fa5ef89"
+    },
+    "backend:json": {
+      "extraction.backend": "8aec38f8bf622858",
+      "extraction.backend_implementation": "afa8c33343529cd5",
+      "extraction.options": "49adf2385fa5ef89"
+    },
+    "backend:json_memory": {
+      "extraction.backend": "70fe9c654703bdd8",
+      "extraction.backend_implementation": "ffc08393c7234c5e",
+      "extraction.options": "49adf2385fa5ef89"
+    },
+    "backend:llm": {
+      "extraction.backend": "8ab5e0ec8db1481b",
+      "extraction.backend_implementation": "24a58c11b714179d",
+      "extraction.inference": "4a404b088580f445",
+      "extraction.options": "01322121aebb532a"
+    },
+    "backend:markdown": {
+      "extraction.backend": "ec90a6bf51d4caf5",
+      "extraction.backend_implementation": "06fa7ca22d75657e",
+      "extraction.options": "49adf2385fa5ef89"
+    },
+    "backend:pdf": {
+      "extraction.backend": "1855753c2695ed24",
+      "extraction.backend_implementation": "afed4290779e87f9",
+      "extraction.options": "49adf2385fa5ef89"
+    },
+    "transform:clean_encoding": {
+      "transform.module": "8f39b491e6c6ce82",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:count_tokens": {
+      "transform.module": "6563e9009c34f476",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:detect_language": {
+      "transform.module": "1be495d3175aa4f3",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:document_tone": {
+      "transform.module": "df352737bb325f41",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:extract_keyphrases": {
+      "transform.module": "fded29af21b55dd7",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:extract_relations": {
+      "transform.module": "05adae6fd2501c42",
+      "transform.options": "4524d84ec3f181b4",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e",
+      "transform_code_version_identity.extractor": "40d9db53c51d13b2",
+      "transform_code_version_identity.extractor_version": "89ff22ca0e29f115"
+    },
+    "transform:find_duplicates": {
+      "transform.module": "aedef30e8090aac0",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:link_entities": {
+      "transform.module": "4b1886497a8aa2ab",
+      "transform.options": "2b86d3037022d3c9",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e",
+      "transform_code_version_identity.resolver": "995f87b8c367b9a7",
+      "transform_code_version_identity.resolver_version": "53404a6ef076735d"
+    },
+    "transform:nlp_document_features": {
+      "transform.module": "33d10cc719936793",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:nlp_entities": {
+      "transform.module": "4fb661c906677a7b",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:nlp_tokens": {
+      "transform.module": "93cda94d80e5cc06",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:redact_pii": {
+      "transform.module": "71ca376434f9cde7",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:render_blocks": {
+      "transform.module": "a14071384c7065f0",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    },
+    "transform:text_stats": {
+      "transform.module": "1c91881c81389198",
+      "transform.options": "49adf2385fa5ef89",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e"
+    }
+  },
+  "intended_changes": [
+    {
+      "case": "backend:llm",
+      "field": "extraction.backend_implementation",
+      "reason": "#751 moved the embed row fingerprint into execution/embed.py as embed_input_fingerprint(); the fingerprint is unchanged, so after upgrading run `stel plan` and `stel adopt --select <model>` for llm models rather than reprocessing."
+    }
+  ]
+}

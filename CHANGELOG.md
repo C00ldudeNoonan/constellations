@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `stel adopt --select <model>` records that a `code_version` change left a model's
+  output unchanged: it restamps the model's published rows in `stel_state` to the
+  current version without reading a source, calling a provider, or touching the model
+  table, and logs who, when, and the old and new versions to `stel_adoption_log`
+  (`--dry-run` reports only). `stel plan` now names the identity fields that moved
+  (`extraction.backend_implementation (a1b2... to c3d4...)`, `plan.json` schema 4)
+  instead of "code_version differs"; it can do so for rows published by this release
+  onward, and says "not recorded" for older ones. A new release gate compares each
+  built-in backend's and transform's identity with the previous release and fails on an
+  unannounced move (issue #750, ADR-0053).
+
 - Embed reads its upstream in the target's partition-then-cluster order, so each
   window is narrow in the columns the layout-pruned MERGE and the reuse read-back
   prune on. Against a 3.67M-row BigQuery embeddings table those windows spanned

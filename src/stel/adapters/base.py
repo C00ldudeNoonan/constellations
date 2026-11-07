@@ -17,7 +17,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
@@ -220,6 +220,16 @@ WRITER_CLAIM_TABLE = "stel_writer_claim"
 # that never benefits from it never gets an empty table for it.
 SYNC_WATERMARK_TABLE = "stel_sync_watermark"
 
+# The identity fields behind each code_version a scope has published under
+# (issue #750): `stel_state` keeps only the digest, so without this `stel plan`
+# can say a model's code_version moved but not what moved it. Lazily created on
+# first write, best-effort like the watermark -- diagnostics, not core state.
+CODE_IDENTITY_TABLE = "stel_code_identity"
+
+# Append-only record of `stel adopt` restamps: who moved which published rows
+# from which code_version to which, and when (issue #750).
+ADOPTION_LOG_TABLE = "stel_adoption_log"
+
 # Serving-ledger table name shared with retrieval.coordination: fenced state
 # replacement must verify a publication claim in the same warehouse that owns
 # the state rows, without adapters importing retrieval code.
@@ -283,6 +293,8 @@ INTERNAL_TABLE_NAMES = (
     SERVING_LEDGER_TABLE,
     SERVING_LEASE_TABLE,
     SYNC_WATERMARK_TABLE,
+    CODE_IDENTITY_TABLE,
+    ADOPTION_LOG_TABLE,
     LEGACY_STATE_TABLE,
     LEGACY_SERVING_LEDGER_TABLE,
     LEGACY_SERVING_LEASE_TABLE,
@@ -2202,6 +2214,131 @@ to see the plan first."""
             [scope.model_name, scope.stage, scope.target_identity],
         )
         return {str(code_version): int(count) for code_version, count in found}
+
+    # ─── code identity and adoption (issue #750) ──────────────────────────
+
+    def record_code_identity(
+        self, scope: StateScope, code_version: str, components: Mapping[str, str]
+    ) -> None:
+        """Remember which identity fields produced `code_version` for `scope`.
+
+        Written after a clean run, so a later release that moves the version
+        can be compared field by field. Replaces any earlier record for the
+        same version: the fields are a pure function of it."""
+        table = f"{self.schema_ref}.{self.quote_ident(CODE_IDENTITY_TABLE)}"
+        self.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                model_name STRING NOT NULL,
+                state_scope STRING NOT NULL,
+                target_identity STRING NOT NULL,
+                code_version STRING NOT NULL,
+                components STRING NOT NULL,
+                recorded_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        key = [scope.model_name, scope.stage, scope.target_identity, code_version]
+        self.execute(
+            f"DELETE FROM {table} WHERE model_name = ? AND state_scope = ? "
+            "AND target_identity = ? AND code_version = ?",
+            key,
+        )
+        self.execute(
+            f"INSERT INTO {table} (model_name, state_scope, target_identity, "
+            "code_version, components, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [*key, json.dumps(dict(components), sort_keys=True), datetime.now(UTC)],
+        )
+
+    def read_code_identity(
+        self, scope: StateScope, code_versions: Sequence[str]
+    ) -> dict[str, dict[str, str]]:
+        """The recorded identity fields for each of `code_versions` that has
+        a record; a version published before records were kept is absent."""
+        if not code_versions or self.table_column_names(CODE_IDENTITY_TABLE) is None:
+            return {}
+        table = f"{self.schema_ref}.{self.quote_ident(CODE_IDENTITY_TABLE)}"
+        found = self.rows(
+            f"SELECT code_version, components FROM {table} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ?",
+            [scope.model_name, scope.stage, scope.target_identity],
+        )
+        wanted = set(code_versions)
+        return {
+            str(version): {str(k): str(v) for k, v in json.loads(str(raw)).items()}
+            for version, raw in found
+            if str(version) in wanted
+        }
+
+    def adopt_code_version(
+        self,
+        scope: StateScope,
+        new_code_version: str,
+        components: Mapping[str, str],
+        *,
+        adopted_by: str,
+    ) -> dict[str, int]:
+        """Restamp every published row in `scope` to `new_code_version`.
+
+        Touches `stel_state` only: no model table, no provider, no input is
+        read. Returns the row count adopted from each old version (a scope
+        already at the new version adopts nothing). Writes the restamp, then
+        one `stel_adoption_log` row per old version; a failure on the log
+        write raises after the restamp has landed, and says so."""
+        counts = self.state_code_version_counts(scope)
+        moving = {v: n for v, n in counts.items() if v != new_code_version}
+        if not moving:
+            return {}
+        state = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        self.execute(
+            f"UPDATE {state} SET code_version = ? WHERE model_name = ? "
+            "AND state_scope = ? AND target_identity = ? AND code_version <> ?",
+            [
+                new_code_version,
+                scope.model_name,
+                scope.stage,
+                scope.target_identity,
+                new_code_version,
+            ],
+        )
+        try:
+            self.record_code_identity(scope, new_code_version, components)
+            log_table = f"{self.schema_ref}.{self.quote_ident(ADOPTION_LOG_TABLE)}"
+            self.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {log_table} (
+                    model_name STRING NOT NULL,
+                    state_scope STRING NOT NULL,
+                    target_identity STRING NOT NULL,
+                    old_code_version STRING NOT NULL,
+                    new_code_version STRING NOT NULL,
+                    rows_adopted BIGINT NOT NULL,
+                    adopted_by STRING NOT NULL,
+                    adopted_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            adopted_at = datetime.now(UTC)
+            for old_version, rows in moving.items():
+                self.execute(
+                    f"INSERT INTO {log_table} VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        scope.model_name,
+                        scope.stage,
+                        scope.target_identity,
+                        old_version,
+                        new_code_version,
+                        rows,
+                        adopted_by,
+                        adopted_at,
+                    ],
+                )
+        except AdapterError as error:
+            raise AdapterError(
+                f"The rows of '{scope.model_name}' were restamped to "
+                f"{new_code_version}, but recording the adoption failed: {error}"
+            ) from error
+        return moving
 
     # ─── pending upstream rows (issue #751) ───────────────────────────────
 

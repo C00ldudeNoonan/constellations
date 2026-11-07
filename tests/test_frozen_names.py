@@ -547,6 +547,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("dbt-ml-search-indexed-row", 1, "27914404645f6e521b77f258f1bb1300"),
     ("dbt-ml-search-upsert-batch", 1, "ca587322c28f29eae4bb9c2b102c4ddb"),
     ("dbt-ml-state-target-identity", 1, "f087496846b3017f361a79ae14ffb95a"),
+    ("dbt-ml-warehouse-snapshot-predicates", 1, "31a244201e23cb3987f992828c550d18"),
     ("dbt-ml-warehouse-table-generation", 1, "6d5a58592fe52d34fb887b2bc9ade896"),
     ("dbt-ml-warehouse-table-snapshot", 1, "fe0f9290da11e207f1aba25686262d87"),
     ("dbt-ml.entity-alias-set", 1, "4a8fbb1a4062e79cb9350615547695ab"),

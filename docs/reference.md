@@ -410,6 +410,8 @@ stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--accept-cost] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
+stel adopt --select EXPR [--exclude EXPR] [--dry-run]  # record that a code_version change left the output unchanged (restamps stel_state only)
+stel plan --pending [--select EXPR] [--json] [--dry-run] [--include-changed]  # upstream rows waiting for a run; exit 3 when any, 0 when none
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -794,7 +796,7 @@ vectors and cost nothing (see below). Set a run budget's `max_cost_usd` when
 you need a cap. `plan.json` carries the estimate per model as
 `estimated_cost_usd`, the rows it was priced at as `priced_rows`, the run log it was read from as `metadata.cost_source`,
 and the target's [cost threshold](#asking-before-a-costly-run-confirm_cost_above_usd)
-as `metadata.confirm_cost_above_usd` (plan schema version 3). A refusal under
+as `metadata.confirm_cost_above_usd` (plan schema version 4). A refusal under
 `on_code_change: fail` names the estimate.
 
 A plan connects to the warehouse the way a run does — the same profile,
@@ -802,6 +804,84 @@ target, and preflight — and writes `target/plan.json`, which `--json` prints
 to stdout for an orchestrator gate. `stel plan` itself never fails on a large
 reprocess; it reports, and its footer names the models a run would refuse
 under the guard below.
+
+### What moved, and adopting a change that changed nothing
+
+When a model is `changed`, the reason line names the identity fields behind its
+`code_version` that differ from the version most stale rows carry, as short
+digests (never values: a prompt or an option can be sensitive):
+
+```
+raw_documents  extraction  incremental  changed  20281  20281
+  code_version differs for 20281 of 20281 published rows; moved: extraction.backend_implementation (505f19ab42c0d7e1 to f0b7a39c6d2e5b48)
+```
+
+`plan.json` carries the same as `identity_changes` (`field`, `before`, `after`),
+with `identity_recorded: false` when the old fields were never on record. stel
+records them after each clean run (`stel_code_identity`), so a release that
+moves a version can be explained from the run before it; rows published before
+that run are reported as "not recorded" instead of guessed at.
+
+If the field that moved is one you have checked cannot change this model's
+output -- a release that edited a module the backend never reads -- record that
+instead of paying for a rewrite:
+
+```bash
+stel plan  --select raw_documents
+stel adopt --select raw_documents --dry-run   # rows and versions, nothing written
+stel adopt --select raw_documents
+```
+
+`stel adopt` rewrites `code_version` in `stel_state` for the selected models to
+the current value, and nothing else: no source is discovered, no provider is
+called, no model table is read or written. Each restamp is appended to
+`stel_adoption_log` (model, old and new `code_version`, rows, who, when).
+`--select` is required; select a model and its descendants (`raw_documents+`)
+only if you checked each. Adopting is your statement that the output is
+unchanged; stel does not verify it. An output column that copies `code_version`
+keeps its old value until that row is next rewritten for another reason.
+
+### Asking whether there is work: `stel plan --pending`
+
+`stel plan` compares code versions against rows already published, so it
+cannot see rows that arrived upstream since the last run. `--pending` asks that
+question, for an orchestrator deciding whether to start a run. Per selected
+embed, chunk or incremental transform model it reports, from the data and
+`stel_state` alone:
+
+- **`new_rows`**: distinct upstream keys with no state row. Exact. A NULL key
+  is never counted (no run publishes one). The key column must be a string or
+  an integer: state keys are stored as text, and only those types print the
+  same in every warehouse, so any other key type reports `unsupported`.
+- **`partition_min` / `partition_max` / `oldest_pending`**: the span of the
+  pending rows in the model's partition column, and the oldest value, so a
+  caller can build a `--read-filter` that narrows the run or alert on
+  staleness. **`cluster_distinct`** is the distinct count of the first cluster
+  column. These need the target to declare `partition_by` / `cluster_by`
+  columns that the upstream also carries; otherwise they are null.
+- **`deleted_rows`**: state rows whose upstream row is gone, counted
+  separately from `new_rows`, since a subset run never deletes them. A full run
+  does delete them, so a model with deleted rows is `pending`.
+- **`changed_rows`** is null unless you pass `--include-changed`, and
+  `changed_reason` says why. A changed row has a state row, and telling it from
+  an unchanged one needs the row's content fingerprint, which reads every
+  column of the upstream. The default report reads the key, partition and
+  cluster columns only, so it can run at sensor frequency; `--include-changed`
+  streams the whole upstream for embed and chunk models and counts rows whose
+  input fingerprint differs from the one state recorded (the runners' own
+  fingerprint, so it cannot drift). Price it first with `--dry-run`. A
+  transform's fingerprint also covers its reference tables, so it stays null.
+  A row whose only change is the model's `code_version` is `stel plan`'s
+  business, not this count.
+
+Any other kind reports `unsupported`; an upstream that does not exist yet
+reports `upstream_missing`. The exit code is **3** when any model has pending
+rows and **0** when none do (1 is an error), so a sensor can branch without
+parsing. `--dry-run` reads nothing, so it exits 0 whatever is waiting, and
+`upstream_missing` and `unsupported` models are not pending; read the `status`
+in the JSON when that distinction matters. `--json` prints `target/pending.json` (`schema_version: 1`).
+`--dry-run` reads nothing and, on BigQuery, prints the bytes the two
+statements would bill; DuckDB does not bill by bytes, so it reports null.
 
 ### Refusing to spend: `on_code_change`
 
@@ -5257,6 +5337,10 @@ artifacts; shipped providers cover Count/TF-IDF/hashing features and Naive
 Bayes classification. Additional regression, clustering, topic-model, and NLP
 providers remain roadmap work.
 
+`ml:` scores locally only; it has no remote-endpoint provider. To use a model
+deployed elsewhere, serve it behind an OpenAI-compatible API and use `vllm`, or call
+it from a Python transform (see [ADR-0054](adr/0054-ml-scores-locally-a-remote-scorer-is-not-yet-an-ml-provider.md)).
+
 ```yaml
 - name: ticket_tfidf
   depends_on: [ref('raw_tickets')]
@@ -6544,6 +6628,11 @@ run results under `target-path`:
   next run would reprocess (with `reprocess_is_upper_bound` when an upstream
   change makes that a ceiling), the upstream models that caused it, and the
   estimated provider calls. `schema_version: 1`. `--json` prints it.
+- **`pending.json`** — written by `stel plan --pending`: per selected model,
+  status (`pending`, `none`, `unsupported`, `upstream_missing`, `dry_run`),
+  `new_rows`, `deleted_rows`, the partition span and oldest pending value,
+  the first cluster column's distinct count, and the bytes estimate.
+  `changed_rows` is null unless `--include-changed`. `schema_version: 1`. `--json` prints it.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`stel docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `stel docs serve`.

@@ -51,6 +51,20 @@ it — which is precisely the person this redirect is for.
    version heading, for example `## v0.2.7 - 2026-07-10`. Confirm every merged
    PR since the previous tag has an entry — a feature PR that skipped the
    changelog is easy to miss.
+   Then re-take the identity baseline, so the next release is compared with this
+   one (issue #750, ADR-0053):
+
+   ```bash
+   STEL_UPDATE_RELEASE_IDENTITY=1 uv run pytest -q tests/test_release_identity_gate.py
+   ```
+
+   Before that, the gate in `tests/test_release_identity_gate.py` has already
+   failed any change that moved a built-in backend's or transform's
+   `code_version`. Each move it allowed is an `intended_changes` entry; list the
+   same fields in the changelog entry, so an operator upgrading knows to run
+   `stel plan` (and `stel adopt` where the output is unchanged). The baseline
+   file then resets `intended_changes` to empty.
+
 4. Run the local checks from the repository root:
 
    ```bash

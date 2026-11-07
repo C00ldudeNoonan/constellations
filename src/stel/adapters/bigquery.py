@@ -270,13 +270,98 @@ def _segment_literal(value: str, key_type: str) -> str:
     return f"'{escaped}'"
 
 
+def _predicate_literal(value: Any, column_type: str | None) -> str | None:
+    """One predicate value as a row-restriction literal, or None when it cannot
+    be written so that it selects exactly what the bound query parameter would.
+
+    A restriction takes literals, not parameters, so the pairing is narrow on
+    purpose: only a Python type the column's own type accepts, and no string
+    with a control character. Anything else keeps the query path, which binds
+    the value and so keeps whatever behavior (or error) it had before.
+    """
+    kind = type(value)
+    if kind is bool:
+        return str(value).upper() if column_type in ("BOOLEAN", "BOOL") else None
+    if kind is int:
+        if column_type in ("INTEGER", "INT64", "FLOAT", "FLOAT64"):
+            return str(value)
+        return None
+    if kind is float:
+        return repr(value) if column_type in ("FLOAT", "FLOAT64") else None
+    if kind is str:
+        if column_type != "STRING" or any(ord(char) < 32 for char in value):
+            return None
+        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{escaped}'"
+    if kind is date:
+        return f"DATE '{value.isoformat()}'" if column_type == "DATE" else None
+    if kind is datetime:
+        if column_type == "DATETIME" and value.tzinfo is None:
+            return f"DATETIME '{value.isoformat(sep=' ')}'"
+        if column_type == "TIMESTAMP":
+            # A naive value is UTC, as the client serializes it for a parameter.
+            instant = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+            return f"TIMESTAMP '{instant.astimezone(UTC).isoformat(sep=' ')}'"
+    return None
+
+
+def _predicate_restrictions(
+    predicates: Sequence[ReadPredicate], column_types: Mapping[str, str]
+) -> list[str] | None:
+    """The predicates as row-restriction clauses (ANDed by the caller), or None
+    when any one of them cannot be written as one. Empty for no predicates."""
+    clauses: list[str] = []
+    for predicate in predicates:
+        if not _UNQUOTED_IDENTIFIER.match(predicate.column):
+            return None
+        column = predicate.column
+        column_type = column_types.get(column)
+        operator = predicate.operator
+        if operator is ReadPredicateOperator.IS_NULL:
+            clauses.append(f"{column} IS NULL")
+        elif operator is ReadPredicateOperator.IS_NOT_NULL:
+            clauses.append(f"{column} IS NOT NULL")
+        elif operator in (ReadPredicateOperator.IN, ReadPredicateOperator.NOT_IN):
+            members = [
+                _predicate_literal(item, column_type)
+                for item in cast(tuple[Any, ...], predicate.value)
+            ]
+            if any(member is None for member in members):
+                return None
+            keyword = "IN" if operator is ReadPredicateOperator.IN else "NOT IN"
+            clauses.append(f"{column} {keyword} ({', '.join(cast(list[str], members))})")
+        else:
+            literal = _predicate_literal(predicate.value, column_type)
+            if literal is None:
+                return None
+            clauses.append(f"{column} {_READ_BINARY_OPERATORS[operator]} {literal}")
+    return clauses
+
+
+def _predicates_identity(predicates: Sequence[ReadPredicate]) -> str:
+    """What a resume point records about the filter it was cut under; "" for an
+    unfiltered read, which is what every point written before this was."""
+    if not predicates:
+        return ""
+    return canonical_fingerprint(
+        {"predicates": [predicate._fingerprint_payload() for predicate in predicates]},
+        domain="dbt-ml-warehouse-snapshot-predicates",
+        version=1,
+    )
+
+
 def _segment_restriction(
-    key_column: str, key_type: str, boundaries: tuple[str, ...], index: int
+    key_column: str,
+    key_type: str,
+    boundaries: tuple[str, ...],
+    index: int,
+    predicate_clauses: Sequence[str],
 ) -> str | None:
     """The row restriction selecting segment `index`, or None for the only segment
-    of an unpartitioned read. Segment `i` holds keys in [boundaries[i-1], boundaries[i])
-    with the first segment open below and the last open above."""
-    clauses: list[str] = []
+    of an unfiltered, unpartitioned read. Segment `i` holds keys in
+    [boundaries[i-1], boundaries[i]) with the first segment open below and the
+    last open above, among the rows the predicates keep."""
+    clauses: list[str] = list(predicate_clauses)
     if index > 0:
         lower = _segment_literal(boundaries[index - 1], key_type)
         clauses.append(f"{key_column} >= {lower}")
@@ -1733,19 +1818,23 @@ class BigQueryAdapter(WarehouseAdapter):
         key: str,
         key_type: str,
         generation: str,
+        where_sql: str,
+        params: Sequence[Any],
     ) -> SnapshotResumePoint | None:
         """The segments for a fresh read.
 
         The time comes from BigQuery's own clock, then the key domain is checked
         and the boundaries cut at that same instant, so no row written after it
-        can slip into the boundaries or past the domain check. None when the
-        boundaries cannot be written safely.
+        can slip into the boundaries or past the domain check. Both run over the
+        rows the predicates keep, so the segments split the relation the read
+        returns and not the whole table. None when the boundaries cannot be
+        written safely.
         """
         taken = self._snapshot_clock()
         table_ref = self.table_ref(request.table)
         as_of = f"FOR SYSTEM_TIME AS OF TIMESTAMP('{taken.isoformat()}')"
-        self._refuse_invalid_key_domain_as_of(table_ref, as_of, key)
-        boundaries = self._segment_boundaries(table_ref, as_of, key)
+        self._refuse_invalid_key_domain_as_of(table_ref, as_of, key, where_sql, params)
+        boundaries = self._segment_boundaries(table_ref, as_of, key, where_sql, params)
         if not _boundaries_are_writable(boundaries, key_type):
             return None
         return SnapshotResumePoint(
@@ -1755,6 +1844,7 @@ class BigQueryAdapter(WarehouseAdapter):
             completed=0,
             rows=0,
             generation=generation,
+            predicates=_predicates_identity(request.predicates),
         )
 
     def _snapshot_clock(self) -> datetime:
@@ -1765,7 +1855,12 @@ class BigQueryAdapter(WarehouseAdapter):
         return value
 
     def _refuse_invalid_key_domain_as_of(
-        self, table_ref: str, as_of: str, key: str
+        self,
+        table_ref: str,
+        as_of: str,
+        key: str,
+        where_sql: str,
+        params: Sequence[Any],
     ) -> None:
         """The NULL and duplicate check, pinned to the snapshot instant.
 
@@ -1778,7 +1873,8 @@ class BigQueryAdapter(WarehouseAdapter):
         job = self._start_query(
             f"SELECT COUNTIF({ident} IS NULL), "
             f"COUNT({ident}) - COUNT(DISTINCT {ident}) "
-            f"FROM {table_ref} {as_of}",
+            f"FROM {table_ref} {as_of}{where_sql}",
+            list(params),
             use_query_cache=False,
         )
         rows = [tuple(row.values()) for row in job.result()]
@@ -1790,7 +1886,14 @@ class BigQueryAdapter(WarehouseAdapter):
                 f"{null_count} NULL and {duplicate_count} duplicate value(s)"
             )
 
-    def _segment_boundaries(self, table_ref: str, as_of: str, key: str) -> list[str]:
+    def _segment_boundaries(
+        self,
+        table_ref: str,
+        as_of: str,
+        key: str,
+        where_sql: str,
+        params: Sequence[Any],
+    ) -> list[str]:
         """The key at the start of each segment after the first, in key order.
 
         Exact rather than approximate, so segments hold `_SEGMENT_ROWS` rows
@@ -1801,8 +1904,9 @@ class BigQueryAdapter(WarehouseAdapter):
         job = self._start_query(
             f"SELECT {ident} FROM (SELECT {ident}, "
             f"ROW_NUMBER() OVER (ORDER BY {ident}) AS rn "
-            f"FROM {table_ref} {as_of}) "
+            f"FROM {table_ref} {as_of}{where_sql}) "
             f"WHERE rn > 1 AND MOD(rn - 1, {_SEGMENT_ROWS}) = 0 ORDER BY rn",
+            list(params),
             use_query_cache=False,
         )
         return [str(row.values()[0]) for row in job.result()]
@@ -1814,9 +1918,11 @@ class BigQueryAdapter(WarehouseAdapter):
         point: SnapshotResumePoint,
         key: str,
         output_names: Sequence[str],
+        predicate_clauses: Sequence[str],
     ) -> TableReadSnapshot:
         """Read the remaining segments one session at a time, each as of the
-        point's snapshot instant (issue #614).
+        point's snapshot instant (issue #614). A predicated read restricts every
+        segment to the rows the predicates keep (issue #754).
 
         One session per segment keeps every session inside BigQuery's six-hour
         limit, however long the publish runs. Pinning every session to the same
@@ -1836,7 +1942,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 selected_fields=selected_fields,
                 snapshot_time=taken,
                 row_restriction=_segment_restriction(
-                    key, point.key_type, point.boundaries, index
+                    key, point.key_type, point.boundaries, index, predicate_clauses
                 ),
             )
 
@@ -1897,14 +2003,19 @@ class BigQueryAdapter(WarehouseAdapter):
                 completed_rows += segment_rows
 
         def resume(candidate: SnapshotResumePoint) -> TableReadSnapshot | None:
-            # Only a point for this same key type, taken recently enough that time
-            # travel still reaches it, can be continued. Anything else reads fresh.
+            # Only a point for this same key type and the same filter, taken
+            # recently enough that time travel still reaches it, can be
+            # continued. Its boundaries cut one relation; under another filter
+            # its completed count would skip rows this read still owes. Anything
+            # else reads fresh.
             if candidate.key_type != point.key_type:
+                return None
+            if candidate.predicates != point.predicates:
                 return None
             if not _snapshot_point_is_recent(candidate.snapshot_time):
                 return None
             return self._open_segmented_snapshot(
-                request, table_id, candidate, key, output_names
+                request, table_id, candidate, key, output_names, predicate_clauses
             )
 
         def progress() -> SnapshotResumePoint:
@@ -1915,6 +2026,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 completed=completed,
                 rows=completed_rows,
                 generation=point.generation,
+                predicates=point.predicates,
             )
 
         def validate_unchanged() -> None:
@@ -2469,10 +2581,12 @@ class BigQueryAdapter(WarehouseAdapter):
                     + ", ".join(missing)
                 )
 
+            column_types = {
+                str(field.name): str(field.field_type).upper()
+                for field in initial_table.schema
+            }
             where_sql, params = _bigquery_read_predicates(
-                self,
-                request.predicates,
-                {str(field.name): str(field.field_type) for field in initial_table.schema},
+                self, request.predicates, column_types
             )
             projection = (
                 "*"
@@ -2480,25 +2594,30 @@ class BigQueryAdapter(WarehouseAdapter):
                 else ", ".join(self.quote_ident(column) for column in request.columns)
             )
             output_names = request.columns or available_names
-            # A keyed, unfiltered read is cut into resumable segments pinned to
-            # one instant (issue #614). It runs its own key-domain check as of
-            # that instant, so it returns before the live-table check below.
+            # A keyed read is cut into resumable segments pinned to one instant
+            # (issue #614). A predicated one is too (issue #754): the predicates
+            # shape the boundary queries and ride on every session as a row
+            # restriction. It runs its own key-domain check as of that instant,
+            # so it returns before the live-table check below.
             #
             # Not an ordered one: segments are cut and resumed in key order,
-            # so a read ordered by anything else cannot be one of them.
+            # so a read ordered by anything else cannot be one of them. Nor a
+            # predicate that cannot be written as a restriction literal, which
+            # keeps the query path that binds it.
+            predicate_clauses = _predicate_restrictions(request.predicates, column_types)
             segmented_key = (
                 self._segmented_key(request, initial_table)
-                if not where_sql and not request.order_by
+                if predicate_clauses is not None and not request.order_by
                 else None
             )
-            if segmented_key is not None:
+            if segmented_key is not None and predicate_clauses is not None:
                 key, key_type = segmented_key
                 point = self._plan_segments(
-                    request, table_id, key, key_type, initial_generation
+                    request, table_id, key, key_type, initial_generation, where_sql, params
                 )
                 if point is not None:
                     return self._open_segmented_snapshot(
-                        request, table_id, point, key, output_names
+                        request, table_id, point, key, output_names, predicate_clauses
                     )
             if request.key_column is not None:
                 self._validate_read_key_domain(request, where_sql, params)
@@ -2531,10 +2650,10 @@ class BigQueryAdapter(WarehouseAdapter):
             # amount of changing how the result is *read* could have fixed
             # that (issue #441); only not running the query does.
             #
-            # Predicated reads keep the query path -- translating predicates
-            # into a Storage Read `row_restriction` was explicitly out of
-            # scope for this fix, and the failing shape in practice (a search
-            # publish reading its own embeddings table back) is unfiltered.
+            # Predicated reads without a key keep the query path -- only a
+            # keyed read has segments to restrict (issue #754), and the failing
+            # shape here (a search publish reading its own embeddings table
+            # back) is unfiltered.
             if not where_sql and request.columns is not None and not request.order_by:
                 job = None
                 session = self._open_storage_read_session_for_table(
@@ -3414,6 +3533,21 @@ class BigQueryAdapter(WarehouseAdapter):
             rows_written=num_rows,
             job_metadata=job_metadata,
         )
+
+    def cast_to_text(self, expression: str) -> str:
+        return f"CAST({expression} AS STRING)"
+
+    def estimate_query_bytes(self, sql: str, params: list[Any]) -> int | None:
+        bigquery = _bigquery()
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        if params:
+            job_config.query_parameters = to_query_parameters(params)
+        try:
+            job = self.client.query(sql, job_config=job_config)
+        except Exception as e:
+            raise AdapterError(f"Query dry-run failed [{type(e).__name__}]") from e
+        total = getattr(job, "total_bytes_processed", None)
+        return None if total is None else int(total)
 
     def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
         bigquery = _bigquery()

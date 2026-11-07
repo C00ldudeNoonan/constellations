@@ -5833,10 +5833,10 @@ def test_an_unfiltered_projected_snapshot_skips_the_query_entirely() -> None:
     ]
 
 
-def test_a_predicated_snapshot_still_uses_the_query_path() -> None:
-    """A predicate keeps the query path even with explicit columns --
-    translating predicates into a Storage Read `row_restriction` was
-    explicitly out of scope for this fix."""
+def test_a_predicated_snapshot_without_a_key_uses_the_query_path() -> None:
+    """A predicate with no key column keeps the query path even with explicit
+    columns: only a keyed read has segments to restrict, and a keyed predicated
+    read is cut into them instead (issue #754, tests/test_segmented_snapshot.py)."""
     payload = pa.table({"chunk_id": ["a"], "symbol": ["AAPL"]})
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = ["chunk_id", "symbol"]
@@ -5996,14 +5996,16 @@ def test_key_validation_carries_the_read_predicates() -> None:
     adapter, client = _snapshot_adapter(
         {"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]}
     )
-    # A predicated read keeps the query path, so it takes the key-domain
-    # aggregate and then the payload job, not the segmented read's statements.
+    # A predicate with no safe restriction literal (a control character) keeps
+    # the query path, so it takes the key-domain aggregate and then the payload
+    # job. A writable one is segmented, and its as-of key-domain check carries
+    # the predicates too (issue #754, tests/test_segmented_snapshot.py).
     payload = pa.table({"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]})
     client.query_results = [
         _FakeJob(rows=[(0, 0)]),
         _FakeSnapshotJob(payload),
     ]
-    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL")
+    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL\t")
     with adapter.table_snapshot(
         "chunks", key_column="chunk_id", predicate=predicate
     ) as snapshot:
@@ -6177,4 +6179,63 @@ def test_integration_ordered_snapshot_arrives_in_order() -> None:
                 assert seen == [row["id"] for row in expected], columns
     finally:
         assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_pending_upstream_counts_keys_without_state() -> None:
+    """Issue #751, against a real dataset: the anti-join casts a numeric key to
+    STRING, the dry run bills bytes, and neither statement names a wide column."""
+    from datetime import date as date_type
+
+    from stel.adapters import StateRecord, StateScope
+    from stel.adapters.base import PendingUpstreamRequest
+
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "stel_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, BigQueryAdapter)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "chunks",
+                pl.DataFrame(
+                    {
+                        "context_id": [1, 2, 3],
+                        "filing_date": [
+                            date_type(2026, 1, 1),
+                            date_type(2026, 2, 1),
+                            date_type(2026, 3, 1),
+                        ],
+                        "symbol": ["AAA", "BBB", "BBB"],
+                    }
+                ),
+            )
+            scope = StateScope("embeddings")
+            adapter.upsert_state(
+                scope, [StateRecord("1", "fp", "v1"), StateRecord("gone", "fp", "v1")]
+            )
+            request = PendingUpstreamRequest(
+                scope=scope,
+                upstream="chunks",
+                key_column="context_id",
+                partition_column="filing_date",
+                cluster_column="symbol",
+            )
+            assert adapter.cast_to_text("x") == "CAST(x AS STRING)"
+            new_sql, _, params = adapter._pending_upstream_sql(request, state_exists=True)
+            assert (adapter.estimate_query_bytes(new_sql, params) or 0) >= 0
+
+            summary = adapter.pending_upstream(request, dry_run=False)
+            assert (summary.new_rows, summary.deleted_rows) == (2, 1)
+            assert summary.partition_min == date_type(2026, 2, 1)
+            assert summary.cluster_distinct == 1
+    finally:
         adapter._reset_storage_for_test()

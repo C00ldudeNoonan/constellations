@@ -65,7 +65,13 @@ from .execution.deletion_guard import is_valid_approval
 from .logging_setup import REPORTER_ECHO_EXTRA
 from .manifest import capture_manifest, compute_modified_models
 from .paths import resolve_within_project
-from .plan import ModelPlan, plan_models, price_plans, run_log_relation
+from .plan import (
+    ModelPlan,
+    plan_models,
+    price_plans,
+    record_published_identity,
+    run_log_relation,
+)
 from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
@@ -1234,6 +1240,34 @@ def _watermark_safely[T](model_name: str, operation: str, action: Callable[[], T
         return None
 
 
+def _record_identity_safely(
+    model: ModelConfig,
+    *,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+) -> None:
+    """Record the identity fields behind a clean run's code_version (issue
+    #750) without letting a failure reach the run.
+
+    An error boundary, like `_watermark_safely`: the record only feeds
+    `stel plan` diagnostics, and a warehouse that refuses to create the table
+    must not fail a model that published correctly. The class, not the text,
+    is logged."""
+    try:
+        record_published_identity(
+            model, project=project, project_dir=project_dir, adapter=adapter, resolved=resolved
+        )
+    except Exception as error:
+        log.warning(
+            "%s: could not record its code identity [%s]; `stel plan` will not "
+            "be able to name what moved next release",
+            model.name,
+            type(error).__name__,
+        )
+
+
 def _published_row_count_if_code_unchanged(
     model: ModelConfig,
     *,
@@ -1499,6 +1533,13 @@ def _run_model(
             lambda: adapter.write_sync_watermark(
                 StateScope(model.name), parent_scope, watermark
             ),
+        )
+    if not result.errors and result.status != "unchanged":
+        # Best-effort like the watermark above: the record only lets a later
+        # `stel plan` name what moved (issue #750), so losing it never costs
+        # a run.
+        _record_identity_safely(
+            model, project=project, project_dir=project_dir, adapter=adapter, resolved=resolved
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     result.started_at = started_at

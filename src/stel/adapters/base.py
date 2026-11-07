@@ -17,7 +17,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
@@ -220,6 +220,16 @@ WRITER_CLAIM_TABLE = "stel_writer_claim"
 # that never benefits from it never gets an empty table for it.
 SYNC_WATERMARK_TABLE = "stel_sync_watermark"
 
+# The identity fields behind each code_version a scope has published under
+# (issue #750): `stel_state` keeps only the digest, so without this `stel plan`
+# can say a model's code_version moved but not what moved it. Lazily created on
+# first write, best-effort like the watermark -- diagnostics, not core state.
+CODE_IDENTITY_TABLE = "stel_code_identity"
+
+# Append-only record of `stel adopt` restamps: who moved which published rows
+# from which code_version to which, and when (issue #750).
+ADOPTION_LOG_TABLE = "stel_adoption_log"
+
 # Serving-ledger table name shared with retrieval.coordination: fenced state
 # replacement must verify a publication claim in the same warehouse that owns
 # the state rows, without adapters importing retrieval code.
@@ -283,6 +293,8 @@ INTERNAL_TABLE_NAMES = (
     SERVING_LEDGER_TABLE,
     SERVING_LEASE_TABLE,
     SYNC_WATERMARK_TABLE,
+    CODE_IDENTITY_TABLE,
+    ADOPTION_LOG_TABLE,
     LEGACY_STATE_TABLE,
     LEGACY_SERVING_LEDGER_TABLE,
     LEGACY_SERVING_LEASE_TABLE,
@@ -411,6 +423,40 @@ class StateScopeSummary:
     rows: int
     code_versions: int
     last_run_at: str | None
+
+
+@dataclass(frozen=True)
+class PendingUpstreamRequest:
+    """What `pending_upstream` should compare (issue #751).
+
+    `key_column` is the upstream column the model's state keys are the
+    stringified value of. `partition_column` and `cluster_column` are layout
+    columns the *upstream* carries, or None; the summary reports a span over
+    the first and a distinct count over the second.
+    """
+
+    scope: StateScope
+    upstream: str
+    key_column: str
+    partition_column: str | None = None
+    cluster_column: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingUpstreamSummary:
+    """Upstream rows with no state row, and state rows with no upstream row.
+
+    `new_rows` is exact. It says nothing about rows whose content changed: a
+    changed row has a state row, and telling it apart needs the row's content
+    fingerprint, which no kind computes from key and layout columns alone.
+    """
+
+    new_rows: int
+    partition_min: Any | None
+    partition_max: Any | None
+    cluster_distinct: int | None
+    deleted_rows: int
+    estimated_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -734,6 +780,10 @@ class SnapshotResumePoint:
     # reports it. A resumed read reports this one, not the current table's, since
     # its rows are the content as of `snapshot_time`.
     generation: str
+    # Identity of the row predicates the boundaries were cut under, "" for none.
+    # The boundaries partition the key domain of one filtered relation, so a
+    # point is only a valid place to continue a read of that same relation.
+    predicates: str
 
     def __post_init__(self) -> None:
         if not self.snapshot_time:
@@ -755,6 +805,7 @@ class SnapshotResumePoint:
                 "completed": self.completed,
                 "rows": self.rows,
                 "generation": self.generation,
+                "predicates": self.predicates,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -779,6 +830,9 @@ class SnapshotResumePoint:
                 completed=int(payload["completed"]),
                 rows=int(payload["rows"]),
                 generation=str(payload["generation"]),
+                # A stamp written before predicated reads were segmented has no
+                # key, and every such read was unfiltered.
+                predicates=str(payload.get("predicates", "")),
             )
         except (ValueError, KeyError, TypeError, AdapterError):
             return None
@@ -2160,6 +2214,235 @@ to see the plan first."""
             [scope.model_name, scope.stage, scope.target_identity],
         )
         return {str(code_version): int(count) for code_version, count in found}
+
+    # ─── code identity and adoption (issue #750) ──────────────────────────
+
+    def record_code_identity(
+        self, scope: StateScope, code_version: str, components: Mapping[str, str]
+    ) -> None:
+        """Remember which identity fields produced `code_version` for `scope`.
+
+        Written after a clean run, so a later release that moves the version
+        can be compared field by field. Replaces any earlier record for the
+        same version: the fields are a pure function of it."""
+        table = f"{self.schema_ref}.{self.quote_ident(CODE_IDENTITY_TABLE)}"
+        self.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                model_name STRING NOT NULL,
+                state_scope STRING NOT NULL,
+                target_identity STRING NOT NULL,
+                code_version STRING NOT NULL,
+                components STRING NOT NULL,
+                recorded_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        key = [scope.model_name, scope.stage, scope.target_identity, code_version]
+        self.execute(
+            f"DELETE FROM {table} WHERE model_name = ? AND state_scope = ? "
+            "AND target_identity = ? AND code_version = ?",
+            key,
+        )
+        self.execute(
+            f"INSERT INTO {table} (model_name, state_scope, target_identity, "
+            "code_version, components, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [*key, json.dumps(dict(components), sort_keys=True), datetime.now(UTC)],
+        )
+
+    def read_code_identity(
+        self, scope: StateScope, code_versions: Sequence[str]
+    ) -> dict[str, dict[str, str]]:
+        """The recorded identity fields for each of `code_versions` that has
+        a record; a version published before records were kept is absent."""
+        if not code_versions or self.table_column_names(CODE_IDENTITY_TABLE) is None:
+            return {}
+        table = f"{self.schema_ref}.{self.quote_ident(CODE_IDENTITY_TABLE)}"
+        found = self.rows(
+            f"SELECT code_version, components FROM {table} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ?",
+            [scope.model_name, scope.stage, scope.target_identity],
+        )
+        wanted = set(code_versions)
+        return {
+            str(version): {str(k): str(v) for k, v in json.loads(str(raw)).items()}
+            for version, raw in found
+            if str(version) in wanted
+        }
+
+    def adopt_code_version(
+        self,
+        scope: StateScope,
+        new_code_version: str,
+        components: Mapping[str, str],
+        *,
+        adopted_by: str,
+    ) -> dict[str, int]:
+        """Restamp every published row in `scope` to `new_code_version`.
+
+        Touches `stel_state` only: no model table, no provider, no input is
+        read. Returns the row count adopted from each old version (a scope
+        already at the new version adopts nothing). Writes the restamp, then
+        one `stel_adoption_log` row per old version; a failure on the log
+        write raises after the restamp has landed, and says so."""
+        counts = self.state_code_version_counts(scope)
+        moving = {v: n for v, n in counts.items() if v != new_code_version}
+        if not moving:
+            return {}
+        state = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        self.execute(
+            f"UPDATE {state} SET code_version = ? WHERE model_name = ? "
+            "AND state_scope = ? AND target_identity = ? AND code_version <> ?",
+            [
+                new_code_version,
+                scope.model_name,
+                scope.stage,
+                scope.target_identity,
+                new_code_version,
+            ],
+        )
+        try:
+            self.record_code_identity(scope, new_code_version, components)
+            log_table = f"{self.schema_ref}.{self.quote_ident(ADOPTION_LOG_TABLE)}"
+            self.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {log_table} (
+                    model_name STRING NOT NULL,
+                    state_scope STRING NOT NULL,
+                    target_identity STRING NOT NULL,
+                    old_code_version STRING NOT NULL,
+                    new_code_version STRING NOT NULL,
+                    rows_adopted BIGINT NOT NULL,
+                    adopted_by STRING NOT NULL,
+                    adopted_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            adopted_at = datetime.now(UTC)
+            for old_version, rows in moving.items():
+                self.execute(
+                    f"INSERT INTO {log_table} VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        scope.model_name,
+                        scope.stage,
+                        scope.target_identity,
+                        old_version,
+                        new_code_version,
+                        rows,
+                        adopted_by,
+                        adopted_at,
+                    ],
+                )
+        except AdapterError as error:
+            raise AdapterError(
+                f"The rows of '{scope.model_name}' were restamped to "
+                f"{new_code_version}, but recording the adoption failed: {error}"
+            ) from error
+        return moving
+
+    # ─── pending upstream rows (issue #751) ───────────────────────────────
+
+    def cast_to_text(self, expression: str) -> str:
+        """`expression` as the text type state keys are stored in."""
+        return f"CAST({expression} AS VARCHAR)"
+
+    def estimate_query_bytes(self, sql: str, params: list[Any]) -> int | None:
+        """Bytes `sql` would bill, or None where the warehouse does not bill by
+        bytes scanned. Reads nothing."""
+        del sql, params
+        return None
+
+    def _pending_upstream_sql(
+        self, request: PendingUpstreamRequest, *, state_exists: bool
+    ) -> tuple[str, str, list[Any]]:
+        """The new-rows and deleted-rows statements and their shared parameters.
+
+        Key, partition and cluster columns only: neither statement names a wide
+        column, so a columnar warehouse bills those columns and nothing else."""
+        upstream = self.table_ref(request.upstream)
+        state = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        key = self.quote_ident(request.key_column)
+        partition = (
+            self.quote_ident(request.partition_column)
+            if request.partition_column is not None
+            else None
+        )
+        cluster = (
+            self.quote_ident(request.cluster_column)
+            if request.cluster_column is not None
+            else None
+        )
+        # Distinct keys, not rows: a key repeated upstream is one record to
+        # the runners. A NULL key never matches a state row, so it is left
+        # out rather than reported as pending forever.
+        select = [
+            f"COUNT(DISTINCT up.{key})",
+            f"MIN(up.{partition})" if partition else "NULL",
+            f"MAX(up.{partition})" if partition else "NULL",
+            f"COUNT(DISTINCT up.{cluster})" if cluster else "NULL",
+        ]
+        in_state = (
+            f"SELECT 1 FROM {state} AS st WHERE st.model_name = ? "
+            "AND st.state_scope = ? AND st.target_identity = ? "
+        )
+        new_sql = (
+            f"SELECT {', '.join(select)} FROM {upstream} AS up "
+            f"WHERE up.{key} IS NOT NULL AND NOT EXISTS ({in_state}"
+            f"AND st.record_key = {self.cast_to_text(f'up.{key}')})"
+        )
+        deleted_sql = (
+            f"SELECT COUNT(*) FROM {state} AS st WHERE st.model_name = ? "
+            "AND st.state_scope = ? AND st.target_identity = ? "
+            f"AND NOT EXISTS (SELECT 1 FROM {upstream} AS up "
+            f"WHERE {self.cast_to_text(f'up.{key}')} = st.record_key)"
+        )
+        if not state_exists:
+            # Nothing has been published, so every upstream row is new.
+            all_sql = (
+                f"SELECT {', '.join(select)} FROM {upstream} AS up "
+                f"WHERE up.{key} IS NOT NULL"
+            )
+            return all_sql, "SELECT 0", []
+        scope = request.scope
+        return (
+            new_sql,
+            deleted_sql,
+            [scope.model_name, scope.stage, scope.target_identity],
+        )
+
+    def pending_upstream(
+        self, request: PendingUpstreamRequest, *, dry_run: bool
+    ) -> PendingUpstreamSummary:
+        """Count the upstream rows the model's state has never seen.
+
+        Read-only, and it reads the key, partition and cluster columns plus
+        stel's own state table. With `dry_run` it runs nothing and returns only
+        the byte estimate (zeros elsewhere). An absent state table means
+        nothing has been published, so every upstream row is new."""
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES, operation="pending upstream rows"
+        )
+        new_sql, deleted_sql, params = self._pending_upstream_sql(
+            request, state_exists=self.table_column_names(STATE_TABLE) is not None
+        )
+        estimates = [
+            self.estimate_query_bytes(new_sql, params),
+            self.estimate_query_bytes(deleted_sql, params),
+        ]
+        known = [value for value in estimates if value is not None]
+        estimated = sum(known) if known else None
+        if dry_run:
+            return PendingUpstreamSummary(0, None, None, None, 0, estimated)
+        found = self.rows(new_sql, params)[0]
+        deleted = self.rows(deleted_sql, params)[0][0]
+        return PendingUpstreamSummary(
+            new_rows=int(found[0]),
+            partition_min=found[1],
+            partition_max=found[2],
+            cluster_distinct=None if found[3] is None else int(found[3]),
+            deleted_rows=int(deleted),
+            estimated_bytes=estimated,
+        )
 
     def state_generation(self, scope: StateScope) -> StateGeneration | None:
         """`scope`'s row count and most recent `last_run_at`, or None when it

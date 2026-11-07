@@ -147,6 +147,18 @@ STEL_MCP_PRINCIPAL_ID=me stel concept-cloud --linking-model entity_links \
 
 Click a star, then **Show me a sentence**.
 
+To load the same systems and relations into a graph store, export them as
+JSON Lines instead:
+
+```bash
+stel graph-export --linking-model entity_links --relation-model entity_relations \
+  --entity-name system -o target/graph
+```
+
+`target/graph/nodes.jsonl` has one row per system, keyed by the `entity_id`
+the agent-context tables carry, and `edges.jsonl` one row per relation, each
+naming the passage and extractor version it came from.
+
 ## 6. Give it to an agent
 
 stel serves the index over MCP, with citations and lineage on every result.

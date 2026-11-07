@@ -45,6 +45,7 @@ from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .execution.deletion_guard import is_valid_approval
 from .freshness import check_freshness
+from .graph_export import GraphExportError, export_graph, write_graph_export
 from .logging_setup import (
     configure_diagnostics_file,
     configure_verbose_logging,
@@ -2879,6 +2880,74 @@ def _serve_concept_cloud(
         raise click.ClickException(str(e)) from e
     except (AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e
+
+
+@cli.command("graph-export")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("graph_export"),
+    show_default=True,
+    help="Directory to write nodes.jsonl, edges.jsonl and graph_manifest.json to.",
+)
+@click.option(
+    "--linking-model",
+    required=True,
+    help="Entity-linking model (link_entities output) whose matched links become nodes.",
+)
+@click.option(
+    "--relation-model",
+    required=True,
+    help="Relation model (extract_relations output) whose asserted rows become edges.",
+)
+@click.option(
+    "--entity-name",
+    required=True,
+    help=(
+        "The entity_name your governed metrics and context_entity_links use "
+        "(e.g. `system`). It is part of every node's entity_id, so a different "
+        "value gives ids that do not join."
+    ),
+)
+@_verbose_option
+@_project_context_options
+@click.pass_context
+def graph_export(
+    ctx: click.Context,
+    output: Path,
+    linking_model: str,
+    relation_model: str,
+    entity_name: str,
+    verbose: int,
+    diagnostics_file: Path | None,
+) -> None:
+    """Export linked entities and relations as a graph (#762).
+
+    Writes JSON Lines nodes keyed by the agent-context ``entity_id`` and one
+    edge per extracted fact, each naming its document and extractor version,
+    plus a manifest. Reads only the two models' output tables.
+    """
+    _configure_output(verbose, diagnostics_file=diagnostics_file)
+    try:
+        graph = export_graph(
+            ctx.obj["project_dir"],
+            linking_model=linking_model,
+            relation_model=relation_model,
+            entity_name=entity_name,
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+        )
+    except (GraphExportError, AdapterError, *_CONFIG_ERRORS) as e:
+        raise ConfigClickError(str(e)) from e
+    written = write_graph_export(
+        graph, output, linking_model=linking_model, relation_model=relation_model
+    )
+    skipped = sum(graph.edges_skipped.values())
+    click.echo(
+        f"Wrote graph ({len(graph.nodes)} nodes, {len(graph.edges)} edges"
+        f"{f', {skipped} relations skipped' if skipped else ''}) to {written}"
+    )
 
 
 def _named_specs(flag: str, raws: tuple[str, ...]) -> dict[str, str]:

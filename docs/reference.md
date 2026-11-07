@@ -5300,6 +5300,10 @@ artifacts; shipped providers cover Count/TF-IDF/hashing features and Naive
 Bayes classification. Additional regression, clustering, topic-model, and NLP
 providers remain roadmap work.
 
+`ml:` scores locally only; it has no remote-endpoint provider. To use a model
+deployed elsewhere, serve it behind an OpenAI-compatible API and use `vllm`, or call
+it from a Python transform (see [ADR-0054](adr/0054-ml-scores-locally-a-remote-scorer-is-not-yet-an-ml-provider.md)).
+
 ```yaml
 - name: ticket_tfidf
   depends_on: [ref('raw_tickets')]

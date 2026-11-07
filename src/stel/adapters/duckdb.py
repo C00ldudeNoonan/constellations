@@ -123,13 +123,17 @@ _READ_BINARY_OPERATORS = {
 }
 
 
-def _duckdb_read_predicates(
-    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate]
-) -> tuple[str, list[Any]]:
+def _duckdb_read_clauses(
+    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate], *, qualifier: str
+) -> tuple[list[str], list[Any]]:
+    """The predicates as ANDable clauses and their bound parameters, in the
+    order the placeholders appear. `qualifier` prefixes each column (`probe.`)
+    where the clause sits beside another table's columns, so a partition column
+    named like a state column cannot bind to the wrong one."""
     clauses: list[str] = []
     params: list[Any] = []
     for predicate in predicates:
-        column = adapter.quote_ident(predicate.column)
+        column = f"{qualifier}{adapter.quote_ident(predicate.column)}"
         if predicate.operator in _READ_BINARY_OPERATORS:
             clauses.append(f"{column} {_READ_BINARY_OPERATORS[predicate.operator]} ?")
             params.append(predicate.value)
@@ -144,6 +148,13 @@ def _duckdb_read_predicates(
         else:
             assert predicate.operator is ReadPredicateOperator.IS_NOT_NULL
             clauses.append(f"{column} IS NOT NULL")
+    return clauses, params
+
+
+def _duckdb_read_predicates(
+    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate]
+) -> tuple[str, list[Any]]:
+    clauses, params = _duckdb_read_clauses(adapter, predicates, qualifier="")
     return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
 
@@ -1783,6 +1794,7 @@ class DuckDBAdapter(WarehouseAdapter):
             transaction_open = True
             state_ref = f"{self.schema_ref}.{self.quote_ident(_STATE_TABLE)}"
             absence_sql = ""
+            probe_params: list[Any] = []
             # Bound separately rather than narrowed in place: each form
             # compiles a different predicate.
             scope_probe = (
@@ -1827,9 +1839,36 @@ class DuckDBAdapter(WarehouseAdapter):
                 # is a supported contract for embed -- so the cast keeps the
                 # comparison on the same normalization the keys were written
                 # with, rather than relying on implicit coercion (issue #428).
+                #
+                # A partitioned publisher's probe keeps only the rows it reads
+                # (issue #764), so a key whose row moved to another partition
+                # counts as absent. The predicates ride on the probe's own
+                # subquery, which is what lets NOT EXISTS see a moved row as
+                # missing rather than as present elsewhere.
+                if relation_probe.predicates:
+                    probe_columns = {
+                        str(column[0])
+                        for column in cursor_conn.execute(
+                            f"SELECT * FROM {probe_ref} LIMIT 0"
+                        ).description
+                    }
+                    missing = sorted(
+                        {p.column for p in relation_probe.predicates} - probe_columns
+                    )
+                    if missing:
+                        raise AdapterError(
+                            "State absence probe predicate column(s) "
+                            f"{', '.join(missing)} are not in relation "
+                            f"'{relation_probe.table}'"
+                        )
+                probe_clauses, probe_params = _duckdb_read_clauses(
+                    self, relation_probe.predicates, qualifier="probe."
+                )
+                probe_filter = "".join(f" AND {clause}" for clause in probe_clauses)
                 absence_sql = (
                     f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
-                    f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key)"
+                    f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key"
+                    f"{probe_filter})"
                 )
             nonce = uuid4().hex
             scope = request.scope
@@ -1844,6 +1883,8 @@ class DuckDBAdapter(WarehouseAdapter):
                 ]
                 if last_key is not None:
                     params.append(last_key)
+                if relation_probe is not None:
+                    params.extend(probe_params)
                 if scope_probe is not None:
                     params.extend(
                         [

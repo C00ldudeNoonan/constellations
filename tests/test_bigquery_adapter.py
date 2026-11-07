@@ -3997,6 +3997,76 @@ def test_a_pinned_absence_probe_judges_the_relation_at_its_own_instant() -> None
     assert values.count(page_instant) == 1
 
 
+def test_an_absence_probe_carries_the_partition_predicate_at_the_pinned_instant() -> None:
+    # Issue #764: a partitioned publisher's probe keeps only the rows its
+    # snapshot read returns, judged at the instant that read pinned. A row that
+    # moved to another partition still exists upstream, so only a predicate on
+    # the probe itself makes it absent.
+    page_instant = datetime.now(UTC)
+    pinned = page_instant - timedelta(hours=7)
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = [
+        "chunk_id",
+        SimpleNamespace(name="filing_year", field_type="INT64", mode="NULLABLE"),
+    ]
+    client.query_results = [_FakeJob(rows=[(page_instant,)]), _FakeJob(rows=[])]
+    adapter = _adapter(client)
+    probe = StateAbsenceProbe(
+        table="chunks",
+        key_column="chunk_id",
+        as_of=pinned,
+        predicates=(ReadPredicate("filing_year", ReadPredicateOperator.EQUAL, 2024),),
+    )
+    with adapter.state_page_reader(
+        StateScope("m"), page_size=5, absent_from=probe
+    ) as reader:
+        reader.fetch_page(None)
+
+    sql, job_config = client.queries[1]
+    # Inside the probe's own subquery, qualified so it cannot bind to a state
+    # column, and after the key comparison it narrows.
+    assert (
+        "WHERE CAST(probe.`chunk_id` AS STRING) = state.record_key "
+        "AND probe.`filing_year` = ?)"
+    ) in sql
+    values = _param_values(job_config)
+    # Placeholders in text order: the probe's instant, then its predicate value,
+    # then the page size.
+    assert values[-3:] == [pinned, 2024, 5]
+
+
+def test_an_absence_probe_without_predicates_is_unchanged() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.query_results = [_FakeJob(rows=[(datetime.now(UTC),)]), _FakeJob(rows=[])]
+    adapter = _adapter(client)
+    with adapter.state_page_reader(
+        StateScope("m"),
+        page_size=5,
+        absent_from=StateAbsenceProbe(table="chunks", key_column="chunk_id"),
+    ) as reader:
+        reader.fetch_page(None)
+    sql, _ = client.queries[1]
+    assert "= state.record_key)" in sql
+
+
+def test_an_absence_probe_predicate_on_a_missing_column_fails() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.query_results = [_FakeJob(rows=[(datetime.now(UTC),)])]
+    adapter = _adapter(client)
+    probe = StateAbsenceProbe(
+        table="chunks",
+        key_column="chunk_id",
+        predicates=(ReadPredicate("filing_year", ReadPredicateOperator.EQUAL, 2024),),
+    )
+    with pytest.raises(AdapterError, match="filing_year"):
+        with adapter.state_page_reader(
+            StateScope("m"), page_size=5, absent_from=probe
+        ):
+            pass
+
+
 def test_state_page_reader_missing_probe_relation_fails() -> None:
     ts = datetime.now(UTC)
     client = _FakeClient()

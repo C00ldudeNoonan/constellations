@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- A search publish that owns one partition of its upstream now reconciles stale keys
+  against that partition, at the instant its snapshot read pinned. `StateAbsenceProbe`
+  and `BoundedReconciler.iter_stale_pages` take the same typed predicates as the
+  snapshot read, on DuckDB and BigQuery, so a row re-dated into another partition is
+  stale for the member it left and is removed on publish, while a row still inside it
+  is not. A predicate on a column the upstream lacks fails the publish rather than
+  calling every published row stale. No project can declare a partition yet (ADR-0037),
+  so a `search:` model's behavior is unchanged; this is the reconciliation half of a
+  segmented search group's publisher (issue #764).
+  Upgrading: the change moves `backend:llm` `extraction.backend_implementation`
+  although no `llm` extraction output changes (its identity hashes the adapter modules
+  through its import closure, #750). Run `stel plan`, then `stel adopt --select <model>`
+  for models that use the `llm` extraction backend.
+
 ## v0.25.0 - 2026-11-07
 
 - `stel adopt --select <model>` records that a `code_version` change left a model's

@@ -30,7 +30,12 @@ from ..adapters import (
     WarehouseAdapter,
     WarehouseCapability,
 )
-from ..adapters.base import RETRIEVAL_PUBLISH_STAGE, SnapshotResumePoint, TableReadSnapshot
+from ..adapters.base import (
+    RETRIEVAL_PUBLISH_STAGE,
+    ReadPredicate,
+    SnapshotResumePoint,
+    TableReadSnapshot,
+)
 from ..config.model import ModelConfig, SearchConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -89,6 +94,7 @@ def run_search_model(
     project_dir: Path,
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
+    partition: tuple[ReadPredicate, ...],
     full_refresh: bool = False,
     subset_run: bool = False,
 ) -> ModelRunResult:
@@ -106,6 +112,7 @@ def run_search_model(
             project_dir=project_dir,
             adapter=adapter,
             resolved=resolved,
+            partition=partition,
             full_refresh=full_refresh,
             subset_run=subset_run,
             timings=timings,
@@ -124,6 +131,7 @@ def _run_search_model(
     project_dir: Path,
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
+    partition: tuple[ReadPredicate, ...],
     full_refresh: bool = False,
     subset_run: bool = False,
     timings: PhaseTimings,
@@ -181,6 +189,10 @@ def _run_search_model(
             columns=projected,
             batch_size=search.batch_size,
             key_column=search.id_field,
+            # The rows this publisher owns. The stale probe below takes the
+            # same predicates, so what is read and what is judged present are
+            # one set (issue #764).
+            predicate=partition,
         ) as snapshot:
             # The serving scope is keyed on the logical collection, so it
             # resolves without knowing which generation is live (issue #355).
@@ -846,6 +858,12 @@ def _run_search_model(
                     reconciler.iter_stale_pages(
                         upstream_table=upstream,
                         key_column=search.id_field,
+                        # A row that moved out of this partition still exists
+                        # upstream, so absence from the whole relation would
+                        # keep it here forever (issue #764). The same
+                        # predicates as the snapshot read, so a published row
+                        # is stale exactly when the read no longer returns it.
+                        predicates=partition,
                         # A segmented read is judged against the instant it pinned,
                         # so a row the snapshot holds is never called stale because
                         # the live table has since dropped it (issue #614).

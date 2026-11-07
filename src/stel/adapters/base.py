@@ -352,11 +352,21 @@ class StateAbsenceProbe:
     rather than as it is at the page. A publish that read a pinned snapshot must
     use the same instant, or it removes rows that snapshot contains and keeps
     rows it does not (issue #614).
+
+    `predicates` restrict the probe to the rows a partitioned publisher reads
+    (issue #764). A key counts as present only when an upstream row carries it
+    *and* satisfies every predicate, so a row that moved out of the partition
+    is absent and its published copy is stale. These must be the predicates
+    the publisher's own snapshot read used: a probe over a wider relation is
+    the bug this field exists to close, because a moved row still exists
+    upstream and would survive in its old collection. Empty means the whole
+    relation, which is the unpartitioned publish.
     """
 
     table: str
     key_column: str
     as_of: datetime | None = None
+    predicates: tuple[ReadPredicate, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.table:

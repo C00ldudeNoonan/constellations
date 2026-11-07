@@ -31,6 +31,7 @@ from stel.adapters import (
     create_adapter,
     parse_warehouse_config,
 )
+from stel.adapters.base import ReadPredicate, ReadPredicateOperator
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.retrieval import ServingCoordinator
 from stel.state_reconciliation import (
@@ -177,13 +178,77 @@ def test_absence_probe_streams_exactly_the_stale_complement(tmp_path: Path) -> N
         )
         pages = list(
             reconciler.iter_stale_pages(
-                upstream_table="chunks_upstream", key_column="chunk_id"
+                upstream_table="chunks_upstream",
+                key_column="chunk_id",
+                predicates=(),
             )
         )
         stale = [record.record_key for page in pages for record in page]
         assert stale == keys[:10] + keys[30:]
         assert all(len(page) <= 7 for page in pages)
         assert pages[0][0].input_fingerprint == "fp-k0000"
+
+
+def _filed_in(year: int) -> tuple[ReadPredicate, ...]:
+    return (ReadPredicate("filing_year", ReadPredicateOperator.EQUAL, year),)
+
+
+def _stale_keys(reconciler: BoundedReconciler, predicates: tuple[ReadPredicate, ...]) -> list[str]:
+    return [
+        record.record_key
+        for page in reconciler.iter_stale_pages(
+            upstream_table="filings",
+            key_column="chunk_id",
+            predicates=predicates,
+        )
+        for record in page
+    ]
+
+
+def test_a_row_that_moved_out_of_the_partition_is_stale_for_that_member(
+    tmp_path: Path,
+) -> None:
+    """Issue #764: a member that publishes one partition judges absence against
+    that partition, not the whole relation.
+
+    k0001 was re-dated into 2025, so it still exists upstream. Probed against
+    the whole relation it is never stale and survives in the 2024 member's
+    collection forever; probed against the member's own rows it is.
+    """
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, _keys(4))
+        adapter.materialize_full(
+            "filings",
+            pl.DataFrame(
+                {
+                    # k0003 is gone upstream entirely.
+                    "chunk_id": ["k0000", "k0001", "k0002"],
+                    "filing_year": [2024, 2025, 2024],
+                }
+            ),
+        )
+        reconciler = BoundedReconciler(adapter, SCOPE, code_version="v1", page_size=2)
+
+        assert _stale_keys(reconciler, _filed_in(2024)) == ["k0001", "k0003"]
+        # What the partition adds: the whole-relation probe misses the moved row.
+        assert _stale_keys(reconciler, ()) == ["k0003"]
+
+
+def test_an_absence_probe_predicate_on_a_missing_column_fails(tmp_path: Path) -> None:
+    """A typo in a partition column must stop the publish. Read as "no upstream
+    row satisfies it", it would call every published row stale and delete them
+    all."""
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, _keys(2))
+        _materialize_upstream(adapter, _keys(2))
+        probe = StateAbsenceProbe(
+            table="chunks_upstream",
+            key_column="chunk_id",
+            predicates=_filed_in(2024),
+        )
+        with pytest.raises(AdapterError, match="filing_year"):
+            with adapter.state_page_reader(SCOPE, page_size=5, absent_from=probe):
+                pass
 
 
 def test_empty_upstream_marks_every_state_row_stale(tmp_path: Path) -> None:
@@ -195,7 +260,9 @@ def test_empty_upstream_marks_every_state_row_stale(tmp_path: Path) -> None:
         )
         pages = list(
             reconciler.iter_stale_pages(
-                upstream_table="chunks_upstream", key_column="chunk_id"
+                upstream_table="chunks_upstream",
+                key_column="chunk_id",
+                predicates=(),
             )
         )
         assert [record.record_key for page in pages for record in page] == _keys(23)
@@ -210,7 +277,9 @@ def test_empty_state_yields_no_stale_pages(tmp_path: Path) -> None:
         assert (
             list(
                 reconciler.iter_stale_pages(
-                    upstream_table="chunks_upstream", key_column="chunk_id"
+                    upstream_table="chunks_upstream",
+                key_column="chunk_id",
+                predicates=(),
                 )
             )
             == []
@@ -313,7 +382,9 @@ def test_reconciliation_residency_is_bounded_by_page_size(tmp_path: Path) -> Non
         stale = [
             record.record_key
             for page in reconciler.iter_stale_pages(
-                upstream_table="chunks_upstream", key_column="chunk_id"
+                upstream_table="chunks_upstream",
+                key_column="chunk_id",
+                predicates=(),
             )
             for record in page
         ]

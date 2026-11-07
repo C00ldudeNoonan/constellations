@@ -97,9 +97,10 @@ evaluation required before it replaces a monolithic index.
   current BigQuery adapter sends predicated snapshots through a query job and
   disables its resumable keyed segments. The publish path needs a bounded
   filtered read before a 3.6M-row corpus can use it safely.
-- `StateReconciler.iter_stale_pages` currently probes the whole upstream. It
-  needs the same partition predicate as the snapshot, or a row moved between
-  years survives in its old collection.
+- `BoundedReconciler.iter_stale_pages` used to probe the whole upstream, so a row
+  moved between years survived in its old collection. It now takes the same
+  partition predicate as the snapshot read, evaluated at the same instant on both
+  adapters (#764); a group declaration still has to supply it.
 - MCP `BusinessFilter` currently accepts only `eq`, `ne`, and `in`, so date
   range routing also needs an additive typed filter contract. An unsupported
   filter may prevent pruning but must still be enforced in every member.

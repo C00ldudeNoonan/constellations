@@ -352,10 +352,23 @@ class StateAbsenceProbe:
     rather than as it is at the page. A publish that read a pinned snapshot must
     use the same instant, or it removes rows that snapshot contains and keeps
     rows it does not (issue #614).
+
+    `predicates` restrict the probe to the rows a partitioned publisher reads
+    (issue #764). A key counts as present only when an upstream row carries it
+    *and* satisfies every predicate, so a row that moved out of the partition
+    is absent and its published copy is stale. These must be the predicates
+    the publisher's own snapshot read used: a probe over a wider relation is
+    the bug this field exists to close, because a moved row still exists
+    upstream and would survive in its old collection. Empty means the whole
+    relation, which is the unpartitioned publish.
     """
 
     table: str
     key_column: str
+    # Required, with `()` for the whole relation: a caller that leaves it out
+    # by accident would probe more than it published, which is the bug this
+    # field exists to close, so the choice is made visible at each call site.
+    predicates: tuple[ReadPredicate, ...]
     as_of: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -365,6 +378,19 @@ class StateAbsenceProbe:
             raise AdapterError("State absence probe key_column must not be empty")
         if self.as_of is not None and self.as_of.tzinfo is None:
             raise AdapterError("State absence probe as_of must be timezone-aware")
+
+    def require_predicate_columns(self, available: Iterable[str]) -> None:
+        """Refuse a predicate on a column the relation lacks.
+
+        Read as "no row satisfies it", it would call every published key stale
+        and delete them all, so the publish stops instead. Names are compared as
+        the snapshot read compares them: exactly."""
+        missing = sorted({p.column for p in self.predicates} - set(available))
+        if missing:
+            raise AdapterError(
+                "State absence probe predicate column(s) "
+                f"{', '.join(missing)} are not in relation '{self.table}'"
+            )
 
 
 @dataclass(frozen=True)
@@ -637,6 +663,13 @@ class WarehouseCapability(StrEnum):
     # consumer cut batches that are narrow in the target's partition and cluster
     # columns.
     ORDERED_TABULAR_READS = "ordered_tabular_reads"
+    # A state absence probe can be judged against the relation as it was at an
+    # earlier instant (`StateAbsenceProbe.as_of`, issues #614 and #764). A
+    # publisher that reads a partition of its upstream needs the probe at the
+    # instant the read pinned, so on an adapter with this capability it refuses
+    # a read that pinned none. An adapter without it (DuckDB has no time travel)
+    # judges absence inside its own read transaction and refuses `as_of`.
+    POINT_IN_TIME_STATE_ABSENCE = "point_in_time_state_absence"
     PAGED_STATE_RECONCILIATION = "paged_state_reconciliation"
     ATOMIC_STATE_SCOPE_REPLACE = "atomic_state_scope_replace"
     ATOMIC_PARENT_CHILD_REPLACE = "atomic_parent_child_replace"

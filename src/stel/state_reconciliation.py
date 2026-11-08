@@ -24,6 +24,7 @@ from datetime import datetime
 
 from .adapters.base import (
     AdapterError,
+    ReadPredicate,
     StateAbsenceProbe,
     StatePageReader,
     StatePageRecord,
@@ -156,6 +157,7 @@ class BoundedReconciler:
         *,
         upstream_table: str,
         key_column: str,
+        predicates: tuple[ReadPredicate, ...],
         as_of: datetime | None = None,
     ) -> Generator[tuple[StatePageRecord, ...], None, None]:
         """Stream state records whose keys are absent from the upstream
@@ -163,9 +165,20 @@ class BoundedReconciler:
         the upstream relation is empty: every scoped state row is stale.
 
         `as_of` judges absence against the relation at that instant, which a
-        publish reading a pinned snapshot must do (issue #614)."""
+        publish reading a pinned snapshot must do (issue #614).
+
+        `predicates` must be the ones the publish's snapshot read used. A
+        member that publishes one partition of a relation reads only that
+        partition, so a key whose row has moved into another partition is
+        absent *for that member* even though the relation still holds it
+        (issue #764). Required, with `()` for an unpartitioned publish: leaving
+        it out by accident would silently probe the whole relation, which is
+        the one wrong answer that looks right until a row moves."""
         probe = StateAbsenceProbe(
-            table=upstream_table, key_column=key_column, as_of=as_of
+            table=upstream_table,
+            key_column=key_column,
+            as_of=as_of,
+            predicates=predicates,
         )
         with self._adapter.state_page_reader(
             self._scope, page_size=self._page_size, absent_from=probe

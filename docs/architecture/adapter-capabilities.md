@@ -64,6 +64,7 @@ gets the same clear error rather than an attribute error or silent skip.
 | multi-statement transactions | yes | no |
 | typed empty relations | yes | yes |
 | bounded chunk writes | yes | yes |
+| stale-key probe judged at an earlier instant (`point_in_time_state_absence`) | no | yes |
 | additive schema evolution | yes | yes |
 
 Capabilities describe implemented guarantees, not aspirations. Adapter sets are

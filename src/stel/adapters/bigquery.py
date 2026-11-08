@@ -1109,15 +1109,20 @@ def _read_param(value: Any, column_type: str | None) -> Any:
     return value
 
 
-def _bigquery_read_predicates(
+def _bigquery_read_clauses(
     adapter: BigQueryAdapter,
     predicates: Sequence[ReadPredicate],
     column_types: Mapping[str, str],
-) -> tuple[str, list[Any]]:
+    *,
+    qualifier: str,
+) -> tuple[list[str], list[Any]]:
+    """The predicates as ANDable clauses and their bound parameters, in the
+    order the placeholders appear. `qualifier` prefixes each column (`probe.`)
+    where the clause sits beside another table's columns."""
     clauses: list[str] = []
     params: list[Any] = []
     for predicate in predicates:
-        column = adapter.quote_ident(predicate.column)
+        column = f"{qualifier}{adapter.quote_ident(predicate.column)}"
         column_type = column_types.get(predicate.column)
         if predicate.operator in _READ_BINARY_OPERATORS:
             clauses.append(f"{column} {_READ_BINARY_OPERATORS[predicate.operator]} ?")
@@ -1137,6 +1142,17 @@ def _bigquery_read_predicates(
         else:
             assert predicate.operator is ReadPredicateOperator.IS_NOT_NULL
             clauses.append(f"{column} IS NOT NULL")
+    return clauses, params
+
+
+def _bigquery_read_predicates(
+    adapter: BigQueryAdapter,
+    predicates: Sequence[ReadPredicate],
+    column_types: Mapping[str, str],
+) -> tuple[str, list[Any]]:
+    clauses, params = _bigquery_read_clauses(
+        adapter, predicates, column_types, qualifier=""
+    )
     return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
 
@@ -1517,6 +1533,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 WarehouseCapability.ICEBERG_TABLE_FORMAT,
                 WarehouseCapability.ORDERED_TABULAR_READS,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
+                WarehouseCapability.POINT_IN_TIME_STATE_ABSENCE,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
                 WarehouseCapability.SQL_MODEL_MATERIALIZATION,
@@ -4933,6 +4950,7 @@ SELECT deleted_count;
         # to re-derive.
         scope_probe = probe if isinstance(probe, StateScopeAbsenceProbe) else None
         relation_probe = probe if isinstance(probe, StateAbsenceProbe) else None
+        probe_params: list[Any] = []
         if scope_probe is not None:
             # Absence from another slice of the same table (issue #635). No
             # CAST: both sides are `record_key`, which is always the
@@ -4954,11 +4972,23 @@ SELECT deleted_count;
                     "State absence probe relation "
                     f"'{relation_probe.table}.{relation_probe.key_column}' is unavailable"
                 ) from None
-            if relation_probe.key_column not in {field.name for field in probe_table.schema}:
+            probe_column_types = {
+                str(field.name): str(field.field_type).upper()
+                for field in probe_table.schema
+            }
+            if relation_probe.key_column not in probe_column_types:
                 raise AdapterError(
                     "State absence probe relation "
                     f"'{relation_probe.table}.{relation_probe.key_column}' is unavailable"
                 )
+            relation_probe.require_predicate_columns(probe_column_types)
+            probe_clauses, probe_params = _bigquery_read_clauses(
+                self,
+                relation_probe.predicates,
+                probe_column_types,
+                qualifier="probe.",
+            )
+            probe_filter = "".join(f" AND {clause}" for clause in probe_clauses)
             # `record_key` is always a STRING, because state keys are the
             # stringified id. The probe column need not be -- a numeric id is
             # a supported contract for embed -- and BigQuery refuses to
@@ -4969,7 +4999,7 @@ SELECT deleted_count;
                 " AND NOT EXISTS (SELECT 1 FROM "
                 f"{self.table_ref(relation_probe.table)} AS probe FOR SYSTEM_TIME AS OF ? "
                 f"WHERE CAST(probe.{self.quote_ident(relation_probe.key_column)} AS STRING) = "
-                "state.record_key)"
+                f"state.record_key{probe_filter})"
             )
         nonce = uuid4().hex
         scope = request.scope
@@ -4993,6 +5023,7 @@ SELECT deleted_count;
                     if relation_probe.as_of is not None
                     else snapshot_at
                 )
+                params.extend(probe_params)
             if scope_probe is not None:
                 params.extend(
                     [

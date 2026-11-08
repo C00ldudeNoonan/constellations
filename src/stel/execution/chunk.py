@@ -497,7 +497,9 @@ def _iter_removed_state_keys(
     deletes data.
     """
     if in_warehouse:
-        probe = StateAbsenceProbe(table=upstream, key_column="document_id")
+        probe = StateAbsenceProbe(
+            table=upstream, key_column="document_id", predicates=()
+        )
         with adapter.state_page_reader(
             scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
         ) as reader:

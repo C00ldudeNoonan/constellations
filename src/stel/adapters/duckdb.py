@@ -123,13 +123,17 @@ _READ_BINARY_OPERATORS = {
 }
 
 
-def _duckdb_read_predicates(
-    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate]
-) -> tuple[str, list[Any]]:
+def _duckdb_read_clauses(
+    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate], *, qualifier: str
+) -> tuple[list[str], list[Any]]:
+    """The predicates as ANDable clauses and their bound parameters, in the
+    order the placeholders appear. `qualifier` prefixes each column (`probe.`)
+    where the clause sits beside another table's columns, so a partition column
+    named like a state column cannot bind to the wrong one."""
     clauses: list[str] = []
     params: list[Any] = []
     for predicate in predicates:
-        column = adapter.quote_ident(predicate.column)
+        column = f"{qualifier}{adapter.quote_ident(predicate.column)}"
         if predicate.operator in _READ_BINARY_OPERATORS:
             clauses.append(f"{column} {_READ_BINARY_OPERATORS[predicate.operator]} ?")
             params.append(predicate.value)
@@ -144,6 +148,13 @@ def _duckdb_read_predicates(
         else:
             assert predicate.operator is ReadPredicateOperator.IS_NOT_NULL
             clauses.append(f"{column} IS NOT NULL")
+    return clauses, params
+
+
+def _duckdb_read_predicates(
+    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate]
+) -> tuple[str, list[Any]]:
+    clauses, params = _duckdb_read_clauses(adapter, predicates, qualifier="")
     return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
 
@@ -1772,6 +1783,41 @@ class DuckDBAdapter(WarehouseAdapter):
         ).fetchall()
         return {str(r[0]): StateValue(str(r[1]), str(r[2])) for r in rows}
 
+    def _relation_absence_sql(
+        self, cursor_conn: Any, probe: StateAbsenceProbe
+    ) -> tuple[str, list[Any]]:
+        """The `AND NOT EXISTS (...)` clause for a relation probe and its bound
+        parameters, in placeholder order."""
+        probe_ref = self.table_ref(probe.table)
+        probe_key = self.quote_ident(probe.key_column)
+        try:
+            cursor_conn.execute(f"SELECT {probe_key} FROM {probe_ref} LIMIT 0")
+        except duckdb.Error:
+            raise AdapterError(
+                "State absence probe relation "
+                f"'{probe.table}.{probe.key_column}' is unavailable"
+            ) from None
+        if probe.predicates:
+            described = cursor_conn.execute(f"SELECT * FROM {probe_ref} LIMIT 0")
+            probe.require_predicate_columns(str(column[0]) for column in described.description)
+        # `record_key` is always a VARCHAR, because state keys are the
+        # stringified id. The probe column need not be -- a numeric id is a
+        # supported contract for embed -- so the cast keeps the comparison on
+        # the same normalization the keys were written with, rather than
+        # relying on implicit coercion (issue #428).
+        #
+        # A partitioned publisher's probe keeps only the rows it reads (issue
+        # #764), so a key whose row moved to another partition counts as absent.
+        # The predicates ride on the probe's own subquery, which is what lets
+        # NOT EXISTS see a moved row as missing rather than as present elsewhere.
+        clauses, params = _duckdb_read_clauses(self, probe.predicates, qualifier="probe.")
+        extra = "".join(f" AND {clause}" for clause in clauses)
+        sql = (
+            f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
+            f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key{extra})"
+        )
+        return sql, params
+
     def _open_state_page_reader(self, request: StatePageRequest) -> StatePageReader:
         # A dedicated cursor holds one read transaction open for the reader's
         # lifetime, so every page observes the same MVCC snapshot even while
@@ -1783,6 +1829,7 @@ class DuckDBAdapter(WarehouseAdapter):
             transaction_open = True
             state_ref = f"{self.schema_ref}.{self.quote_ident(_STATE_TABLE)}"
             absence_sql = ""
+            probe_params: list[Any] = []
             # Bound separately rather than narrowed in place: each form
             # compiles a different predicate.
             scope_probe = (
@@ -1812,24 +1859,8 @@ class DuckDBAdapter(WarehouseAdapter):
                     "AND probe.record_key = state.record_key)"
                 )
             elif relation_probe is not None:
-                probe_ref = self.table_ref(relation_probe.table)
-                probe_key = self.quote_ident(relation_probe.key_column)
-                try:
-                    cursor_conn.execute(f"SELECT {probe_key} FROM {probe_ref} LIMIT 0")
-                except duckdb.Error:
-                    raise AdapterError(
-                        "State absence probe relation "
-                        f"'{relation_probe.table}."
-                        f"{relation_probe.key_column}' is unavailable"
-                    ) from None
-                # `record_key` is always a VARCHAR, because state keys are the
-                # stringified id. The probe column need not be -- a numeric id
-                # is a supported contract for embed -- so the cast keeps the
-                # comparison on the same normalization the keys were written
-                # with, rather than relying on implicit coercion (issue #428).
-                absence_sql = (
-                    f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
-                    f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key)"
+                absence_sql, probe_params = self._relation_absence_sql(
+                    cursor_conn, relation_probe
                 )
             nonce = uuid4().hex
             scope = request.scope
@@ -1844,6 +1875,8 @@ class DuckDBAdapter(WarehouseAdapter):
                 ]
                 if last_key is not None:
                     params.append(last_key)
+                if relation_probe is not None:
+                    params.extend(probe_params)
                 if scope_probe is not None:
                     params.extend(
                         [

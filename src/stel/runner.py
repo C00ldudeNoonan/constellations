@@ -1500,6 +1500,9 @@ def _run_model(
             project_dir=project_dir,
             adapter=adapter,
             resolved=resolved,
+            # No declared partitions yet: a search model publishes its whole
+            # upstream. A segmented group's member supplies its own (ADR-0037).
+            partition=(),
             full_refresh=full_refresh,
             subset_run=subset_run,
         )

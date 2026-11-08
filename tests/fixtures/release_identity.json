@@ -153,5 +153,11 @@
       "transform_code_hash": "5cf5f1773b155e4e"
     }
   },
-  "intended_changes": []
+  "intended_changes": [
+    {
+      "case": "backend:llm",
+      "field": "extraction.backend_implementation",
+      "reason": "A partitioned search publish reconciles stale keys against its own partition (issue #764): the state absence probe gained predicates in adapters/base.py, duckdb.py and bigquery.py. The llm backend's identity hashes those modules through its import closure but never reads an absence probe, so its output is unchanged; run `stel plan`, then `stel adopt` for llm-extraction models."
+    }
+  ]
 }

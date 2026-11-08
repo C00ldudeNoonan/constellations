@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import re
 import shlex
 from pathlib import Path
@@ -245,7 +246,48 @@ def test_star_map_names_and_colours_systems_from_the_vocabulary(built: Path) -> 
     assert export.concept_edges
 
 
-def test_the_longest_declared_name_claims_an_overlapping_span() -> None:
+def test_graph_export_nodes_join_to_the_governed_context(
+    built: Path, tmp_path: Path
+) -> None:
+    """ALE-423 / #762: the exported nodes are keyed by the same `entity_id` the
+    agent-context link table carries, so a graph store joins to governed
+    metrics without re-deriving identity, and every edge names its source."""
+    out = tmp_path / "graph"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir", str(built),
+            "graph-export",
+            "--linking-model", "entity_links",
+            "--relation-model", "entity_relations",
+            "--entity-name", "system",
+            "-o", str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    nodes = [
+        json.loads(line)
+        for line in (out / "nodes.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    edges = [
+        json.loads(line)
+        for line in (out / "edges.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    governed = {
+        row[0] for row in _rows(built, f"select entity_id from {NAME}.context_entity_links")
+    }
+    assert {node["entity_id"] for node in nodes} == governed
+    assert len(nodes) == 8
+    assert {node["canonical_id"]: node["class"] for node in nodes}["Postgres"] == "datastore"
+
+    assert edges
+    node_ids = {node["entity_id"] for node in nodes}
+    for edge in edges:
+        assert edge["subject_entity_id"] in node_ids
+        assert edge["object_entity_id"] in node_ids
+        assert edge["document_id"]
+        assert edge["extractor_version"]
+
     """Template code a user extends with their own vocabulary: when one term's
     name contains another's, the longer one wins the span, whatever order
     the terms are declared in."""

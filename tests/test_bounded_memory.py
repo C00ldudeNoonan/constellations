@@ -177,6 +177,16 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         "model, at document grain -- one row per document, also smaller than "
         "the mention-grain linking read beside it",
     ),
+    (
+        "graph_export.py",
+        "export_graph",
+        2,
+        EXCEPTION,
+        "an artifact export like the concept cloud, not a pipeline stage (#762, "
+        "ADR-0055): it reads the mention-grain links and the relation table whole "
+        "and rewrites the graph in full, so it is corpus-scale on a large project. "
+        "Incremental export is the deferred change that would bound it",
+    ),
 )
 
 

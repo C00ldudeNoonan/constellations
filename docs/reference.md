@@ -432,6 +432,7 @@ stel providers list [--output {table,json}]              # built-in + entry-poin
 stel source freshness                                    # mtime vs warn_after/error_after
 stel docs generate [--output DIR]                        # static HTML site from manifest.json
 stel docs serve [--port N]                               # local http.server over target/docs/
+stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR]  # nodes.jsonl + edges.jsonl a graph store can load
 stel emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
 stel codegen --output DIR                                # generate dbt Python-model shims + schema.yml (embedded path)
 stel clean                                               # remove known target artifacts; preserve warehouses
@@ -5867,6 +5868,82 @@ The direction can also reverse: a stel transform can declare
 transform — closing the loop in one `dbt build`. See
 [`examples/dbt_ref_roundtrip_dbt`](../examples/dbt_ref_roundtrip_dbt) for a
 runnable stel → dbt → stel → dbt round trip.
+
+## Graph export
+
+`stel graph-export` writes the entities and relations a project extracted as a
+graph a downstream store (Neo4j, Graphiti, a triple store) can load, so each
+consumer does not write its own join of the links table to the relation table
+and re-derive node identity (issue #762, [ADR-0055](adr/0055-graph-export-is-a-cli-over-per-fact-edges.md)).
+
+```bash
+stel graph-export --linking-model entity_links --relation-model entity_relations \
+  --entity-name system -o target/graph
+```
+
+It reads only the two models' output tables and writes three files:
+
+- `nodes.jsonl` — one row per entity a matched link resolved to: `entity_id`,
+  `entity_namespace`, `entity_name`, `canonical_id`, `class` (from the
+  vocabulary term, or null) and `class_ancestors` (nearest parent first).
+- `edges.jsonl` — one row per extracted fact, not an aggregate:
+  `relation_id`, `subject_entity_id`, `object_entity_id`, `relation_type`,
+  `directed`, `method`, `confidence`, `document_id`, `sentence_index`,
+  `extractor`, `extractor_version`, and the `*_resolver` / `*_resolver_version`
+  that linked each end. Every edge therefore names the document and extractor
+  version it came from.
+- `graph_manifest.json` — `stel.graph_export/v1`, the models read, row counts, a
+  SHA-256 per file and a count of relations left out by reason. It is written
+  last, so a directory that has one is complete.
+
+**Node ids join to governed metrics.** `entity_id` is the agent-context
+`make_entity_id(entity_namespace, entity_name, canonical_id)`, the same id
+`context_entity_links` carries. `--entity-name` is required because the links
+table does not record it: it is whatever your governed metrics and context
+models use (the demo uses `system`), and a different value gives ids that do
+not join.
+
+**What becomes an edge.** A relation row whose `status` is `asserted` and
+whose two mentions resolve to two different *matched* entities. Ambiguous and
+unmatched links name no single entity, so relations touching them are left out,
+as are non-asserted relations and relations between two mentions of one entity;
+`graph_manifest.json` counts each (`not_asserted`, `unlinked_mention`,
+`self_relation`). An undirected relation (co-occurrence) is written once with
+its ends in `entity_id` order. A mention matched to two different entities, or
+a repeated `relation_id`, fails the export rather than letting row order decide.
+
+**Deterministic.** Rows are sorted, keys are sorted, and nothing carries a
+timestamp, so two exports of unchanged tables are byte-identical. No mention
+text is read, so nothing withheld upstream (`include_mention_text`) reaches the
+files.
+
+**Not in v1.** The export is a full rewrite each time (no incremental export),
+JSON Lines only (no JSON-LD, Turtle or Graphiti format), and carries no `iri`
+or validity interval, because neither exists in stel yet. The manifest schema
+is versioned so adding them is a version bump, not a column of nulls.
+
+**Loading into Neo4j.** With the APOC plugin and the files under Neo4j's
+import directory, nothing needs hand-transforming. This snippet is not
+exercised by stel's tests (they need no database); treat it as a starting point:
+
+```cypher
+CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.entity_id IS UNIQUE;
+
+CALL apoc.load.json('file:///graph/nodes.jsonl') YIELD value
+MERGE (n:Entity {entity_id: value.entity_id})
+SET n.canonical_id = value.canonical_id, n.entity_namespace = value.entity_namespace,
+    n.class = value.class, n.class_ancestors = value.class_ancestors;
+
+CALL apoc.load.json('file:///graph/edges.jsonl') YIELD value
+MATCH (s:Entity {entity_id: value.subject_entity_id}),
+      (o:Entity {entity_id: value.object_entity_id})
+CALL apoc.merge.relationship(s, toUpper(value.relation_type),
+  {relation_id: value.relation_id},
+  {document_id: value.document_id, extractor: value.extractor,
+   extractor_version: value.extractor_version, method: value.method,
+   confidence: value.confidence, directed: value.directed}, o) YIELD rel
+RETURN count(rel);
+```
 
 ## Star map (visualization)
 

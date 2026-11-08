@@ -7,12 +7,14 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
 from .class_hierarchy import ClassDeclaration, class_names, validate_classes
 from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME
+from .ontology import OntologyImport
 from .vocabulary import RelationTypeDef, Vocabulary, check_declaration
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
@@ -57,6 +59,11 @@ class ProjectConfig(BaseModel):
         default_factory=lambda: [Path("transforms")], alias="transform-paths"
     )
     target_path: Path = Field(default=Path("target"), alias="target-path")
+    # Ontology files imported into the declaration below (issue #767). An
+    # authoring input, like a vocabulary's `from:`: `load_project` resolves it
+    # into `vocabularies:`, `classes:` and `relations:`, and nothing reads it
+    # after that. Declared before them so their validators can see it.
+    ontologies: tuple[OntologyImport, ...] = Field(default_factory=tuple, exclude=True)
     # Declared domain vocabularies (issue #625): a closed, ordered label set
     # a `type: enum` field can point at with `values_from: vocab.<name>`
     # instead of repeating `values:` inline. Keyed by the name used there.
@@ -68,11 +75,19 @@ class ProjectConfig(BaseModel):
     classes: tuple[ClassDeclaration, ...] = Field(default_factory=tuple)
     relations: tuple[RelationTypeDef, ...] = Field(default_factory=tuple)
 
+    # A project that imports an ontology may refer to an imported class from
+    # a hand-written relation, term or `subclass_of:`, so every cross-reference
+    # check below waits for the import: `stel.ontology_import` merges it, then
+    # calls `validate_merged_declaration`. Without `ontologies:` nothing waits.
+
     @field_validator("classes")
     @classmethod
-    def _validate_classes(cls, v: tuple[ClassDeclaration, ...]) -> tuple[ClassDeclaration, ...]:
+    def _validate_classes(
+        cls, v: tuple[ClassDeclaration, ...], info: ValidationInfo
+    ) -> tuple[ClassDeclaration, ...]:
         normalized = tuple(value.strip() if isinstance(value, str) else value for value in v)
-        validate_classes(normalized)
+        if not info.data.get("ontologies"):
+            validate_classes(normalized)
         return normalized
 
     @model_validator(mode="after")
@@ -80,16 +95,29 @@ class ProjectConfig(BaseModel):
         # Vocabulary names and term classes are checked against the project
         # around them, in the function the serving catalog also applies to a
         # compiled declaration (issue #669), so the two cannot disagree.
-        check_declaration(self.vocabularies, class_names(self.classes))
+        if not self.ontologies:
+            check_declaration(self.vocabularies, class_names(self.classes))
         return self
 
     @model_validator(mode="after")
     def _validate_relations(self) -> ProjectConfig:
+        if not self.ontologies:
+            self._check_relations()
+        return self
+
+    def validate_merged_declaration(self) -> None:
+        """Run the checks construction deferred for `ontologies:`; raises ValueError."""
+        validate_classes(self.classes)
+        check_declaration(self.vocabularies, class_names(self.classes))
+        self._check_relations()
+
+    def _check_relations(self) -> None:
         if not self.relations:
-            return self
+            return
         declared_classes = set(class_names(self.classes))
         seen: set[tuple[str, str, str]] = set()
         functional_by_name: dict[str, bool] = {}
+        iri_by_name: dict[str, str] = {}
         for relation in self.relations:
             if functional_by_name.setdefault(relation.name, relation.functional) != (
                 relation.functional
@@ -98,6 +126,14 @@ class ProjectConfig(BaseModel):
                     f"relation '{relation.name}' is declared `functional` on one "
                     "pairing and not on another; `functional` belongs to the "
                     "relation type, so every pairing must agree"
+                )
+            if relation.iri is not None and iri_by_name.setdefault(
+                relation.name, relation.iri
+            ) != relation.iri:
+                raise ValueError(
+                    f"relation '{relation.name}' declares two IRIs, "
+                    f"{iri_by_name[relation.name]} and {relation.iri}; a relation "
+                    "name is one relation type"
                 )
             for class_name, role in (
                 (relation.subject_class, "subject_class"),
@@ -115,7 +151,6 @@ class ProjectConfig(BaseModel):
                     f"{relation.object_class}) declared twice"
                 )
             seen.add(key)
-        return self
 
     @property
     def yaml_provenance(self) -> YamlProvenance | None:

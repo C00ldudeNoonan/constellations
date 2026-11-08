@@ -517,9 +517,13 @@ def load_project(
     # the concrete variants, which is correct when transform.path itself
     # contains a ${matrix.KEY} placeholder.
     _populate_sql_depends_on(models, project_dir)
-    # Local import: vocabulary_sources uses ConfigError and file validation.
+    # Local imports: both modules use ConfigError and file validation. The
+    # ontology import goes first: a CSV vocabulary's term may name a class it
+    # declares, and it validates the merged declaration as a whole.
+    from ..ontology_import import resolve_ontologies
     from ..vocabulary_sources import resolve_csv_vocabularies
 
+    resolve_ontologies(project, project_dir)
     resolve_csv_vocabularies(project, project_dir)
     _resolve_declared_vocabularies(project, models)
 

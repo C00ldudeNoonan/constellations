@@ -3,14 +3,20 @@
 ## Unreleased
 
 - A search publish that owns one partition of its upstream now reconciles stale keys
-  against that partition, at the instant its snapshot read pinned. `StateAbsenceProbe`
-  and `BoundedReconciler.iter_stale_pages` take the same typed predicates as the
-  snapshot read, on DuckDB and BigQuery, so a row re-dated into another partition is
-  stale for the member it left and is removed on publish, while a row still inside it
-  is not. A predicate on a column the upstream lacks fails the publish rather than
-  calling every published row stale. No project can declare a partition yet (ADR-0037),
-  so a `search:` model's behavior is unchanged; this is the reconciliation half of a
-  segmented search group's publisher (issue #764).
+  against that partition. `StateAbsenceProbe` and `BoundedReconciler.iter_stale_pages`
+  take the same typed predicates as the snapshot read, on DuckDB and BigQuery, so a row
+  re-dated into another partition is stale for the member it left and is removed on
+  publish, while a row still inside it is not. On BigQuery the probe is judged at the
+  instant the read pinned, and a partitioned publish whose read pinned none (a predicate
+  with no safe literal keeps the unpinned query path, #754) is refused before any row is
+  written; BigQuery gains a `point_in_time_state_absence` capability to say so. DuckDB
+  has no time travel: it judges absence inside the probe's own read transaction and
+  refuses a pinned instant. `StateAbsenceProbe.predicates` is required (`()` for the
+  whole relation), so a probe cannot silently widen. A predicate on a column the
+  upstream lacks fails the publish rather than calling every published row stale. No
+  project can declare a partition yet (ADR-0037), so a `search:` model's behavior is
+  unchanged; this is the reconciliation half of a segmented search group's publisher
+  (issue #764).
   Upgrading: the change moves `backend:llm` `extraction.backend_implementation`
   although no `llm` extraction output changes (its identity hashes the adapter modules
   through its import closure, #750). Run `stel plan`, then `stel adopt --select <model>`

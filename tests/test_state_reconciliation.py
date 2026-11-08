@@ -7,6 +7,7 @@ larger than one page.
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any, cast
 
@@ -234,6 +235,74 @@ def test_a_row_that_moved_out_of_the_partition_is_stale_for_that_member(
         assert _stale_keys(reconciler, ()) == ["k0003"]
 
 
+@pytest.mark.parametrize(
+    ("predicates", "stale"),
+    [
+        # The shape ADR-0037 gives a partition: nonoverlapping bounds on a date.
+        (
+            (
+                ReadPredicate(
+                    "filed", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2024, 1, 1)
+                ),
+                ReadPredicate("filed", ReadPredicateOperator.LESS_THAN, date(2025, 1, 1)),
+            ),
+            ["k0000", "k0002", "k0003"],
+        ),
+        (
+            (ReadPredicate("form", ReadPredicateOperator.IN, ("10-K", "10-Q")),),
+            ["k0002", "k0004"],
+        ),
+        (
+            (ReadPredicate("form", ReadPredicateOperator.NOT_IN, ("8-K",)),),
+            ["k0002", "k0004"],
+        ),
+        # A catch-all member owns the rows the bounded members cannot.
+        (
+            (ReadPredicate("filed", ReadPredicateOperator.IS_NULL),),
+            ["k0000", "k0001", "k0002", "k0004"],
+        ),
+        (
+            (ReadPredicate("filed", ReadPredicateOperator.IS_NOT_NULL),),
+            ["k0003"],
+        ),
+    ],
+    ids=["date-range", "in", "not-in", "is-null", "is-not-null"],
+)
+def test_every_predicate_operator_narrows_the_probe_like_the_read(
+    tmp_path: Path,
+    predicates: tuple[ReadPredicate, ...],
+    stale: list[str],
+) -> None:
+    """Issue #764: a partition is declared with bounds, not only equality. The
+    probe's clauses come from the same builder shape as the snapshot read, with
+    the columns qualified, and each operator binds differently (a list for IN, no
+    value for the null tests), so each is held to the read's row selection.
+
+    Rows k0000..k0004; k0003 has a NULL date and k0004 a NULL form, so the NULL
+    semantics are pinned too: a NULL fails a bound or membership test in the
+    probe exactly as it does in the read."""
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, _keys(5))
+        adapter.materialize_full(
+            "filings",
+            pl.DataFrame(
+                {
+                    "chunk_id": _keys(5),
+                    "filed": [
+                        date(2023, 5, 1),
+                        date(2024, 5, 1),
+                        date(2025, 5, 1),
+                        None,
+                        date(2024, 12, 31),
+                    ],
+                    "form": ["10-K", "10-Q", "8-K", "10-K", None],
+                }
+            ),
+        )
+        reconciler = BoundedReconciler(adapter, SCOPE, code_version="v1", page_size=2)
+        assert _stale_keys(reconciler, predicates) == stale
+
+
 def test_an_absence_probe_predicate_on_a_missing_column_fails(tmp_path: Path) -> None:
     """A typo in a partition column must stop the publish. Read as "no upstream
     row satisfies it", it would call every published row stale and delete them
@@ -294,7 +363,7 @@ def test_missing_probe_relation_fails_rather_than_deleting(tmp_path: Path) -> No
                 SCOPE,
                 page_size=5,
                 absent_from=StateAbsenceProbe(
-                    table="missing_table", key_column="chunk_id"
+                    table="missing_table", key_column="chunk_id", predicates=()
                 ),
             ):
                 pass
@@ -718,6 +787,8 @@ def test_a_relation_probe_still_works_beside_the_scope_form(tmp_path: Path) -> N
         with adapter.state_page_reader(
             SCOPE,
             page_size=10,
-            absent_from=StateAbsenceProbe(table="chunks", key_column="chunk_id"),
+            absent_from=StateAbsenceProbe(
+                table="chunks", key_column="chunk_id", predicates=()
+            ),
         ) as reader:
             assert _drain(reader) == ["b"]

@@ -99,8 +99,11 @@ evaluation required before it replaces a monolithic index.
   filtered read before a 3.6M-row corpus can use it safely.
 - `BoundedReconciler.iter_stale_pages` used to probe the whole upstream, so a row
   moved between years survived in its old collection. It now takes the same
-  partition predicate as the snapshot read, evaluated at the same instant on both
-  adapters (#764); a group declaration still has to supply it.
+  partition predicate as the snapshot read (#764). On BigQuery the probe is judged
+  at the instant the read pinned, and a partitioned publish whose read pinned none is
+  refused (`point_in_time_state_absence`); DuckDB cannot time-travel and judges the
+  live relation in its own read transaction. A group declaration still has to supply
+  the predicate.
 - MCP `BusinessFilter` currently accepts only `eq`, `ne`, and `in`, so date
   range routing also needs an additive typed filter contract. An unsupported
   filter may prevent pruning but must still be enforced in every member.

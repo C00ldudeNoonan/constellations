@@ -1533,6 +1533,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 WarehouseCapability.ICEBERG_TABLE_FORMAT,
                 WarehouseCapability.ORDERED_TABULAR_READS,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
+                WarehouseCapability.POINT_IN_TIME_STATE_ABSENCE,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
                 WarehouseCapability.SQL_MODEL_MATERIALIZATION,
@@ -4980,15 +4981,7 @@ SELECT deleted_count;
                     "State absence probe relation "
                     f"'{relation_probe.table}.{relation_probe.key_column}' is unavailable"
                 )
-            missing = sorted(
-                {p.column for p in relation_probe.predicates} - set(probe_column_types)
-            )
-            if missing:
-                raise AdapterError(
-                    "State absence probe predicate column(s) "
-                    f"{', '.join(missing)} are not in relation "
-                    f"'{relation_probe.table}'"
-                )
+            relation_probe.require_predicate_columns(probe_column_types)
             probe_clauses, probe_params = _bigquery_read_clauses(
                 self,
                 relation_probe.predicates,

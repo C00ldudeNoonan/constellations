@@ -61,6 +61,7 @@ from stel.adapters.bigquery import (
     _coalesced_batches,
     to_query_parameters,
 )
+from stel.adapters.duckdb import DuckDBAdapter
 from stel.adapters.serialized import SerializedAdapter
 from stel.config.identifiers import LEGACY_SCHEMA_NAME
 from stel.credentials import ProtectedCredential
@@ -3956,7 +3957,7 @@ def test_state_page_reader_absence_probe_time_travels_both_relations() -> None:
     client.tables["proj.ds.chunks"] = ["chunk_id", "text"]
     client.query_results = [_FakeJob(rows=[(ts,)]), _FakeJob(rows=[])]
     adapter = _adapter(client)
-    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id")
+    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id", predicates=())
     with adapter.state_page_reader(
         StateScope("m"), page_size=5, absent_from=probe
     ) as reader:
@@ -3985,7 +3986,9 @@ def test_a_pinned_absence_probe_judges_the_relation_at_its_own_instant() -> None
     client.tables["proj.ds.chunks"] = ["chunk_id"]
     client.query_results = [_FakeJob(rows=[(page_instant,)]), _FakeJob(rows=[])]
     adapter = _adapter(client)
-    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id", as_of=pinned)
+    probe = StateAbsenceProbe(
+        table="chunks", key_column="chunk_id", predicates=(), as_of=pinned
+    )
     with adapter.state_page_reader(
         StateScope("m"), page_size=5, absent_from=probe
     ) as reader:
@@ -4035,6 +4038,48 @@ def test_an_absence_probe_carries_the_partition_predicate_at_the_pinned_instant(
     assert values[-3:] == [pinned, 2024, 5]
 
 
+def test_an_absence_probe_binds_range_and_membership_bounds_typed_to_their_columns() -> None:
+    # Issue #764: a partition is declared with bounds (ADR-0037), so the probe
+    # takes ranges and membership, not only equality. Each value binds as the
+    # column's own type: a DATE bound as a DATE, an IN list as an array, and a
+    # naive datetime against a DATETIME column as DATETIME, because the default
+    # TIMESTAMP binding is an error there (see `_read_param`).
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = [
+        "chunk_id",
+        SimpleNamespace(name="filed", field_type="DATE", mode="NULLABLE"),
+        SimpleNamespace(name="filed_at", field_type="DATETIME", mode="NULLABLE"),
+        "form",
+    ]
+    client.query_results = [_FakeJob(rows=[(datetime.now(UTC),)]), _FakeJob(rows=[])]
+    adapter = _adapter(client)
+    opened = datetime(2024, 1, 1, 0, 0, 0)
+    probe = StateAbsenceProbe(
+        table="chunks",
+        key_column="chunk_id",
+        predicates=(
+            ReadPredicate("filed", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2024, 1, 1)),
+            ReadPredicate("filed", ReadPredicateOperator.LESS_THAN, date(2025, 1, 1)),
+            ReadPredicate("filed_at", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, opened),
+            ReadPredicate("form", ReadPredicateOperator.IN, ("10-K", "10-Q")),
+        ),
+    )
+    with adapter.state_page_reader(
+        StateScope("m"), page_size=5, absent_from=probe
+    ) as reader:
+        reader.fetch_page(None)
+
+    sql, job_config = client.queries[1]
+    assert (
+        "AND probe.`filed` >= ? AND probe.`filed` < ? "
+        "AND probe.`filed_at` >= ? AND probe.`form` IN UNNEST(?))"
+    ) in sql
+    values = _param_values(job_config)
+    assert values[-5:] == [date(2024, 1, 1), date(2025, 1, 1), opened, ["10-K", "10-Q"], 5]
+    typed = {p.value: p.type_ for p in job_config.query_parameters if hasattr(p, "type_")}
+    assert typed[opened] == "DATETIME"
+
+
 def test_an_absence_probe_without_predicates_is_unchanged() -> None:
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = ["chunk_id"]
@@ -4043,7 +4088,7 @@ def test_an_absence_probe_without_predicates_is_unchanged() -> None:
     with adapter.state_page_reader(
         StateScope("m"),
         page_size=5,
-        absent_from=StateAbsenceProbe(table="chunks", key_column="chunk_id"),
+        absent_from=StateAbsenceProbe(table="chunks", key_column="chunk_id", predicates=()),
     ) as reader:
         reader.fetch_page(None)
     sql, _ = client.queries[1]
@@ -4067,12 +4112,27 @@ def test_an_absence_probe_predicate_on_a_missing_column_fails() -> None:
             pass
 
 
+def test_only_an_adapter_that_can_time_travel_declares_point_in_time_absence() -> None:
+    # The publish guard (issue #764) refuses an unpinned partitioned read only
+    # where the probe could have been pinned, so the declaration has to match
+    # what each adapter's probe really does: BigQuery reads `FOR SYSTEM_TIME AS
+    # OF`, DuckDB refuses `as_of`.
+    assert (
+        WarehouseCapability.POINT_IN_TIME_STATE_ABSENCE
+        in BigQueryAdapter.capabilities()
+    )
+    assert (
+        WarehouseCapability.POINT_IN_TIME_STATE_ABSENCE
+        not in DuckDBAdapter.capabilities()
+    )
+
+
 def test_state_page_reader_missing_probe_relation_fails() -> None:
     ts = datetime.now(UTC)
     client = _FakeClient()
     client.query_results = [_FakeJob(rows=[(ts,)])]
     adapter = _adapter(client)
-    probe = StateAbsenceProbe(table="missing", key_column="chunk_id")
+    probe = StateAbsenceProbe(table="missing", key_column="chunk_id", predicates=())
     with pytest.raises(AdapterError, match="absence probe"):
         with adapter.state_page_reader(
             StateScope("m"), page_size=5, absent_from=probe
@@ -4081,7 +4141,7 @@ def test_state_page_reader_missing_probe_relation_fails() -> None:
 
     client.query_results = [_FakeJob(rows=[(ts,)])]
     client.tables["proj.ds.chunks"] = ["other_column"]
-    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id")
+    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id", predicates=())
     with pytest.raises(AdapterError, match="absence probe"):
         with adapter.state_page_reader(
             StateScope("m"), page_size=5, absent_from=probe

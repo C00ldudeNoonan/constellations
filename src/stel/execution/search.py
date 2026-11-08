@@ -491,6 +491,16 @@ def _run_search_model(
                     else:
                         spec = replace(spec, source_progress=None)
                         store.restamp_collection(spec)
+                # Whether this run reconciles stale keys at all. Stated once and
+                # used both by the guard below and at the probe, so they cannot
+                # disagree about when a probe happens (issue #764).
+                probes_stale = (
+                    not rebuild or seed_from is not None or resumed
+                ) and not subset_run
+                if probes_stale:
+                    _require_pinned_absence(
+                        adapter, snapshot, partition=partition, model_name=model.name
+                    )
                 # A resumed generation whose rows were complete for the very
                 # upstream generation this run sees has nothing to read: no
                 # row can have changed or gone, so the page loop and stale
@@ -869,9 +879,7 @@ def _run_search_model(
                         # the live table has since dropped it (issue #614).
                         as_of=_pinned_instant(snapshot),
                     )
-                    if (not rebuild or seed_from is not None or resumed)
-                    and not subset_run
-                    and not complete_resume
+                    if probes_stale and not complete_resume
                     else _no_stale_pages()
                 )
                 try:
@@ -1303,6 +1311,40 @@ def _pinned_instant(snapshot: TableReadSnapshot) -> datetime | None:
     pinned (issue #614)."""
     point = snapshot.resume_point
     return None if point is None else datetime.fromisoformat(point.snapshot_time)
+
+
+def _require_pinned_absence(
+    adapter: WarehouseAdapter,
+    snapshot: TableReadSnapshot,
+    *,
+    partition: tuple[ReadPredicate, ...],
+    model_name: str,
+) -> None:
+    """Refuse a partitioned publish whose read pinned no instant on an adapter
+    that could have judged its stale-key probe at one (issue #764).
+
+    A partition's read and its probe must see the relation at the same instant,
+    or a row re-dated between the two is judged against a different relation
+    than the one it was read from. The read pins an instant only on the
+    segmented path; a predicate with no safe literal keeps the query path
+    (issue #754) and pins none, which would otherwise leave the probe at its
+    own later instant without a word. Refused before any row is written. An
+    adapter that cannot time-travel judges absence inside its own read
+    transaction and is not asked."""
+    if not partition:
+        return
+    if not adapter.supports(WarehouseCapability.POINT_IN_TIME_STATE_ABSENCE):
+        return
+    if _pinned_instant(snapshot) is not None:
+        return
+    raise RunError(
+        f"{model_name}: this partition's read did not pin a snapshot instant, so "
+        "its stale-key check cannot be judged at the instant the rows were read. "
+        "A predicate that cannot be written as a typed row restriction takes the "
+        "unpinned read path; express the partition with column types the "
+        "warehouse can restrict on (dates, integers, strings without control "
+        "characters)."
+    )
 
 
 def _rebuild_requested(model: ModelConfig, *, full_refresh: bool) -> bool:

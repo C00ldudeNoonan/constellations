@@ -1783,6 +1783,41 @@ class DuckDBAdapter(WarehouseAdapter):
         ).fetchall()
         return {str(r[0]): StateValue(str(r[1]), str(r[2])) for r in rows}
 
+    def _relation_absence_sql(
+        self, cursor_conn: Any, probe: StateAbsenceProbe
+    ) -> tuple[str, list[Any]]:
+        """The `AND NOT EXISTS (...)` clause for a relation probe and its bound
+        parameters, in placeholder order."""
+        probe_ref = self.table_ref(probe.table)
+        probe_key = self.quote_ident(probe.key_column)
+        try:
+            cursor_conn.execute(f"SELECT {probe_key} FROM {probe_ref} LIMIT 0")
+        except duckdb.Error:
+            raise AdapterError(
+                "State absence probe relation "
+                f"'{probe.table}.{probe.key_column}' is unavailable"
+            ) from None
+        if probe.predicates:
+            described = cursor_conn.execute(f"SELECT * FROM {probe_ref} LIMIT 0")
+            probe.require_predicate_columns(str(column[0]) for column in described.description)
+        # `record_key` is always a VARCHAR, because state keys are the
+        # stringified id. The probe column need not be -- a numeric id is a
+        # supported contract for embed -- so the cast keeps the comparison on
+        # the same normalization the keys were written with, rather than
+        # relying on implicit coercion (issue #428).
+        #
+        # A partitioned publisher's probe keeps only the rows it reads (issue
+        # #764), so a key whose row moved to another partition counts as absent.
+        # The predicates ride on the probe's own subquery, which is what lets
+        # NOT EXISTS see a moved row as missing rather than as present elsewhere.
+        clauses, params = _duckdb_read_clauses(self, probe.predicates, qualifier="probe.")
+        extra = "".join(f" AND {clause}" for clause in clauses)
+        sql = (
+            f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
+            f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key{extra})"
+        )
+        return sql, params
+
     def _open_state_page_reader(self, request: StatePageRequest) -> StatePageReader:
         # A dedicated cursor holds one read transaction open for the reader's
         # lifetime, so every page observes the same MVCC snapshot even while
@@ -1824,51 +1859,8 @@ class DuckDBAdapter(WarehouseAdapter):
                     "AND probe.record_key = state.record_key)"
                 )
             elif relation_probe is not None:
-                probe_ref = self.table_ref(relation_probe.table)
-                probe_key = self.quote_ident(relation_probe.key_column)
-                try:
-                    cursor_conn.execute(f"SELECT {probe_key} FROM {probe_ref} LIMIT 0")
-                except duckdb.Error:
-                    raise AdapterError(
-                        "State absence probe relation "
-                        f"'{relation_probe.table}."
-                        f"{relation_probe.key_column}' is unavailable"
-                    ) from None
-                # `record_key` is always a VARCHAR, because state keys are the
-                # stringified id. The probe column need not be -- a numeric id
-                # is a supported contract for embed -- so the cast keeps the
-                # comparison on the same normalization the keys were written
-                # with, rather than relying on implicit coercion (issue #428).
-                #
-                # A partitioned publisher's probe keeps only the rows it reads
-                # (issue #764), so a key whose row moved to another partition
-                # counts as absent. The predicates ride on the probe's own
-                # subquery, which is what lets NOT EXISTS see a moved row as
-                # missing rather than as present elsewhere.
-                if relation_probe.predicates:
-                    probe_columns = {
-                        str(column[0])
-                        for column in cursor_conn.execute(
-                            f"SELECT * FROM {probe_ref} LIMIT 0"
-                        ).description
-                    }
-                    missing = sorted(
-                        {p.column for p in relation_probe.predicates} - probe_columns
-                    )
-                    if missing:
-                        raise AdapterError(
-                            "State absence probe predicate column(s) "
-                            f"{', '.join(missing)} are not in relation "
-                            f"'{relation_probe.table}'"
-                        )
-                probe_clauses, probe_params = _duckdb_read_clauses(
-                    self, relation_probe.predicates, qualifier="probe."
-                )
-                probe_filter = "".join(f" AND {clause}" for clause in probe_clauses)
-                absence_sql = (
-                    f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
-                    f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key"
-                    f"{probe_filter})"
+                absence_sql, probe_params = self._relation_absence_sql(
+                    cursor_conn, relation_probe
                 )
             nonce = uuid4().hex
             scope = request.scope

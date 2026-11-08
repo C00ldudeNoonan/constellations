@@ -232,6 +232,45 @@ def test_transform_code_change_reprocesses_every_parent(tmp_path: Path) -> None:
     assert result.documents_skipped == 0
 
 
+def test_a_code_change_that_adds_a_column_reprocesses_into_it(tmp_path: Path) -> None:
+    """Reprocessing existing parents while `on_schema_change: append_new_columns`
+    adds a column used to fail at commit on DuckDB (found while building #768):
+    the parents' rows were deleted before the ALTER, and DuckDB refuses to
+    commit a table altered after it was modified. The refusal message offers
+    this policy as the remedy, so it has to work."""
+    project = _project(tmp_path)
+    _write_doc(project, "a.json", "alpha beta")
+    _write_doc(project, "b.json", "gamma")
+    run_project(project)
+
+    model = project / "models" / "word_tokens.yml"
+    model.write_text(model.read_text() + "    on_schema_change: append_new_columns\n")
+    module = project / "transforms" / "word_tokens.py"
+    source = module.read_text()
+    assert source.count('"word": pl.String(),\n}') == 1
+    assert source.count('"word": word,\n') == 1
+    with_schema = source.replace(
+        '"word": pl.String(),\n}', '"word": pl.String(),\n    "shout": pl.String(),\n}'
+    )
+    module.write_text(
+        with_schema.replace(
+            '"word": word,\n', '"word": word,\n                    "shout": word.upper(),\n'
+        )
+    )
+
+    result = _result(run_project(project), "word_tokens")
+
+    assert result.documents_processed == 2
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        rows = con.execute(
+            'SELECT word, shout FROM "db".docs.word_tokens ORDER BY word'
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows == [("alpha", "ALPHA"), ("beta", "BETA"), ("gamma", "GAMMA")]
+
+
 def test_parent_producing_zero_children_is_processed_then_skipped(
     tmp_path: Path,
 ) -> None:

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- On DuckDB, an incremental child-table model (`extract_relations`, `nlp_entities`, any
+  transform with an incremental contract) with `on_schema_change: append_new_columns` no
+  longer fails with "Attempting to modify table ... but another transaction has altered
+  this table" when a run both reprocesses existing documents and adds a column. The
+  adapter deleted the reprocessed documents' rows before the `ALTER TABLE`, and DuckDB
+  refuses to commit a table altered after it was modified; the schema is now reconciled
+  first. A run of only new documents was never affected. BigQuery adds columns before
+  its transaction and was not affected. This is the remedy the "Schema change on
+  incremental table" error already named (issue #769).
+  The adapter edit moves the same `backend:llm` identity field announced in the entry
+  above, so the same `stel plan`, then `stel adopt`, applies; nothing else re-keys.
+
 - A search publish that owns one partition of its upstream now reconciles stale keys
   against that partition. `StateAbsenceProbe` and `BoundedReconciler.iter_stale_pages`
   take the same typed predicates as the snapshot read, on DuckDB and BigQuery, so a row

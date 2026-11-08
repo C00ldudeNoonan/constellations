@@ -187,6 +187,7 @@ def supersede(
     _reject_undirected(rows)
     skipped = {"not_asserted": 0, "unlinked_mention": 0}
     groups: dict[tuple[str, _Entity], list[_Fact]] = defaultdict(list)
+    already_ended: dict[str, datetime] = {}
     undated: dict[str, int] = defaultdict(int)
     for row in rows.iter_rows(named=True):
         if row["status"] != "asserted":
@@ -203,6 +204,8 @@ def supersede(
         groups[(str(row["relation_type"]), subject)].append(
             _Fact(row["valid_from"], str(row["relation_id"]), obj)
         )
+        if row["valid_to"] is not None:
+            already_ended[str(row["relation_id"])] = row["valid_to"]
     if undated:
         relation_type = sorted(undated)[0]
         raise ValueError(
@@ -219,6 +222,14 @@ def supersede(
         group_closings, group_simultaneous = _close_group(facts)
         closings.update(group_closings)
         simultaneous += group_simultaneous
+    # An interval the input already ended before the next fact began was not
+    # closed by it: crediting that fact in `superseded_by`, or counting a
+    # closure, would say something the data does not.
+    closings = {
+        relation_id: (closes_at, closer)
+        for relation_id, (closes_at, closer) in closings.items()
+        if relation_id not in already_ended or closes_at <= already_ended[relation_id]
+    }
 
     return SupersessionResult(
         frame=_apply_closings(frame, closings),
@@ -271,6 +282,16 @@ def _mention_entities(links: pl.DataFrame) -> dict[str, _Entity]:
     }
 
 
+def _first_different(
+    best: Sequence[tuple[_Entity, datetime, str]], obj: _Entity
+) -> tuple[datetime, str] | None:
+    """The soonest of the (at most two) candidate closers naming another object."""
+    for candidate, closes_at, closer in best:
+        if candidate != obj:
+            return closes_at, closer
+    return None
+
+
 def _close_group(facts: list[_Fact]) -> tuple[dict[str, tuple[datetime, str]], int]:
     """Closings within one `(relation_type, subject)`, and its simultaneous count.
 
@@ -292,10 +313,9 @@ def _close_group(facts: list[_Fact]) -> tuple[dict[str, tuple[datetime, str]], i
             start -= 1
         same_instant = facts[start:end]
         for fact in same_instant:
-            for obj, closes_at, closer in best:
-                if obj != fact.obj:
-                    closings[fact.relation_id] = (closes_at, closer)
-                    break
+            closer = _first_different(best, fact.obj)
+            if closer is not None:
+                closings[fact.relation_id] = closer
         # Rows are in relation_id order, so the first per object is its lowest.
         lowest: dict[_Entity, str] = {}
         for fact in same_instant:
@@ -328,10 +348,9 @@ def _apply_closings(
     )
     return (
         frame.join(closed, on="relation_id", how="left")
-        # An interval the input already closed earlier is kept.
-        .with_columns(
-            pl.min_horizontal("valid_to", "_closes_at").cast(INSTANT_DTYPE).alias("valid_to")
-        )
+        # `closings` holds only closers at or before an existing end, so the
+        # closing instant, when there is one, is the end.
+        .with_columns(pl.coalesce("_closes_at", "valid_to").alias("valid_to"))
         .drop("_closes_at")
     )
 

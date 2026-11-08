@@ -1005,3 +1005,35 @@ def test_the_run_log_counts_what_the_step_left_out(caplog: pytest.LogCaptureFixt
     assert "1 not_asserted" in message
     assert "1 unlinked_mention" in message
     assert "1 simultaneous conflict(s)" in message
+
+
+def test_a_fact_the_input_already_ended_is_not_credited_to_a_later_fact() -> None:
+    """A row that ended in 2021 was not closed by the 2023 assertion, so naming
+    it in `superseded_by` (and counting a closure) would be wrong. Codex review
+    on #768."""
+    result = _supersede(
+        _relation("ended", "acme_1", "paris", _at(2019), valid_to=_at(2021)),
+        _relation("later", "acme_1", "berlin", _at(2023)),
+    )
+
+    assert _intervals(result)["ended"] == (_at(2021), None)
+    assert result.closed == 0
+
+
+def test_a_fact_the_input_ends_exactly_when_the_next_begins_is_credited_to_it() -> None:
+    result = _supersede(
+        _relation("ended", "acme_1", "paris", _at(2019), valid_to=_at(2023)),
+        _relation("later", "acme_1", "berlin", _at(2023)),
+    )
+
+    assert _intervals(result)["ended"] == (_at(2023), "later")
+    assert result.closed == 1
+
+
+def test_a_fact_the_input_ends_later_than_the_next_begins_is_closed_earlier() -> None:
+    result = _supersede(
+        _relation("open_ended", "acme_1", "paris", _at(2019), valid_to=_at(2030)),
+        _relation("later", "acme_1", "berlin", _at(2023)),
+    )
+
+    assert _intervals(result)["open_ended"] == (_at(2023), "later")

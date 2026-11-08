@@ -24,6 +24,10 @@ warehouse; `export_graph` reads the frames through the active adapter and
 `write_graph_export` writes the files. Output is deterministic and carries no
 timestamp, so two exports of unchanged tables are byte-identical.
 
+An edge also carries the interval its fact holds over (`valid_from`, `valid_to`,
+`observed_at`, `superseded_by`), when the relation model has those columns
+(ADR-0056, schema v2).
+
 Only intended output tables are read. Mention text is never read: a node is a
 canonical id and an edge is a pair of them, so nothing the operator withheld
 upstream (`include_mention_text`) can reach the files.
@@ -34,6 +38,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +49,7 @@ from .config import load_project
 from .config.class_hierarchy import ClassDeclaration, class_ancestors, class_parents
 from .config.vocabulary import Vocabulary, VocabularyTerm, declared_terms
 
-GRAPH_EXPORT_SCHEMA = "stel.graph_export/v1"
+GRAPH_EXPORT_SCHEMA = "stel.graph_export/v2"
 NODES_FILENAME = "nodes.jsonl"
 EDGES_FILENAME = "edges.jsonl"
 GRAPH_MANIFEST_FILENAME = "graph_manifest.json"
@@ -109,6 +114,21 @@ def _number(value: object) -> float | None:
     if isinstance(value, float) and value != value:
         return None
     return value if isinstance(value, int | float) else None
+
+
+def _instant(value: object, column: str) -> str | None:
+    """A validity timestamp as UTC ISO-8601 with a `Z`, so the file reads the
+    same wherever it is loaded. A naive datetime is read as UTC, as everywhere
+    else a relation row carries an instant (ADR-0056)."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        raise GraphExportError(
+            f"the relation model's column {column} must hold timestamps; "
+            "`extract_relations` and `supersede_relations` write it that way"
+        )
+    stamped = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return stamped.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _clean_entity_name(entity_name: str) -> str:
@@ -203,6 +223,12 @@ def _edge(row: dict[str, Any], subject: _Linked, obj: _Linked) -> dict[str, Any]
         "subject_resolver_version": subject.resolver_version,
         "object_resolver": obj.resolver,
         "object_resolver_version": obj.resolver_version,
+        # The interval the fact holds over (ADR-0056). A relation model built
+        # before these columns existed exports null: the validity is unknown.
+        "valid_from": _instant(row.get("valid_from"), "valid_from"),
+        "valid_to": _instant(row.get("valid_to"), "valid_to"),
+        "observed_at": _instant(row.get("observed_at"), "observed_at"),
+        "superseded_by": _text(row.get("superseded_by")),
     }
 
 

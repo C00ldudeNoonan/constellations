@@ -232,6 +232,7 @@ def run_transform_model(
         options=dict(model.transform.options),
         run_budget=run_budget,
         vocabularies=project.vocabularies,
+        relations=project.relations,
     )
 
     result = ModelRunResult(

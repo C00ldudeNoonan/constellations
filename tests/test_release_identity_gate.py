@@ -44,6 +44,7 @@ _LLM_BACKEND_FIELDS = [{"name": "title", "type": "string"}]
 _TRANSFORM_OPTIONS: dict[str, dict[str, object]] = {
     "extract_relations": {"extractor": "co_occurrence", "mentions": "mentions"},
     "link_entities": {"mentions": "mentions", "aliases": "aliases"},
+    "supersede_relations": {"relations": "relations", "entity_links": "links"},
 }
 
 

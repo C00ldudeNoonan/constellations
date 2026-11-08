@@ -144,6 +144,15 @@
       "transform.uses_llm": "6bf0224995e4bd07",
       "transform_code_hash": "5cf5f1773b155e4e"
     },
+    "transform:supersede_relations": {
+      "transform.module": "707c6986c9d61199",
+      "transform.options": "8304737b3e3a5f2a",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e",
+      "transform_code_version_identity.supersession_version": "89ff22ca0e29f115"
+    },
     "transform:text_stats": {
       "transform.module": "1c91881c81389198",
       "transform.options": "49adf2385fa5ef89",

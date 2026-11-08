@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 import polars as pl
@@ -17,6 +18,7 @@ from ...budget import BudgetGuard
 from ...config.profile import DEFAULT_LLM_PROVIDER, LLMConfig
 from ...execution.cost import estimate_cost
 from ...providers import get_inference_provider, resolve_provider_model
+from ...relation_validity import INSTANT_DTYPE, is_temporal, to_utc_instant
 from ...transforms import IncrementalContract, TransformContext
 from ..relations import (
     Mention,
@@ -92,11 +94,71 @@ def run_relations(
     if not grouped:
         return pl.DataFrame(schema=schema)
 
+    valid_from = _document_instants(
+        frame, options, options.effective_date_field, "effective date"
+    )
+    observed_at = _document_instants(
+        frame, options, options.observed_at_field, "observation time"
+    )
     rows: list[dict[str, Any]] = []
     for document_id in sorted(grouped):
         for relation in extractor.extract(grouped[document_id], options, infer=infer):
-            rows.append(_relation_row(document_id, relation, options, extractor))
+            row = _relation_row(document_id, relation, options, extractor)
+            if options.effective_date_field is not None:
+                row["valid_from"] = valid_from.get(document_id)
+                row["valid_to"] = None
+            if options.observed_at_field is not None:
+                row["observed_at"] = observed_at.get(document_id)
+            rows.append(row)
     return pl.DataFrame(rows, schema=schema, strict=False)
+
+
+def _document_instants(
+    frame: pl.DataFrame,
+    options: Any,
+    field_name: str | None,
+    description: str,
+) -> dict[str, datetime]:
+    """Each document's one instant, read from a mentions column (ADR-0056).
+
+    A document has a single effective date, so its mentions must agree: nulls
+    are skipped (a join upstream can leave the value on only some rows), but two
+    different values are an error, because choosing one would put a guess into a
+    column an as-of answer rests on. A date or naive datetime reads as UTC. A
+    text column is refused rather than parsed: `03/04` has two readings.
+
+    Errors name the column and the document, never a value.
+    """
+    if field_name is None:
+        return {}
+    dtype = frame.schema[field_name]
+    if dtype == pl.Null:
+        return {}
+    if not is_temporal(dtype):
+        raise ValueError(
+            f"Mention column '{field_name}' must be a date or datetime column to "
+            f"carry a document's {description}; got {dtype}"
+        )
+    per_document = (
+        frame.select(
+            pl.col(options.document_id_field).cast(pl.String).alias("document_id"),
+            to_utc_instant(field_name, dtype).alias("instant"),
+        )
+        .drop_nulls()
+        .group_by("document_id")
+        .agg(
+            pl.col("instant").n_unique().alias("distinct"),
+            pl.col("instant").first().alias("instant"),
+        )
+        .sort("document_id")
+    )
+    conflicted = per_document.filter(pl.col("distinct") > 1)
+    if conflicted.height:
+        raise ValueError(
+            f"Mention column '{field_name}' holds more than one value for document "
+            f"'{conflicted['document_id'][0]}'; a document has one {description}"
+        )
+    return dict(zip(per_document["document_id"], per_document["instant"], strict=True))
 
 
 # --- LLM inference for the model_assertion extractor (issue #240) -------------
@@ -303,6 +365,9 @@ def _required_columns(options: Any, extractor: RelationExtractor) -> list[str]:
     ]
     if options.label_field is not None:
         required.append(options.label_field)
+    for date_field in (options.effective_date_field, options.observed_at_field):
+        if date_field is not None:
+            required.append(date_field)
     if options.include_mention_text or extractor.text_required():
         required.append(options.mention_text_field)
     return list(dict.fromkeys(required))
@@ -313,6 +378,17 @@ def _output_schema(options: Any) -> dict[str, pl.DataType]:
     if options.include_mention_text:
         schema["subject_text"] = pl.String()
         schema["object_text"] = pl.String()
+    # The interval the fact holds over (ADR-0056). Present only when the
+    # operator names the mentions column that carries it: a column added to an
+    # incremental table is a schema change the run refuses until the operator
+    # accepts it, so a model that did not ask for validity must not grow one
+    # on upgrade. `valid_to` is always null here; closing an interval needs a
+    # second document, which is `supersede_relations`' job.
+    if options.effective_date_field is not None:
+        schema["valid_from"] = INSTANT_DTYPE
+        schema["valid_to"] = INSTANT_DTYPE
+    if options.observed_at_field is not None:
+        schema["observed_at"] = INSTANT_DTYPE
     return schema
 
 

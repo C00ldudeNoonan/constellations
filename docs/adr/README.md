@@ -65,6 +65,7 @@ history (issue #311).
 | [0053](0053-a-restamp-records-that-a-version-change-left-the-output-unchanged.md) | `stel adopt` restamps state when a version change left output unchanged; plan names the moved identity field; releases are gated on identity | accepted |
 | [0054](0054-ml-scores-locally-a-remote-scorer-is-not-yet-an-ml-provider.md) | `ml:` scores locally; a remote scorer (a Vertex custom prediction endpoint) is not yet an `ml:` provider, and not an `InferenceProvider` either | accepted |
 | [0055](0055-graph-export-is-a-cli-over-per-fact-edges.md) | Graph export is a `stel graph-export` CLI writing JSON Lines, one edge per extracted fact, with nodes keyed by the agent-context `entity_id` and `entity_name` required | accepted |
+| [0056](0056-supersession-is-a-full-step-over-the-relation-table.md) | Supersession is a `full` step over the relation table and entity links, not part of the incremental extractor; `functional: true` is declared on the relation type; graph export carries validity as schema v2 | accepted |
 
 ## When to write one
 

@@ -13,7 +13,6 @@
   incremental table" error already named (issue #769).
   The adapter edit moves the same `backend:llm` identity field announced in the entry
   above, so the same `stel plan`, then `stel adopt`, applies; nothing else re-keys.
-
 - An `ontologies:` block in `stel_project.yml` imports classes, relation types and
   vocabulary terms from a SKOS/OWL file (Turtle or RDF/XML) instead of retyping them.
   An `include:` allow-list of IRIs is required and is the whole import: `owl:Class`
@@ -32,7 +31,11 @@
   Upgrading: the serving manifest is now v5 (an optional `iri` on declared terms and
   classes). The MCP server refuses a v4 manifest; recompile serving manifests on upgrade.
   A declaration with no IRIs dumps exactly as before.
-
+- MCP `BusinessFilter` accepts `gte` and `lte` as spellings of the range operators `ge`
+  and `le`. They are normalized on input, so `list_context_models`, the query log and
+  every store still see only `ge` and `le`. The range operators themselves (`lt`, `le`,
+  `gt`, `ge`) were already accepted and are now documented in `docs/mcp.md` with a date
+  window example (issue #770).
 - A search publish that owns one partition of its upstream now reconciles stale keys
   against that partition. `StateAbsenceProbe` and `BoundedReconciler.iter_stale_pages`
   take the same typed predicates as the snapshot read, on DuckDB and BigQuery, so a row

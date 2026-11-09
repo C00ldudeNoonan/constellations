@@ -3,9 +3,16 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 MCP_CONTEXT_SCHEMA_VERSION: Final = "mcp_context/v1"
 _STABLE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -47,11 +54,29 @@ class FilterOperator(StrEnum):
     ARRAY_CONTAINS_ANY = "array_contains_any"
 
 
+# Spellings a caller may send for an operator, normalized to the canonical one
+# on input. `ge`/`le` stay canonical: they are what `list_context_models`
+# advertises, what the query log records, and what the CLI and every store map
+# accept, so an alias adds a way to say it without a second operator to support.
+_OPERATOR_ALIASES: Final = {
+    "gte": FilterOperator.GREATER_THAN_OR_EQUAL,
+    "lte": FilterOperator.LESS_THAN_OR_EQUAL,
+}
+
+
+def _canonical_operator(value: object) -> object:
+    if isinstance(value, str):
+        return _OPERATOR_ALIASES.get(value, value)
+    return value
+
+
 class BusinessFilter(BaseModel):
     model_config = _STRICT_CONFIG
 
     field: str = Field(min_length=1, max_length=128)
-    operator: FilterOperator = FilterOperator.EQUAL
+    operator: Annotated[FilterOperator, BeforeValidator(_canonical_operator)] = (
+        FilterOperator.EQUAL
+    )
     value: FilterScalar | tuple[FilterScalar, ...]
 
     @model_validator(mode="after")

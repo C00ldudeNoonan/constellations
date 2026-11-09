@@ -474,6 +474,11 @@ _SEEDERS_BY_TYPE: dict[str, Seeder] = {
 
 _AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html", "demo")
 _TEMPLATED_SUFFIXES = frozenset({".yml", ".yaml", ".md", ".py", ".sql"})
+_TEMPLATES_ROOT = Path(__file__).parent / "templates"
+# Importing a template's transform module (a test does; so can a user poking
+# at an installed package) leaves bytecode beside it. It is not part of the
+# template, is not text, and must not land in a new project.
+_TEMPLATE_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
 
 
 @cli.command()
@@ -495,11 +500,11 @@ def init(name: str, template: str) -> None:
     if target.exists():
         raise click.ClickException(f"{target} already exists")
 
-    template_dir = Path(__file__).parent / "templates" / template
+    template_dir = _TEMPLATES_ROOT / template
     if not template_dir.is_dir():
         raise click.ClickException(f"Template directory missing: {template_dir}")
 
-    shutil.copytree(template_dir, target)
+    shutil.copytree(template_dir, target, ignore=_TEMPLATE_IGNORE)
     for path in target.rglob(".gitkeep"):
         path.unlink()
 

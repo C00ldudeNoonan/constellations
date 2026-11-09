@@ -9,6 +9,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
+from stel import cli as stel_cli
 from stel.cli import _safe_console_text, cli
 from stel.runner import run_project
 from stel.synth import generate_invoices
@@ -148,6 +149,38 @@ def test_init_with_html_template(tmp_path: Path) -> None:
         assert result.exit_code == 0, result.output
         target = Path(cwd) / "p"
         assert (target / "models" / "raw_pages.yml").exists()
+
+
+def test_init_leaves_template_bytecode_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Importing a template's transform caches bytecode beside it, in the
+    installed package. `stel init` copied that into every new project, where it
+    is no part of the template; a parallel test run left one in
+    `templates/demo/transforms` on 2026-11-09, and the demo test, which reads
+    each copied file as text, failed on it."""
+    templates = tmp_path / "templates"
+    shutil.copytree(
+        stel_cli._TEMPLATES_ROOT / "demo",
+        templates / "demo",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    cache = templates / "demo" / "transforms" / "__pycache__"
+    cache.mkdir()
+    (cache / "entity_mentions.cpython-312.pyc").write_bytes(b"\xcb\r\r\n\x00binary")
+    (templates / "demo" / "stray.pyc").write_bytes(b"\xcb\x00")
+    monkeypatch.setattr(stel_cli, "_TEMPLATES_ROOT", templates)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+        result = runner.invoke(cli, ["init", "acme", "--template", "demo"])
+        assert result.exit_code == 0, result.output
+        project = Path(cwd) / "acme"
+        copied = sorted(p.relative_to(project).as_posix() for p in project.rglob("*"))
+
+    assert copied, "the template was not copied at all"
+    assert [path for path in copied if "__pycache__" in path or path.endswith(".pyc")] == []
+    assert "transforms/entity_mentions.py" in copied
 
 
 def test_init_unknown_template_rejected(tmp_path: Path) -> None:

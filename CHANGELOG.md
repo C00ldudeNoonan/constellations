@@ -20,6 +20,11 @@
   Upgrading: the MCP server refuses a v5 (or older) manifest, so run `stel compile` (or
   `stel run`) once before starting it. Nothing re-keys.
 
+- `stel init` no longer copies Python bytecode (`__pycache__/`, `*.pyc`, `*.pyo`) from
+  a template into the new project. Importing a template's transform module, as a test
+  did, caches bytecode beside it in the installed package, and every later `init`
+  copied it (issue #774).
+
 - On DuckDB, an incremental child-table model (`extract_relations`, `nlp_entities`, any
   transform with an incremental contract) with `on_schema_change: append_new_columns` no
   longer fails with "Attempting to modify table ... but another transaction has altered

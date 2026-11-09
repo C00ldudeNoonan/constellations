@@ -46,7 +46,7 @@ history (issue #311).
 | [0034](0034-a-run-over-its-cost-threshold-asks-and-refuses-without-a-terminal.md) | A run whose projected provider cost is over the target's `confirm_cost_above_usd` asks at a terminal and refuses without one; `--full-refresh` and `--accept-reprocess` do not release it | accepted |
 | [0035](0035-session-query-pins-drain-without-expiring-readers.md) | Remote serving sessions share durable query pins and drain cooperatively; a clock never revokes a running reader | accepted |
 | [0036](0036-hybrid-search-fuses-documents-not-chunks.md) | Hybrid search fuses documents, at the rank of their best chunk, and interleaves their chunks back out; RRF's constant and equal weights stay | accepted |
-| [0037](0037-a-segmented-search-group-declares-its-partitions.md) | A segmented search group declares partition bounds and pins every selected member | proposed |
+| [0037](0037-a-segmented-search-group-declares-its-partitions.md) | A segmented search group declares partition bounds and pins every selected member | accepted for the publish half; query half proposed |
 | [0038](0038-embedding-publication-overlap-is-opt-in.md) | Embedding can overlap the next provider window with publication when explicitly enabled; chunk stays serial until measured | accepted |
 | [0039](0039-array-filters-publish-without-a-scalar-index.md) | Array filters publish without a scalar index; array sorting and deterministic index argument failures are refused early | accepted |
 | [0040](0040-mcp-array-filters-use-explicit-overlap.md) | MCP array filters expose the search core's explicit overlap operator rather than translating scalar `in` | accepted |

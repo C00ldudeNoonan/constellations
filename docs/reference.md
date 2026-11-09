@@ -2655,7 +2655,7 @@ qualify. So `stel compile`, `run` and `build` write the declaration into
 and an edit to the project file does nothing to a running or restarted server
 until you recompile and republish. A server started beside a project file that
 differs from its manifest logs a warning saying so. A manifest at any other
-`manifest_version` than 5 is refused with "run `stel compile`" rather than read as
+`manifest_version` than 6 is refused with "run `stel compile`" rather than read as
 declaring nothing, since an empty declaration would downgrade `entity_types` to
 the scan and refuse every scope for the wrong reason.
 
@@ -4539,6 +4539,103 @@ configuration is unchanged and rewrites it in place. Rows are untouched: there
 is no rebuild, no re-embed, and nothing to run by hand.
 
 #
+### Segmented search groups
+
+One search index over a corpus too large to publish whole can be split into
+**members** that each publish one slice of the same upstream, and declared as
+one **group** that serves under one name. The motivating case is a 3.6M-row
+filings corpus whose single publish cannot finish; cut by filing year, the
+largest member is a few pages long.
+
+A member says which rows it owns on its own `search:` block, and the project
+file names the group. `for_each` can generate members, but a tag or a shared
+name never makes a group; only the declaration does.
+
+```yaml
+# stel_project.yml
+search_groups:
+  - name: filings            # the one logical serving name
+    members: [filings_old, filings_mid, filings_new, filings_unfiled]
+```
+
+```yaml
+# models/filings.yml  (each member repeats the whole search block, bar these)
+models:
+  - name: filings_mid
+    depends_on: [ref('filing_chunks')]
+    materialization: incremental
+    search:
+      collection: filings_mid
+      # ... the same store, vector, attributes and query as every member ...
+      attributes:
+        - {name: filing_year, data_type: integer, nullable: true, filter_role: user}
+      partition:
+        field: filing_year
+        type: integer          # date, integer or string
+        lower: 2023            # inclusive; omit to leave the start open
+        upper: 2025            # exclusive; omit to leave the end open
+  - name: filings_unfiled
+    # ... same block ...
+      partition: {field: filing_year, type: integer, nulls: true}
+```
+
+A member reads only its own rows, and reconciles stale keys against the same
+rows, so a filing re-dated into another year leaves the member it left on the
+next publish (issue #764). Each member keeps its own collection, state and
+serving ledger, and publishes independently.
+
+**What the compiler checks**, before source discovery, credentials or any
+remote call:
+
+- **Coverage.** Every value of the field belongs to exactly one member, and so
+  does null. Ranges are half-open (`[lower, upper)`) and must meet end to end.
+  The first range leaves its start open and the last leaves its end open, which
+  is how the group takes values beyond any finite bound, and exactly one member
+  declares `nulls: true`, since a range never selects a null. A gap, an
+  overlap, a missing open end or a missing or second null member is refused,
+  naming the members involved. (Predicates are conjunctive, so a catch-all is
+  built from the open ends and the null member rather than from one
+  disjunction.)
+- **One corpus.** Members read one upstream relation, share one store, one
+  embedding identity, the same query modes, access mode and policy filters, and
+  the same schema; each publishes to its own collection. Only `collection`,
+  `partition`, `freshness` and execution cadence may differ.
+- **A routable field.** The partition field is a declared `search.attributes`
+  entry on every member, so a query's filter on it is enforced inside each
+  member, and it is `nullable: true` because the null member publishes those
+  rows.
+- **No stray partition.** A `search.partition` on a model that no group names,
+  and a member with none, are both refused.
+
+**Changing a bound is a membership migration.** The partition is part of each
+member's identity: it reaches the collection descriptor and every fingerprint,
+so a moved bound changes the member's `config_fingerprint` and is never reused
+silently. Under the default `on_index_change: fail` the publish is refused and
+the member keeps serving what it published. Under `on_index_change: rebuild`
+the member builds a new generation from its new rows, and the rows that moved
+out are simply not in it. Move both sides of a boundary, then republish every
+member that changed.
+
+**The manifest records the group.** `manifest.json` (serving manifest v6)
+carries `search_groups`: each group's name, partition field and type, a
+`version` that changes whenever any bound does, and each member's bounds,
+logical collection and the `config_fingerprint` it must publish under. A
+member's own serving resource carries its `partition`. A query reads
+membership and bounds from this artifact, never from project YAML at query
+time.
+
+**A group is unavailable until every member has published under the manifest's
+current bounds.** A member counts as published when its live serving generation
+carries the manifest's `config_fingerprint` for it; one still holding rows cut
+under old bounds, or none yet, keeps the whole group unavailable, because
+serving the others would answer from a partial corpus without saying so.
+
+The query side, which routes a filter to members, pins them all-or-nothing and
+fuses their rankings, is the second half of
+[ADR-0037](adr/0037-a-segmented-search-group-declares-its-partitions.md) and is
+not shipped: a group is declared, compiled and published today, and each member
+is queried as an ordinary index.
+
 ## Suggesting context improvements
 
 `stel suggest dbt` turns the agent-transcript corpus into a **reviewable
@@ -6840,11 +6937,13 @@ run results under `target-path`:
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
   model, DAG nodes+edges+execution order. Re-generated each run. A project
   with a search or agent-context model writes the serving manifest
-  (`manifest_version: 5`), which also carries `declarations`: the project's
+  (`manifest_version: 6`), which also carries `declarations`: the project's
   `classes:` and `vocabularies:` as compiled, because the MCP server reads the
   declaration from here rather than from the project file (issue #669). v5
   adds the optional `iri` an imported term or class carries (issue #767); a
-  declaration with no IRIs is otherwise the same as v4's.
+  declaration with no IRIs is otherwise the same as v4's. v6 adds
+  `search_groups`: each segmented search group's members and partition bounds
+  as compiled (issue #771).
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed, and `sources_considered`) plus per-model documents
   processed/skipped, rows written, duration, the model's own `started_at` and

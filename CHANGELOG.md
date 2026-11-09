@@ -17,8 +17,8 @@
   keeps a group unavailable until every member has published under them. The query side
   (routing, all-or-nothing pins, rank fusion) is not shipped; each member is queried as an
   ordinary index.
-  Upgrading: the MCP server refuses a v4 manifest, so run `stel compile` (or `stel run`)
-  once before starting it. Nothing re-keys.
+  Upgrading: the MCP server refuses a v5 (or older) manifest, so run `stel compile` (or
+  `stel run`) once before starting it. Nothing re-keys.
 
 - On DuckDB, an incremental child-table model (`extract_relations`, `nlp_entities`, any
   transform with an incremental contract) with `on_schema_change: append_new_columns` no

@@ -173,6 +173,11 @@ def _drop(model: str) -> Callable[[dict[str, Any]], None]:
         (_set_bound("new", "upper", 2030), "from 2030 up"),
         (_set_bound("old", "upper", None), "open end claims every value"),
         (_drop("none"), "no member for rows where filing_year is null"),
+        # Null rows belong to one member, or two would each publish them.
+        (
+            lambda models: models.update(also_none=_year("also_none", nulls=True)),
+            "2 members for null filing_year",
+        ),
         # One logical corpus: the members must be interchangeable but for bounds.
         (_set_search("mid", "store", "secondary"), "share one store"),
         (_set_vector_embedding("mid", model="another-model"), "one embedding identity"),

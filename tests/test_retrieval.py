@@ -235,7 +235,7 @@ def test_search_manifest_v2_and_dbt_export_projection(tmp_path: Path) -> None:
     write_project(tmp_path)
     manifest = build_manifest(tmp_path)
 
-    assert manifest["manifest_version"] == 5
+    assert manifest["manifest_version"] == 6
     search = next(model for model in manifest["models"] if model["name"] == "context_search")
     assert search["resource_type"] == "search_index"
     assert search["output"]["type"] == "serving_resource"

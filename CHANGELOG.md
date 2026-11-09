@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- A project can declare a segmented search group (ADR-0037, issue #771). `search_groups:`
+  in `stel_project.yml` names `search:` models that each publish one partition of a shared
+  upstream, and a member declares its rows in `search.partition` (`field`, `type`, a
+  half-open `lower`/`upper` range, or `nulls: true`). A member reads only its own rows and
+  reconciles stale keys against the same predicate, so a re-dated row moves between members.
+  Compilation rejects gaps, overlaps, a missing null member, mixed store or embedding
+  identity, and incompatible schemas, modes or policy filters before any source discovery
+  or remote call. The partition is part of the member's identity, so a moved bound is a
+  membership migration (refused under `on_index_change: fail`, rebuilt under `rebuild`)
+  and never reused silently; a search model with no partition keeps every existing
+  fingerprint. The serving manifest is now v6 and carries `search_groups`, each member's
+  bounds and the fingerprint it must publish under, and `search_groups.group_availability`
+  keeps a group unavailable until every member has published under them. The query side
+  (routing, all-or-nothing pins, rank fusion) is not shipped; each member is queried as an
+  ordinary index.
+  Upgrading: the MCP server refuses a v5 (or older) manifest, so run `stel compile` (or
+  `stel run`) once before starting it. Nothing re-keys.
+
 - On DuckDB, an incremental child-table model (`extract_relations`, `nlp_entities`, any
   transform with an incremental contract) with `on_schema_change: append_new_columns` no
   longer fails with "Attempting to modify table ... but another transaction has altered

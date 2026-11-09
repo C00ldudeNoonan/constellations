@@ -177,7 +177,7 @@ def test_a_manifest_that_cannot_carry_the_declaration_is_refused() -> None:
     declaration would downgrade a project with a vocabulary to the scanned
     `entity_types` and refuse every `entity_scope` with the wrong reason.
     """
-    with pytest.raises(ArtifactCatalogError, match=r"v5 artifact and this one is v3"):
+    with pytest.raises(ArtifactCatalogError, match=r"v6 artifact and this one is v3"):
         ArtifactCatalog.from_payloads({"manifest_version": 3, "target": {"name": "dev"}})
 
 

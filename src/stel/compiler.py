@@ -48,6 +48,7 @@ from .retrieval import (
     create_store,
     store_class,
 )
+from .search_groups import SearchGroupError, validate_search_groups
 from .sql_models import (
     SqlModelError,
     discover_refs,
@@ -264,6 +265,18 @@ def validate_project_contract(
         )
         if implicated is None:
             raise ConfigError(str(e)) from e
+        raise _model_error(implicated, str(e), e.path) from e
+
+    # Before the DAG and before any source discovery or remote call: coverage,
+    # overlap and identity are all decidable from configuration (ADR-0037).
+    try:
+        validate_search_groups(project, models, taken_names=source_names | model_names)
+    except SearchGroupError as e:
+        implicated = next((model for model in models if model.name == e.model), None)
+        if implicated is None:
+            raise ConfigError(
+                project.format_yaml_diagnostic(str(e), relative_path=e.path)
+            ) from e
         raise _model_error(implicated, str(e), e.path) from e
 
     try:

@@ -79,6 +79,7 @@ from .profile import (
 )
 from .progress import get_reporter
 from .reprocess_guard import format_refusals, guard_reprocess
+from .search_groups import model_partition_predicates
 from .sources import SourceError, get_document_source
 from .versioning import compute_model_code_version
 from .vocabulary_sources import resolve_warehouse_vocabularies
@@ -1500,9 +1501,10 @@ def _run_model(
             project_dir=project_dir,
             adapter=adapter,
             resolved=resolved,
-            # No declared partitions yet: a search model publishes its whole
-            # upstream. A segmented group's member supplies its own (ADR-0037).
-            partition=(),
+            # A segmented group's member publishes only the rows its partition
+            # owns (ADR-0037); any other search model publishes its whole
+            # upstream, which is the empty predicate.
+            partition=model_partition_predicates(model),
             full_refresh=full_refresh,
             subset_run=subset_run,
         )

@@ -36,6 +36,7 @@ from .retrieval import (
     create_store,
     store_class,
 )
+from .search_groups import group_manifest_entries
 from .versioning import (
     compute_model_code_version,
     describe_model_embedding,
@@ -52,7 +53,10 @@ MANIFEST_VERSION = 1
 # in force when the artifact was written rather than whatever the project
 # file says when the server starts. v4 carries class hierarchy declarations;
 # v5 adds the optional `iri` an ontology import gives a term or class (#767).
-SERVING_MANIFEST_VERSION = 5
+# v6 adds `search_groups`, each segmented search group's members and partition
+# bounds as compiled (ADR-0037, issue #771), and a member's `partition` on its
+# serving resource, so a query routes from the artifact that was published.
+SERVING_MANIFEST_VERSION = 6
 MANIFEST_FILENAME = "manifest.json"
 RUN_RESULTS_FILENAME = "run_results.json"
 
@@ -473,6 +477,16 @@ def _build_manifest_v2(
                     "safe_target_identity": safe.safe_target_identity,
                 }
             )
+    model_nodes = [
+        _model_dict_v2(
+            model,
+            project,
+            project_dir,
+            resolved,
+            models_by_name,
+        )
+        for model in models
+    ]
     return {
         "manifest_version": SERVING_MANIFEST_VERSION,
         "generated_at": _now(),
@@ -502,16 +516,10 @@ def _build_manifest_v2(
             }
             for source in sources
         ],
-        "models": [
-            _model_dict_v2(
-                model,
-                project,
-                project_dir,
-                resolved,
-                models_by_name,
-            )
-            for model in models
-        ],
+        "models": model_nodes,
+        "search_groups": group_manifest_entries(
+            project, models, published=_published_members(model_nodes)
+        ),
         "dag": {
             "execution_order": [
                 _unique_id(dag.nodes[name].kind, project.name, name)
@@ -677,6 +685,13 @@ def _model_dict_v2(
                     "max_batch_size": capabilities.max_batch_size,
                 },
                 "upstream": f"model.{project.name}.{upstream}",
+                # Present only on a segmented group's member, so every other
+                # index's resource reads exactly as it did before groups.
+                **(
+                    {"partition": search.partition.identity()}
+                    if search.partition is not None
+                    else {}
+                ),
             },
         },
     }
@@ -754,6 +769,20 @@ def compute_modified_models(
         if previous.get(model.name) != current:
             modified.add(model.name)
     return modified
+
+
+def _published_members(model_nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Each search index's compiled fingerprint and collection, by model name."""
+    published: dict[str, dict[str, Any]] = {}
+    for node in model_nodes:
+        if node.get("resource_type") != "search_index":
+            continue
+        resource = node["output"]["serving_resource"]
+        published[str(node["name"])] = {
+            "config_fingerprint": resource["config_fingerprint"],
+            "logical_collection": resource["logical_collection"],
+        }
+    return published
 
 
 def _declarations(project: ProjectConfig) -> dict[str, Any]:

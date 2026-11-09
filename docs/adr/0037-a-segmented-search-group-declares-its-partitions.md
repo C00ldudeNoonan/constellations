@@ -1,6 +1,6 @@
 # ADR-0037: A segmented search group declares its partitions
 
-- **Status:** proposed
+- **Status:** accepted for the publish half (#771); the query half is proposed
 - **Date:** 2026-10-22
 - **Prompted by:** #620
 
@@ -57,6 +57,19 @@ individually publishable and inspectable but are not additional default MCP
 catalog entries. Group freshness is stale if any member is stale under its own
 policy; the group's last-success timestamp is the oldest member activation,
 not the newest one.
+
+## Publish half as built
+
+The declaration is a project-level `search_groups:` naming members, with each
+member's bounds on its own `search.partition`, so `for_each` can generate a
+member and the partition rides in the config every fingerprint already hashes.
+Predicates are conjunctive, so the catch-all that "accounts for nulls and values
+outside finite bounds" is built from the first and last ranges leaving their
+ends open plus exactly one member with `nulls: true`, not from one disjunctive
+member. The partition field must be a declared, nullable search attribute on
+every member. The manifest is v6; `search_groups.group_availability` is the rule
+a query will consult. Removing a member after a boundary change is not
+automated: its collection is left as it is.
 
 ## Alternatives considered
 

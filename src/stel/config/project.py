@@ -15,6 +15,7 @@ from pydantic import (
 from .class_hierarchy import ClassDeclaration, class_names, validate_classes
 from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME
 from .ontology import OntologyImport
+from .search_partition import SearchGroupConfig
 from .vocabulary import RelationTypeDef, Vocabulary, check_declaration
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
@@ -74,6 +75,11 @@ class ProjectConfig(BaseModel):
     # that opts in gets one.
     classes: tuple[ClassDeclaration, ...] = Field(default_factory=tuple)
     relations: tuple[RelationTypeDef, ...] = Field(default_factory=tuple)
+    # Segmented search groups (ADR-0037, issue #771): one logical serving name
+    # over `search:` models that each publish one partition of a shared
+    # upstream. Checked as a whole at compile time (`search_groups.py`), since
+    # coverage is a property of the members together, not of any one of them.
+    search_groups: tuple[SearchGroupConfig, ...] = Field(default_factory=tuple)
 
     # A project that imports an ontology may refer to an imported class from
     # a hand-written relation, term or `subclass_of:`, so every cross-reference

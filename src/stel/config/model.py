@@ -24,6 +24,7 @@ from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 from ..agent_context import AgentContextGrain
 from ..credentials import CredentialReference, CredentialReferenceError
 from .identifiers import validate_node_name
+from .search_partition import SearchPartitionConfig
 from .source import DurationSpec
 from .vocabulary import VALUES_FROM_PATTERN
 from .yaml_diagnostics import ConfigPath, YamlProvenance
@@ -948,6 +949,27 @@ class SearchConfig(BaseModel):
     on_index_change: Literal["fail", "rebuild", "online"] = "fail"
     batch_size: int = Field(default=1000, ge=1, le=100_000)
     index_options: dict[str, Any] = Field(default_factory=dict)
+    # The rows of the upstream relation this index publishes, when it is one
+    # member of a segmented search group (ADR-0037, issue #771). Part of the
+    # index's identity: a changed bound is a membership migration, so it must
+    # reach the descriptor and every fingerprint rather than be reused silently.
+    partition: SearchPartitionConfig | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_an_absent_partition(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Unset, the field must be invisible: every descriptor, fingerprint and
+        # code-version hash starts from this dump, and a `partition: None` in it
+        # would re-key every search model published before the field existed
+        # (the same rule as `freshness` and `nprobes`). Set, it is written as
+        # JSON, so a date bound round-trips through a stored descriptor.
+        data = handler(self)
+        if self.partition is None:
+            data.pop("partition", None)
+        else:
+            data["partition"] = self.partition.identity()
+        return data
 
     @model_validator(mode="after")
     def _validate_contract(self) -> SearchConfig:

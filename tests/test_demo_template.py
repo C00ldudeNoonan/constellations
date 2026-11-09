@@ -12,6 +12,7 @@ import importlib.util
 import json
 import re
 import shlex
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -288,6 +289,10 @@ def test_graph_export_nodes_join_to_the_governed_context(
         assert edge["document_id"]
         assert edge["extractor_version"]
 
+
+def test_the_longest_declared_name_claims_an_overlapping_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Template code a user extends with their own vocabulary: when one term's
     name contains another's, the longer one wins the span, whatever order
     the terms are declared in."""
@@ -295,6 +300,9 @@ def test_graph_export_nodes_join_to_the_governed_context(
     spec = importlib.util.spec_from_file_location("demo_entity_mentions", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Executing the shipped file would otherwise cache bytecode inside the
+    # package's template directory, which a later `stel init` reads.
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
     spec.loader.exec_module(module)
     vocabulary = Vocabulary.model_validate(
         {"terms": [{"label": "Search"}, {"label": "Search Service"}]}

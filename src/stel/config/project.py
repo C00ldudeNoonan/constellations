@@ -15,6 +15,7 @@ from pydantic import (
 from .class_hierarchy import ClassDeclaration, class_names, validate_classes
 from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME
 from .ontology import OntologyImport
+from .relation_characteristics import check_relation_characteristics
 from .vocabulary import RelationTypeDef, Vocabulary, check_declaration
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
@@ -151,6 +152,7 @@ class ProjectConfig(BaseModel):
                     f"{relation.object_class}) declared twice"
                 )
             seen.add(key)
+        check_relation_characteristics(self.relations)
 
     @property
     def yaml_provenance(self) -> YamlProvenance | None:

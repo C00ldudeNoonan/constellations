@@ -4822,6 +4822,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `stel.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
 | `stel.text.transforms.link_entities`      | Links entity mentions to canonical IDs by alias table, vector, or fuzzy match  |
 | `stel.text.transforms.extract_relations`  | Emits typed relations between entity mentions (deterministic co-occurrence)     |
+| `stel.text.transforms.supersede_relations` | Closes the validity interval of a `functional` relation a later, different fact replaced |
 | `stel.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
 | `stel.text.transforms.document_tone`      | Scores per-document tone from the token table + an operator-owned lexicon      |
 | `stel.text.transforms.extract_keyphrases` | Ranks keyphrases per document by n-gram frequency; child table with stable IDs |
@@ -5111,6 +5112,10 @@ the latter does not imply class inheritance. MCP class scopes include terms
 declared in descendant classes, and concept-cloud nodes show the declared class
 followed by its ancestors.
 
+A relation may also declare `functional: true` (one current object per subject),
+which `supersede_relations` acts on; every pairing of one name must agree. See
+[Validity intervals and supersession](#validity-intervals-and-supersession).
+
 A project that declares neither `classes:` nor `relations:` is unaffected:
 this adds a constraint only where one exists, never a new requirement, and
 the `co_occurrence` extractor (whose `relation_type` is a single operator
@@ -5123,6 +5128,112 @@ set rather than the corpus, and an incremental transform requires its adapter
 to advertise `STREAMING_TABULAR_READS`. What invalidates a parent is
 unchanged — every column still participates, order still does not matter, and
 repeated rows still count.
+
+### Validity intervals and supersession
+
+A fact is true for a window: "the Fed is in a hiking cycle", "the issuer
+guides revenue up". Every relation row carries the interval it holds over, so
+a later document that contradicts it is a different row with its own
+interval, not an overwrite and not an unexplained duplicate (issue #766,
+[ADR-0056](adr/0056-supersession-is-a-full-step-over-the-relation-table.md)).
+
+**The extractor stamps the interval's start, when asked.** Naming a mentions
+column makes `extract_relations` write the matching UTC timestamp columns:
+`effective_date_field` adds `valid_from` and `valid_to`, and
+`observed_at_field` adds `observed_at`.
+
+```yaml
+options:
+  mentions: document_entities
+  effective_date_field: filed_at   # the document's effective date -> valid_from
+  observed_at_field: ingested_at   # when the document was observed -> observed_at
+```
+
+Each is read per document, never from the clock, so a rerun republishes
+identical rows and `relation_id` does not change. A date reads as midnight UTC
+and a naive datetime as UTC; a text column is refused, because `03/04` has two
+readings. A document's mentions must agree on the value (a null on some rows
+is filled from the others, two different values are an error that names the
+column and the document). A document with no value on any mention gets a null
+`valid_from`, meaning *unknown*: stel does not guess a start. `valid_to` is
+always null from the extractor, because closing an interval needs a second
+document. A model that names neither field writes none of these columns and is
+unchanged by this feature.
+
+Naming a field on an existing incremental model adds columns to its table,
+which a run refuses ("Schema change on incremental table") rather than guess.
+Rebuild it with `stel run --select <model> --full-refresh`, which reprocesses
+every document and stamps them together; for a `model_assertion` model that is
+a re-extraction, so check the provider cache and budget first.
+
+**Supersession is a separate, full step.** Declare which relation types hold
+one object per subject with `functional: true` on the relation, then add a
+`supersede_relations` model over the relation table and the entity links:
+
+```yaml
+# stel_project.yml
+classes: [company, city]
+relations:
+  - {name: headquartered_in, subject_class: company, object_class: city, functional: true}
+```
+
+```yaml
+- name: current_relations
+  depends_on: [ref('document_typed_relations'), ref('entity_links')]
+  transform:
+    type: python
+    module: stel.text.transforms.supersede_relations
+    options:
+      relations: document_typed_relations
+      entity_links: entity_links
+  materialization: full
+```
+
+A functional fact is keyed by its relation type and the *entity* its subject
+mention linked to (the matched link, so two spellings of one company are one
+subject). It is closed at the earliest strictly later `valid_from` among facts
+of the same key that name a *different* object entity: `valid_to` is set to
+that instant and `superseded_by` to that row's `relation_id`. No row is ever
+deleted. Details worth knowing:
+
+- Restating the same object closes nothing (corroboration is not change), and
+  every restatement before a change is closed by that change.
+- Different objects asserted at the same `valid_from` stay open together,
+  since nothing orders them; the run log counts them.
+- Only `asserted` rows whose two mentions resolve to a matched entity take
+  part. The rest pass through unchanged and are counted in the run log.
+- It fails, rather than guess, when a mention is matched to two entities, when
+  a functional row has no `valid_from`, when a column is missing, or when a
+  functional relation type is emitted by the undirected `co_occurrence`
+  extractor (also caught at compile). A `supersede_relations` model with no
+  `functional: true` relation declared fails at compile.
+- It recomputes from the whole table each run, so a forced reprocess of the
+  extractor gives the same intervals, and incremental extractor runs keep the
+  rows (and so the closed intervals) of unchanged documents. Read closed facts
+  from this model's table: the extractor's own `valid_to` stays null.
+
+**Reading as of an instant.** An interval is half-open, `[valid_from,
+valid_to)`: at the instant a newer fact begins, only the newer fact holds.
+
+```python
+from datetime import UTC, datetime
+from stel.relation_validity import relations_as_of
+
+held = relations_as_of(
+    frame,                       # current_relations read through the adapter
+    datetime(2024, 6, 1, tzinfo=UTC),
+    include_unknown_validity=False,  # rows with no valid_from claim no instant
+)
+```
+
+Status is not filtered, so combine with `status == 'asserted'` for only the
+facts an extractor stood behind. The same predicate in SQL is
+`valid_from <= :t AND (valid_to IS NULL OR :t < valid_to)`.
+
+`stel graph-export` carries the interval on each edge (see
+[Graph export](#graph-export)). Bitemporal belief ("what did we think on date
+X") is not asked of this table: `observed_at` is stamped but takes no part in
+the interval logic.
 
 ### Document-level aggregate features
 
@@ -5889,10 +6000,14 @@ It reads only the two models' output tables and writes three files:
 - `edges.jsonl` — one row per extracted fact, not an aggregate:
   `relation_id`, `subject_entity_id`, `object_entity_id`, `relation_type`,
   `directed`, `method`, `confidence`, `document_id`, `sentence_index`,
-  `extractor`, `extractor_version`, and the `*_resolver` / `*_resolver_version`
-  that linked each end. Every edge therefore names the document and extractor
-  version it came from.
-- `graph_manifest.json` — `stel.graph_export/v1`, the models read, row counts, a
+  `extractor`, `extractor_version`, the `*_resolver` / `*_resolver_version`
+  that linked each end, and the interval the fact holds over (`valid_from`,
+  `valid_to`, `observed_at`, `superseded_by`; UTC ISO-8601 with a `Z`, null when
+  unknown or open, see [Validity intervals and supersession](#validity-intervals-and-supersession)).
+  Every edge therefore names the document and extractor version it came from.
+  Point `--relation-model` at the `supersede_relations` model to export closed
+  intervals.
+- `graph_manifest.json` — `stel.graph_export/v2`, the models read, row counts, a
   SHA-256 per file and a count of relations left out by reason. It is written
   last, so a directory that has one is complete.
 

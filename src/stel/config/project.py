@@ -89,7 +89,16 @@ class ProjectConfig(BaseModel):
             return self
         declared_classes = set(class_names(self.classes))
         seen: set[tuple[str, str, str]] = set()
+        functional_by_name: dict[str, bool] = {}
         for relation in self.relations:
+            if functional_by_name.setdefault(relation.name, relation.functional) != (
+                relation.functional
+            ):
+                raise ValueError(
+                    f"relation '{relation.name}' is declared `functional` on one "
+                    "pairing and not on another; `functional` belongs to the "
+                    "relation type, so every pairing must agree"
+                )
             for class_name, role in (
                 (relation.subject_class, "subject_class"),
                 (relation.object_class, "object_class"),

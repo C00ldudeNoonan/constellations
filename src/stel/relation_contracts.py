@@ -27,7 +27,9 @@ from .config.class_hierarchy import class_ancestors, class_parents
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .paths import resolve_module_file
+from .relation_validity import SUPERSEDE_TRANSFORM_MODULE
 from .text.relations import (
+    CoOccurrenceExtractorOptions,
     ModelAssertionExtractorOptions,
     RelationRule,
     RuleExtractorOptions,
@@ -52,6 +54,40 @@ class RelationContractError(ValueError):
 def validate_relation_project_contracts(
     models: list[ModelConfig], project: ProjectConfig, project_dir: Path
 ) -> None:
+    _validate_declared_relations(models, project, project_dir)
+    _validate_supersession_models(models, project, project_dir)
+
+
+def _validate_supersession_models(
+    models: list[ModelConfig], project: ProjectConfig, project_dir: Path
+) -> None:
+    """A `supersede_relations` model acts on `functional: true` relation types
+    (ADR-0056); with none declared it would silently do nothing, which reads as
+    "no facts were replaced" rather than "nothing was asked"."""
+    if any(relation.functional for relation in project.relations):
+        return
+    # A project file at the built-in's path owns its options, as above.
+    if resolve_module_file(SUPERSEDE_TRANSFORM_MODULE, project_dir).exists():
+        return
+    for model in models:
+        if (
+            model.transform is not None
+            and model.transform.type == "python"
+            and model.transform.module == SUPERSEDE_TRANSFORM_MODULE
+        ):
+            raise RelationContractError(
+                f"Model '{model.name}' supersedes relations, but no relation under "
+                "`relations:` declares `functional: true`, so there is nothing for "
+                "it to close. Declare the relation types that hold one object per "
+                "subject, or remove the model",
+                model_name=model.name,
+                path=("transform", "module"),
+            )
+
+
+def _validate_declared_relations(
+    models: list[ModelConfig], project: ProjectConfig, project_dir: Path
+) -> None:
     if not project.classes and not project.relations:
         return
     # A project file at the same dotted path wins over the built-in module
@@ -65,6 +101,7 @@ def validate_relation_project_contracts(
             (relation.subject_class, relation.object_class)
         )
     parents = class_parents(project.classes)
+    functional = {relation.name for relation in project.relations if relation.functional}
 
     for model in models:
         if (
@@ -87,6 +124,24 @@ def validate_relation_project_contracts(
                 _validate_rule(model, index, rule, allowed_pairs, parents)
         elif isinstance(options, ModelAssertionExtractorOptions):
             _validate_model_assertion_types(model, options, allowed_pairs)
+        elif isinstance(options, CoOccurrenceExtractorOptions):
+            _validate_not_functional(model, options, functional)
+
+
+def _validate_not_functional(
+    model: ModelConfig, options: CoOccurrenceExtractorOptions, functional: set[str]
+) -> None:
+    """Co-occurrence rows have no subject and object, only an order the text
+    happened to give them, so "one current object per subject" cannot hold."""
+    if options.relation_type in functional:
+        raise RelationContractError(
+            f"Model '{model.name}' emits undirected co-occurrence rows as "
+            f"'{options.relation_type}', which `relations:` declares `functional: "
+            "true`. A functional relation needs a subject and an object; use the "
+            "`rule` or `model_assertion` extractor for it",
+            model_name=model.name,
+            path=("transform", "options", "relation_type"),
+        )
 
 
 def _validate_rule(

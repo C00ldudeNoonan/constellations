@@ -20,7 +20,14 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from .identifiers import validate_node_name
 from .source import WAREHOUSE_SOURCE_SCHEME, validate_relation_name
@@ -305,6 +312,10 @@ class RelationTypeDef(BaseModel):
     name: str
     subject_class: str
     object_class: str
+    # One current object per subject (ADR-0056): `supersede_relations` closes a
+    # row when a later document asserts a different object for the same subject.
+    # A property of the relation type, so every pairing of one name must agree.
+    functional: StrictBool = False
 
     @field_validator("name", "subject_class", "object_class")
     @classmethod

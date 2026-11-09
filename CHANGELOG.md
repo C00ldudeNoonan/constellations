@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- On DuckDB, an incremental child-table model (`extract_relations`, `nlp_entities`, any
+  transform with an incremental contract) with `on_schema_change: append_new_columns` no
+  longer fails with "Attempting to modify table ... but another transaction has altered
+  this table" when a run both reprocesses existing documents and adds a column. The
+  adapter deleted the reprocessed documents' rows before the `ALTER TABLE`, and DuckDB
+  refuses to commit a table altered after it was modified; the schema is now reconciled
+  first. A run of only new documents was never affected. BigQuery adds columns before
+  its transaction and was not affected. This is the remedy the "Schema change on
+  incremental table" error already named (issue #769).
+  The adapter edit moves the same `backend:llm` identity field announced in the entry
+  above, so the same `stel plan`, then `stel adopt`, applies; nothing else re-keys.
 - MCP `BusinessFilter` accepts `gte` and `lte` as spellings of the range operators `ge`
   and `le`. They are normalized on input, so `list_context_models`, the query log and
   every store still see only `ge` and `le`. The range operators themselves (`lt`, `le`,
@@ -26,6 +37,22 @@
   although no `llm` extraction output changes (its identity hashes the adapter modules
   through its import closure, #750). Run `stel plan`, then `stel adopt --select <model>`
   for models that use the `llm` extraction backend.
+
+- Relation rows carry the interval a fact holds over. `extract_relations` can write
+  `valid_from`, `valid_to` and `observed_at` columns, read per document from the mentions
+  columns named by the new `effective_date_field` and `observed_at_field` options (never
+  the clock, so rows and `relation_id` do not change). A model that names neither writes
+  no new column; naming one on an existing incremental model is a schema change, rebuilt
+  with `--full-refresh`. A relation declared `functional: true` under `relations:` holds
+  one current object per subject, and the new `stel.text.transforms.supersede_relations`
+  model closes each such fact at the first later fact that names a different object,
+  recording `superseded_by` and never deleting a row. Subject identity comes from
+  `link_entities`, so it needs the link table; the step is `materialization: full`, so a
+  forced reprocess gives the same intervals. `stel.relation_validity.relations_as_of`
+  reads a relation table at an instant over half-open intervals. `stel graph-export`
+  edges carry the four fields and the manifest is now `stel.graph_export/v2`. Existing
+  models are unaffected: no `code_version` moves and no column appears until a model
+  opts in (issue #766, ADR-0056).
 
 ## v0.25.0 - 2026-11-07
 

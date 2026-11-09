@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -424,3 +424,113 @@ def test_lines_end_in_a_bare_newline_on_every_platform(tmp_path: Path) -> None:
     for name in (NODES_FILENAME, EDGES_FILENAME):
         assert b"\r" not in (out / name).read_bytes()
     assert not list(out.glob("*.tmp"))
+
+
+# --- validity on edges (ALE-422, ADR-0056): schema v2 -----------------------
+
+_VALIDITY_SCHEMA = {
+    "valid_from": pl.Datetime("us", "UTC"),
+    "valid_to": pl.Datetime("us", "UTC"),
+    "observed_at": pl.Datetime("us", "UTC"),
+    "superseded_by": pl.String(),
+}
+_EDGE_VALIDITY = ("valid_from", "valid_to", "observed_at", "superseded_by")
+
+
+def _ab_links() -> pl.DataFrame:
+    return _links(
+        [
+            {"mention_id": "m1", "canonical_id": "A"},
+            {"mention_id": "m2", "canonical_id": "B"},
+        ]
+    )
+
+
+def _validity_graph(**validity: Any) -> Any:
+    relations = _relations(
+        [
+            {
+                "relation_id": "r1",
+                "subject_mention_id": "m1",
+                "object_mention_id": "m2",
+                "directed": True,
+            }
+        ]
+    ).with_columns(
+        *(
+            pl.Series(name, [validity.get(name)], dtype=dtype)
+            for name, dtype in _VALIDITY_SCHEMA.items()
+        )
+    )
+    return _build(
+        _ab_links(),
+        relations,
+    )
+
+
+def test_the_export_schema_is_v2_because_edges_gained_validity() -> None:
+    """ADR-0055 said validity arrives as a version bump, not as null columns
+    on v1: a reader that checks the version learns the edge shape changed."""
+    assert GRAPH_EXPORT_SCHEMA == "stel.graph_export/v2"
+
+
+def test_an_edge_carries_its_validity_interval_as_utc_iso_strings() -> None:
+    graph = _validity_graph(
+        valid_from=datetime(2020, 1, 1, tzinfo=UTC),
+        valid_to=datetime(2023, 6, 1, 12, 30, 15, 250000, tzinfo=UTC),
+        observed_at=datetime(2020, 1, 2, tzinfo=UTC),
+        superseded_by="r2",
+    )
+
+    (edge,) = graph.edges
+    assert edge["valid_from"] == "2020-01-01T00:00:00Z"
+    assert edge["valid_to"] == "2023-06-01T12:30:15.250000Z"
+    assert edge["observed_at"] == "2020-01-02T00:00:00Z"
+    assert edge["superseded_by"] == "r2"
+
+
+def test_an_open_interval_has_a_null_end() -> None:
+    graph = _validity_graph(valid_from=datetime(2020, 1, 1, tzinfo=UTC))
+
+    (edge,) = graph.edges
+    assert edge["valid_to"] is None
+    assert edge["superseded_by"] is None
+
+
+def test_a_relation_model_built_before_validity_exports_null_validity() -> None:
+    """A table with no validity columns says the validity is unknown, which is
+    what null means here; the edge still has the keys so v2 has one shape."""
+    graph = _build(
+        _ab_links(),
+        _relations([{"relation_id": "r1", "subject_mention_id": "m1", "object_mention_id": "m2"}]),
+    )
+
+    (edge,) = graph.edges
+    assert {name: edge[name] for name in _EDGE_VALIDITY} == dict.fromkeys(_EDGE_VALIDITY)
+
+
+def test_validity_survives_the_written_file_byte_for_byte(tmp_path: Path) -> None:
+    graph = _validity_graph(
+        valid_from=datetime(2020, 1, 1, tzinfo=UTC),
+        valid_to=datetime(2023, 1, 1, tzinfo=UTC),
+        superseded_by="r2",
+    )
+
+    out = write_graph_export(graph, tmp_path / "g", linking_model="l", relation_model="r")
+    again = write_graph_export(graph, tmp_path / "g2", linking_model="l", relation_model="r")
+
+    line = (out / EDGES_FILENAME).read_text(encoding="utf-8").splitlines()[0]
+    assert json.loads(line)["valid_to"] == "2023-01-01T00:00:00Z"
+    assert (out / EDGES_FILENAME).read_bytes() == (again / EDGES_FILENAME).read_bytes()
+
+
+def test_a_validity_column_that_is_not_a_timestamp_is_refused_by_name() -> None:
+    relations = _relations(
+        [{"relation_id": "r1", "subject_mention_id": "m1", "object_mention_id": "m2"}]
+    ).with_columns(pl.lit("2020-01-01").alias("valid_from"))
+
+    with pytest.raises(GraphExportError, match="valid_from"):
+        _build(
+            _ab_links(),
+            relations,
+        )

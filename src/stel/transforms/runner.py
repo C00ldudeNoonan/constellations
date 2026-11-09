@@ -14,7 +14,7 @@ import polars as pl
 
 from ..budget import BudgetLedger
 from ..config.profile import LLMConfig, WarehouseConfig
-from ..config.vocabulary import Vocabulary
+from ..config.vocabulary import RelationTypeDef, Vocabulary
 from ..paths import resolve_module_file
 
 
@@ -41,6 +41,9 @@ class TransformContext:
     # `alias_table` resolver does, for an `aliases: vocab.<name>` source
     # (issue #627) — without re-loading the project from `project_dir`.
     vocabularies: Mapping[str, Vocabulary] = field(default_factory=dict)
+    # The project's declared relation types (issue #766), so `supersede_relations`
+    # can read which are `functional` without re-loading the project.
+    relations: tuple[RelationTypeDef, ...] = ()
 
 
 @dataclass(frozen=True)

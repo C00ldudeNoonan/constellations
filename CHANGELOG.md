@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- MCP `BusinessFilter` accepts `gte` and `lte` as spellings of the range operators `ge`
+  and `le`. They are normalized on input, so `list_context_models`, the query log and
+  every store still see only `ge` and `le`. The range operators themselves (`lt`, `le`,
+  `gt`, `ge`) were already accepted and are now documented in `docs/mcp.md` with a date
+  window example (issue #770).
 - A search publish that owns one partition of its upstream now reconciles stale keys
   against that partition. `StateAbsenceProbe` and `BoundedReconciler.iter_stale_pages`
   take the same typed predicates as the snapshot read, on DuckDB and BigQuery, so a row

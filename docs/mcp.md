@@ -651,6 +651,25 @@ when its list contains at least one of those values:
 Scalar fields do not accept `array_contains_any`. Policy attributes remain
 server-controlled and cannot be supplied as business filters.
 
+A scalar field other than a boolean also accepts the range operators `lt`, `le`,
+`gt` and `ge`, with one value parsed against the field's declared type, so a date
+window is two filters on a `date` field:
+
+```json
+{
+  "model": "context_search",
+  "query": "guidance",
+  "filters": [
+    {"field": "filing_date_dt", "operator": "ge", "value": "2025-01-01"},
+    {"field": "filing_date_dt", "operator": "lt", "value": "2026-01-01"}
+  ]
+}
+```
+
+`gte` and `lte` are accepted as spellings of `ge` and `le`. They are normalized
+before anything else sees the request, so `list_context_models` advertises, and
+the query log records, only `ge` and `le`.
+
 A search hit carries the attributes the model declares `returned: true`, in
 an `attributes` object beside `citation` and `lineage`:
 

@@ -1301,6 +1301,18 @@ class DuckDBAdapter(WarehouseAdapter):
             with self._transaction():
                 full = self.table_ref(table)
                 existing = self._table_columns(table)
+                insert_cols: list[str] = []
+                if has_rows:
+                    self.connection.execute(
+                        f"CREATE TABLE IF NOT EXISTS {full} AS "
+                        "SELECT * FROM stel_staging LIMIT 0"
+                    )
+                    # Before any row is deleted: DuckDB refuses to commit a
+                    # table a transaction altered after it modified it, so
+                    # `append_new_columns` while reprocessing an existing parent
+                    # failed at commit. `existing` was read first, so a table
+                    # created just above still skips the parent delete.
+                    insert_cols = self._reconcile_schema(table, new_rows, on_schema_change)
                 if existing is not None and parent_ids:
                     placeholders = ", ".join("?" for _ in parent_ids)
                     self.connection.execute(
@@ -1309,11 +1321,6 @@ class DuckDBAdapter(WarehouseAdapter):
                         list(parent_ids),
                     )
                 if has_rows:
-                    self.connection.execute(
-                        f"CREATE TABLE IF NOT EXISTS {full} AS "
-                        "SELECT * FROM stel_staging LIMIT 0"
-                    )
-                    insert_cols = self._reconcile_schema(table, new_rows, on_schema_change)
                     key = self.quote_ident(child_key)
                     self.connection.execute(
                         f"DELETE FROM {full} AS target "

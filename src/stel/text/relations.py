@@ -95,6 +95,13 @@ class _RelationBaseOptions(BaseModel):
     label_field: str | None = "label"
     mention_text_field: str = "entity_text"
 
+    # Mentions columns carrying the document's effective date and the instant it
+    # was observed (ADR-0056). Each is read per document, never from the clock, so
+    # a rerun republishes identical rows; unset leaves `valid_from` or
+    # `observed_at` null rather than guessing.
+    effective_date_field: str | None = None
+    observed_at_field: str | None = None
+
     # Only mentions whose label is in this allow-list participate; empty = all.
     labels: tuple[str, ...] = ()
     # Fail closed on a pathological document rather than materialize a runaway
@@ -117,7 +124,7 @@ class _RelationBaseOptions(BaseModel):
     def _non_empty_string(cls, value: str) -> str:
         return _require_non_empty(value)
 
-    @field_validator("label_field")
+    @field_validator("label_field", "effective_date_field", "observed_at_field")
     @classmethod
     def _non_empty_optional_string(cls, value: str | None) -> str | None:
         if value is None:

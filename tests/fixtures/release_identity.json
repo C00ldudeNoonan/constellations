@@ -144,6 +144,15 @@
       "transform.uses_llm": "6bf0224995e4bd07",
       "transform_code_hash": "5cf5f1773b155e4e"
     },
+    "transform:supersede_relations": {
+      "transform.module": "707c6986c9d61199",
+      "transform.options": "8304737b3e3a5f2a",
+      "transform.path": "30d225c46740a241",
+      "transform.type": "83ab6ff3c1fa1123",
+      "transform.uses_llm": "6bf0224995e4bd07",
+      "transform_code_hash": "5cf5f1773b155e4e",
+      "transform_code_version_identity.supersession_version": "89ff22ca0e29f115"
+    },
     "transform:text_stats": {
       "transform.module": "1c91881c81389198",
       "transform.options": "49adf2385fa5ef89",
@@ -157,7 +166,7 @@
     {
       "case": "backend:llm",
       "field": "extraction.backend_implementation",
-      "reason": "A partitioned search publish reconciles stale keys against its own partition (issue #764): the state absence probe gained predicates in adapters/base.py, duckdb.py and bigquery.py. The llm backend's identity hashes those modules through its import closure but never reads an absence probe, so its output is unchanged; run `stel plan`, then `stel adopt` for llm-extraction models."
+      "reason": "A partitioned search publish reconciles stale keys against its own partition (issue #764): the state absence probe gained predicates in adapters/base.py, duckdb.py and bigquery.py. The llm backend's identity hashes those modules through its import closure but never reads an absence probe, and `DuckDBAdapter.replace_children` now reconciles the schema before deleting reprocessed parents (`append_new_columns` fix). The llm backend never reads either, so its output is unchanged; run `stel plan`, then `stel adopt` for llm-extraction models."
     }
   ]
 }

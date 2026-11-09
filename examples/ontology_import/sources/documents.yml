@@ -1,0 +1,5 @@
+version: 2
+sources:
+  - name: filings
+    path: documents
+    file_pattern: "*.json"

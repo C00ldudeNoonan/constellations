@@ -1,0 +1,14 @@
+version: 2
+models:
+  - name: classified_filings
+    source: ref('filings')
+    materialization: incremental
+    extraction:
+      backend: llm
+      options:
+        fields:
+          - {name: domicile, type: enum, values_from: vocab.country}
+          - {name: sector, type: enum, values_from: vocab.sector}
+    fields:
+      - {name: domicile, type: enum, values_from: vocab.country}
+      - {name: sector, type: enum, values_from: vocab.sector}

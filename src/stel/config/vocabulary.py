@@ -19,17 +19,21 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
 from .identifiers import validate_node_name
+from .ontology import validate_iri
 from .source import WAREHOUSE_SOURCE_SCHEME, validate_relation_name
 
 # `values_from: vocab.<name>` — the only source kind today. Prefixed rather
@@ -56,6 +60,23 @@ class VocabularyTerm(BaseModel):
     # `class:`; a keyword in Python, so the attribute is `entity_class`. Must
     # name a class declared under `classes:` (checked by ProjectConfig).
     entity_class: str | None = Field(default=None, alias="class")
+    # The concept's IRI when it came from an ontology (issue #767), so a
+    # downstream graph can join on it. Optional and never part of a label.
+    iri: str | None = None
+
+    @field_validator("iri")
+    @classmethod
+    def _validate_iri(cls, v: str | None) -> str | None:
+        return None if v is None else validate_iri(v, surface="vocabulary term `iri:`")
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_iri(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # A term without an IRI dumps exactly as it did before IRIs existed, so
+        # a project that imports no ontology keeps its artifacts' shape.
+        data = handler(self)
+        if self.iri is None:
+            data.pop("iri", None)
+        return data
 
     @field_validator("label")
     @classmethod
@@ -316,6 +337,9 @@ class RelationTypeDef(BaseModel):
     # row when a later document asserts a different object for the same subject.
     # A property of the relation type, so every pairing of one name must agree.
     functional: StrictBool = False
+    # The owl:ObjectProperty's IRI when the pairing was imported from an
+    # ontology (issue #767). Pairings of one name never carry different IRIs.
+    iri: str | None = None
 
     @field_validator("name", "subject_class", "object_class")
     @classmethod
@@ -324,3 +348,15 @@ class RelationTypeDef(BaseModel):
         if not normalized:
             raise ValueError("must not be empty")
         return normalized
+
+    @field_validator("iri")
+    @classmethod
+    def _validate_iri(cls, v: str | None) -> str | None:
+        return None if v is None else validate_iri(v, surface="relation `iri:`")
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_iri(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.iri is None:
+            data.pop("iri", None)
+        return data

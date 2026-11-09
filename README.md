@@ -12,6 +12,9 @@ build a DAG, materialize incrementally, test the results, and emit artifacts.
 Shared enum vocabularies can use inline terms, CSV seeds, or existing warehouse
 relations. The [vocabulary sources example](examples/vocabulary_sources/README.md)
 runs offline and shows how label changes reach provider schemas and incremental plans.
+Classes, relation types and terms can also be imported from a SKOS/OWL ontology
+file through an IRI allow-list, keeping each IRI; see the
+[ontology import example](examples/ontology_import/README.md).
 Declared entity classes can also form a single-parent hierarchy used by
 relation validation, MCP class scopes, and concept-cloud descriptions.
 

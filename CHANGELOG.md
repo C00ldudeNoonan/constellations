@@ -13,6 +13,24 @@
   incremental table" error already named (issue #769).
   The adapter edit moves the same `backend:llm` identity field announced in the entry
   above, so the same `stel plan`, then `stel adopt`, applies; nothing else re-keys.
+- An `ontologies:` block in `stel_project.yml` imports classes, relation types and
+  vocabulary terms from a SKOS/OWL file (Turtle or RDF/XML) instead of retyping them.
+  An `include:` allow-list of IRIs is required and is the whole import: `owl:Class`
+  becomes a class (an allow-listed `rdfs:subClassOf` its `subclass_of`),
+  `owl:ObjectProperty` a relation pairing per allow-listed `rdfs:domain` x `rdfs:range`
+  (`functional: true` when it is an `owl:FunctionalProperty`),
+  and `skos:Concept` or `owl:NamedIndividual` a term in the entry's `vocabulary:`, with
+  label, aliases, definition, broader term and class from SKOS/RDFS. Every imported term,
+  class and relation pairing keeps its source IRI in a new optional `iri:` field, which a
+  hand-written one may also declare. The file resolves at load, before discovery: an
+  allow-listed IRI the file lacks, an ambiguous type, label or parent, or an unparseable
+  file fails naming the IRI or line. Term order follows the allow-list, so re-serializing
+  the file changes no identity; a label change re-keys models whose enum fields use the
+  vocabulary and shows in `stel plan`. Parsing needs the new `rdf` extra
+  (`pip install 'stel[rdf]'`, rdflib) (issue #767, ADR-0057).
+  Upgrading: the serving manifest is now v5 (an optional `iri` on declared terms and
+  classes). The MCP server refuses a v4 manifest; recompile serving manifests on upgrade.
+  A declaration with no IRIs dumps exactly as before.
 - MCP `BusinessFilter` accepts `gte` and `lte` as spellings of the range operators `ge`
   and `le`. They are normalized on input, so `list_context_models`, the query log and
   every store still see only `ge` and `le`. The range operators themselves (`lt`, `le`,

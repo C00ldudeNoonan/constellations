@@ -50,8 +50,9 @@ MANIFEST_VERSION = 1
 # project's `classes:` and `vocabularies:` as compiled (issue #669), so the
 # catalog interprets published entity links under the declaration that was
 # in force when the artifact was written rather than whatever the project
-# file says when the server starts. v4 carries class hierarchy declarations.
-SERVING_MANIFEST_VERSION = 4
+# file says when the server starts. v4 carries class hierarchy declarations;
+# v5 adds the optional `iri` an ontology import gives a term or class (#767).
+SERVING_MANIFEST_VERSION = 5
 MANIFEST_FILENAME = "manifest.json"
 RUN_RESULTS_FILENAME = "run_results.json"
 

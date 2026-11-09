@@ -1,0 +1,49 @@
+# A hand-written subset modelled on FIBO and OMG LCC IRIs, for the stel
+# `ontologies:` example. The triples are illustrative: the real ontologies
+# carry far more (and not always this domain and range), which is why stel
+# imports only an allow-list.
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix fibo-be-le-lp: <https://spec.edmcouncil.org/fibo/ontology/BE/LegalEntities/LegalPersons/> .
+@prefix fibo-fnd-rel:  <https://spec.edmcouncil.org/fibo/ontology/FND/Relations/Relations/> .
+@prefix lcc-cr:  <https://www.omg.org/spec/LCC/Countries/CountryRepresentation/> .
+@prefix lcc-3166: <https://www.omg.org/spec/LCC/Countries/ISO3166-1-CountryCodes/> .
+@prefix sector: <https://example.com/sectors#> .
+
+fibo-be-le-lp:LegalPerson a owl:Class ;
+    rdfs:label "legal person"@en .
+
+fibo-be-le-lp:LegalEntity a owl:Class ;
+    rdfs:subClassOf fibo-be-le-lp:LegalPerson ;
+    rdfs:label "legal entity"@en .
+
+lcc-cr:Country a owl:Class ;
+    rdfs:label "country"@en .
+
+fibo-fnd-rel:isDomiciledIn a owl:ObjectProperty ;
+    rdfs:label "is domiciled in"@en ;
+    rdfs:domain fibo-be-le-lp:LegalEntity ;
+    rdfs:range lcc-cr:Country .
+
+lcc-3166:UnitedStatesOfAmerica a owl:NamedIndividual, lcc-cr:Country ;
+    rdfs:label "United States of America"@en ;
+    skos:altLabel "United States"@en, "USA"@en .
+
+lcc-3166:Germany a owl:NamedIndividual, lcc-cr:Country ;
+    rdfs:label "Germany"@en, "Deutschland"@de .
+
+lcc-3166:Japan a owl:NamedIndividual, lcc-cr:Country ;
+    rdfs:label "Japan"@en .
+
+sector:financials a skos:Concept ;
+    skos:prefLabel "financials"@en ;
+    skos:definition "Banks, insurers and other financial firms"@en .
+
+sector:banks a skos:Concept ;
+    skos:prefLabel "banks"@en ;
+    skos:broader sector:financials .
+
+sector:technology a skos:Concept ;
+    skos:prefLabel "technology"@en .

@@ -2468,6 +2468,82 @@ Offline dbt export, code generation, and embedded execution support CSV and
 inline vocabularies; they reject unresolved warehouse vocabularies. See the
 runnable [`vocabulary_sources` example](../examples/vocabulary_sources/README.md).
 
+### Importing an ontology
+
+An `ontologies:` block imports classes, relation types and vocabulary terms
+from a SKOS or OWL file instead of retyping them (issue #767). It needs the
+`rdf` extra: `pip install 'stel[rdf]'`.
+
+```yaml
+# stel_project.yml
+ontologies:
+  - path: ontologies/fibo_subset.ttl
+    vocabulary: country          # receives the allow-listed terms
+    include:                     # required; the whole import
+      - https://spec.edmcouncil.org/fibo/ontology/BE/LegalEntities/LegalPersons/LegalEntity
+      - https://www.omg.org/spec/LCC/Countries/CountryRepresentation/Country
+      - https://spec.edmcouncil.org/fibo/ontology/FND/Relations/Relations/isDomiciledIn
+      - https://www.omg.org/spec/LCC/Countries/ISO3166-1-CountryCodes/Germany
+      - {iri: https://example.com/other#Org, name: OtherOrg}
+```
+
+`include:` lists full IRIs (prefixes are not expanded). Each allow-listed IRI
+becomes one thing, by its `rdf:type` in the file:
+
+| In the file | Becomes |
+|---|---|
+| `skos:Concept` or `owl:NamedIndividual` | a term in `vocabulary:`. Label from `skos:prefLabel`, else `rdfs:label`; `aliases` from `skos:altLabel`; `description` from `skos:definition`; `broader` from `skos:broader` (or an inverse `skos:narrower`); `class:` from an `rdf:type` that names an allow-listed class |
+| `owl:Class` (or `rdfs:Class`) | a class named by the IRI's local name, with an allow-listed `rdfs:subClassOf` as its `subclass_of` |
+| `owl:ObjectProperty` | one relation pairing per allow-listed `rdfs:domain` x `rdfs:range` class; an `owl:unionOf` domain or range counts each named member. Also typed `owl:FunctionalProperty`, every pairing is `functional: true` (see [supersession](#validity-intervals-and-supersession)), and a hand-written pairing of the same name must agree |
+
+Every imported term, class and relation pairing keeps its source IRI as an
+`iri:` field, so a downstream graph can join on it. A hand-written term,
+class (`{name: ..., iri: ...}`) or relation may declare `iri:` too.
+
+`name:` on an `include:` entry overrides the derived name: a class or relation
+name otherwise comes from the IRI's local name, and a term label from its
+preferred label. Two IRIs that derive the same name, or a local name that is
+not a valid class name, need one. Labels, alternative labels and definitions
+are read in `lang:` (default `en`), falling back to literals with no language
+tag. `format:` is `turtle` or `xml` (RDF/XML) and defaults from the suffix:
+`.ttl` is Turtle, and `.rdf`, `.owl` and `.xml` are RDF/XML.
+
+The allow-list is the whole import. A `skos:broader` or `rdfs:subClassOf` link
+to an IRI outside it is not followed, so the imported hierarchy is the part of
+the file's hierarchy the allow-list covers. Its order is the order terms and
+classes take: re-serializing or reformatting the file changes nothing, and
+reordering the allow-list reorders an enum's values, as reordering inline
+`terms:` does. Imported classes and relations are appended after hand-written
+ones, and a hand-written relation, term `class:` or `subclass_of:` may name an
+imported class. An imported vocabulary is owned by its ontology entry; a
+vocabulary or class name declared twice fails.
+
+The file resolves when the project loads, before source discovery, credentials
+or any warehouse or provider call, and every failure names the file and the
+IRI:
+
+- an allow-listed IRI the file does not declare, or declares with none of the
+  types above, or with two of them;
+- a term with no label, or two labels or definitions in `lang:`;
+- a class with two allow-listed parents or a term with two allow-listed
+  broader terms (stel's are single-parent);
+- a relation with no named `rdfs:domain` or `rdfs:range`, or none in the
+  allow-list;
+- a term in an entry with no `vocabulary:`, or a `vocabulary:` with no terms;
+- a file that does not parse (the error names the line, not its text).
+
+Ontology paths stay inside the project and must be regular, non-symlink files,
+like CSV seeds. `owl:imports` is not followed and external XML entities are
+not resolved. A relative IRI in the file resolves against
+`https://stel.invalid/<path>` (the reserved `.invalid` domain), never against
+the file's location on disk. Changing an imported label changes the code
+identity of every model whose enum field uses the vocabulary, appears in
+`stel plan` and follows the usual incremental policy. An MCP server reading a
+project with `ontologies:` needs the `rdf` extra too, because it loads the live
+project to warn about drift. See the runnable
+[`ontology_import` example](../examples/ontology_import/README.md) and
+[ADR-0057](adr/0057-an-ontology-import-is-an-allow-list-resolved-at-load.md).
+
 A term's `description:` reaches the prompt fallback too, as a line of its
 own, so a provider without schema-level enum support sees what a label means,
 not only its name. A term may also declare `aliases:` (alternative names) and
@@ -2578,8 +2654,8 @@ qualify. So `stel compile`, `run` and `build` write the declaration into
 `manifest.json`, `entity_types` and `entity_scope` resolve against that copy,
 and an edit to the project file does nothing to a running or restarted server
 until you recompile and republish. A server started beside a project file that
-differs from its manifest logs a warning saying so. A manifest from before
-`manifest_version: 4` is refused with "run `stel compile`" rather than read as
+differs from its manifest logs a warning saying so. A manifest at any other
+`manifest_version` than 5 is refused with "run `stel compile`" rather than read as
 declaring nothing, since an empty declaration would downgrade `entity_types` to
 the scan and refuse every scope for the wrong reason.
 
@@ -6764,9 +6840,11 @@ run results under `target-path`:
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
   model, DAG nodes+edges+execution order. Re-generated each run. A project
   with a search or agent-context model writes the serving manifest
-  (`manifest_version: 4`), which also carries `declarations`: the project's
+  (`manifest_version: 5`), which also carries `declarations`: the project's
   `classes:` and `vocabularies:` as compiled, because the MCP server reads the
-  declaration from here rather than from the project file (issue #669).
+  declaration from here rather than from the project file (issue #669). v5
+  adds the optional `iri` an imported term or class carries (issue #767); a
+  declaration with no IRIs is otherwise the same as v4's.
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed, and `sources_considered`) plus per-model documents
   processed/skipped, rows written, duration, the model's own `started_at` and

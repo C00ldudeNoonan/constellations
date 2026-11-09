@@ -66,6 +66,7 @@ history (issue #311).
 | [0054](0054-ml-scores-locally-a-remote-scorer-is-not-yet-an-ml-provider.md) | `ml:` scores locally; a remote scorer (a Vertex custom prediction endpoint) is not yet an `ml:` provider, and not an `InferenceProvider` either | accepted |
 | [0055](0055-graph-export-is-a-cli-over-per-fact-edges.md) | Graph export is a `stel graph-export` CLI writing JSON Lines, one edge per extracted fact, with nodes keyed by the agent-context `entity_id` and `entity_name` required | accepted |
 | [0056](0056-supersession-is-a-full-step-over-the-relation-table.md) | Supersession is a `full` step over the relation table and entity links, not part of the incremental extractor; `functional: true` is declared on the relation type; graph export carries validity as schema v2 | accepted |
+| [0057](0057-an-ontology-import-is-an-allow-list-resolved-at-load.md) | An ontology import is a required, ordered allow-list resolved into `vocabularies:`, `classes:` and `relations:` at load; links outside it are not followed, and ambiguity fails rather than picks | accepted |
 
 ## When to write one
 

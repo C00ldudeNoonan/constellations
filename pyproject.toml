@@ -64,6 +64,10 @@ nlp = ["spacy>=3.8,<4"]
 # scikit-learn>=1.3 ships HDBSCAN natively, so clustering/topic modeling needs
 # no separate hdbscan dependency.
 ml = ["scikit-learn>=1.3", "numpy>=1.26"]
+# Ontology import (`ontologies:`, issue #767) parses Turtle and RDF/XML. rdflib
+# never follows owl:imports on its own, and stel parses only files it has
+# already validated inside the project.
+rdf = ["rdflib>=7.1"]
 all = [
     "google-cloud-bigquery>=3.25",
     "google-cloud-bigquery-storage>=2.25",
@@ -89,6 +93,7 @@ all = [
     "spacy>=3.8,<4",
     "scikit-learn>=1.3",
     "numpy>=1.26",
+    "rdflib>=7.1",
 ]
 
 [project.scripts]

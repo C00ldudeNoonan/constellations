@@ -1,0 +1,21 @@
+name: ontology_import
+version: "0.1.0"
+profile: ontology_import
+
+# Classes, relations and vocabulary terms imported from an ontology file. The
+# allow-list is the whole import, and its order is the order terms take.
+ontologies:
+  - path: ontologies/fibo_subset.ttl
+    vocabulary: country
+    include:
+      - https://spec.edmcouncil.org/fibo/ontology/BE/LegalEntities/LegalPersons/LegalPerson
+      - https://spec.edmcouncil.org/fibo/ontology/BE/LegalEntities/LegalPersons/LegalEntity
+      - https://www.omg.org/spec/LCC/Countries/CountryRepresentation/Country
+      - https://spec.edmcouncil.org/fibo/ontology/FND/Relations/Relations/isDomiciledIn
+      - https://www.omg.org/spec/LCC/Countries/ISO3166-1-CountryCodes/UnitedStatesOfAmerica
+      - https://www.omg.org/spec/LCC/Countries/ISO3166-1-CountryCodes/Germany
+  - path: ontologies/fibo_subset.ttl
+    vocabulary: sector
+    include:
+      - https://example.com/sectors#financials
+      - https://example.com/sectors#banks

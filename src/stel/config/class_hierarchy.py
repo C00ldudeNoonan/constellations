@@ -3,24 +3,56 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from .identifiers import validate_node_name
+from .ontology import validate_iri
 
 
 class ClassDef(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     name: str
-    subclass_of: str
+    # Optional so a root class can still carry an `iri:`; a ClassDef with
+    # neither behaves exactly like the bare name.
+    subclass_of: str | None = None
+    # The owl:Class IRI when the class was imported from an ontology (#767).
+    iri: str | None = None
 
-    @field_validator("name", "subclass_of")
+    @field_validator("name")
     @classmethod
     def _name(cls, value: str) -> str:
         value = value.strip()
         validate_node_name(value, kind="Class")
         return value
+
+    @field_validator("subclass_of")
+    @classmethod
+    def _parent(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        validate_node_name(value, kind="Class")
+        return value
+
+    @field_validator("iri")
+    @classmethod
+    def _iri(cls, value: str | None) -> str | None:
+        return None if value is None else validate_iri(value, surface="class `iri:`")
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # Dumps only what was declared: `{name, subclass_of}` as before IRIs
+        # existed, `{name, iri}` for an imported root class.
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 ClassDeclaration = str | ClassDef
@@ -35,7 +67,11 @@ def class_names(classes: Sequence[ClassDeclaration]) -> tuple[str, ...]:
 
 
 def class_parents(classes: Sequence[ClassDeclaration]) -> dict[str, str]:
-    return {value.name: value.subclass_of for value in classes if isinstance(value, ClassDef)}
+    return {
+        value.name: value.subclass_of
+        for value in classes
+        if isinstance(value, ClassDef) and value.subclass_of is not None
+    }
 
 
 def validate_classes(classes: Sequence[ClassDeclaration]) -> None:

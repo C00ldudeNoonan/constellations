@@ -1,0 +1,10 @@
+ontology_import:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: target/ontology_import.duckdb
+      llm:
+        provider: deterministic
+        cache_path: target/llm_cache.sqlite

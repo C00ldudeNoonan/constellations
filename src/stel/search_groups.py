@@ -34,6 +34,9 @@ from .embedding import resolve_search_embedding_identity
 from .hashing import canonical_fingerprint
 from .retrieval.evolution import semantic_search_config
 
+# The attribute `data_type` each partition type is compared against.
+_ATTRIBUTE_TYPE = {"date": "date", "integer": "integer", "string": "string"}
+
 
 class SearchGroupError(ValueError):
     """A group declaration the compiler rejects.
@@ -64,6 +67,10 @@ def partition_predicates(
     if partition.nulls:
         return (ReadPredicate(partition.field, ReadPredicateOperator.IS_NULL),)
     predicates: list[ReadPredicate] = []
+    if partition.lower is None and partition.upper is None:
+        # An empty tuple reads the whole relation, nulls included, which the
+        # required null member also publishes. A range never owns a null.
+        return (ReadPredicate(partition.field, ReadPredicateOperator.IS_NOT_NULL),)
     if partition.lower is not None:
         predicates.append(
             ReadPredicate(
@@ -195,6 +202,20 @@ def _validate_group(
                 "enforced inside every member",
                 model=model.name,
                 path=("search", "attributes"),
+            )
+        expected = _ATTRIBUTE_TYPE[first_partition.type]
+        if routed.data_type != expected:
+            # Coverage is checked in the declared type, but the warehouse
+            # evaluates the predicates in the column's own: bounds that tile
+            # strings can overlap as integers, so a member would publish a row
+            # another member also owns, or none.
+            raise SearchGroupError(
+                f"search group '{name}' declares `type: {first_partition.type}` for "
+                f"{first_partition.field}, but '{model.name}' declares that attribute "
+                f"`data_type: {routed.data_type}`; the two must agree, so the bounds mean "
+                "the same thing to the compiler and to the warehouse",
+                model=model.name,
+                path=("search", "partition", "type"),
             )
         if not routed.nullable:
             # The group always has a member for null (below), and that member

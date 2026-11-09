@@ -220,6 +220,37 @@ def test_the_partition_field_must_be_filterable_in_every_member() -> None:
         _validate(models)
 
 
+def test_the_partition_type_must_match_the_attribute_it_filters() -> None:
+    """Issue #771 review: ranges that tile strings ("10", "2") overlap as integers.
+    The warehouse evaluates the predicates in the column's type, so a mismatch is
+    refused rather than left to publish a row from two members."""
+
+    def mistyped(models: dict[str, dict[str, Any]]) -> None:
+        for model in models.values():
+            partition = model["search"]["partition"]
+            partition["type"] = "string"
+            for key in ("lower", "upper"):
+                if key in partition:
+                    partition[key] = str(partition[key])
+
+    with pytest.raises(SearchGroupError, match=r"`data_type: integer`"):
+        _validate(_mutate(mistyped))
+
+
+def test_a_range_with_no_bounds_still_excludes_nulls() -> None:
+    """Issue #771 review: an empty predicate reads the whole relation, nulls
+    included, so the fully open range would publish what the null member does."""
+    everything = SearchPartitionConfig(field="filing_year", type="integer")
+    assert partition_predicates(everything) == (
+        ReadPredicate("filing_year", ReadPredicateOperator.IS_NOT_NULL),
+    )
+    models = {
+        "all": _year("all"),
+        "none": _year("none", nulls=True),
+    }
+    _validate(models)
+
+
 def test_the_partition_field_must_admit_the_null_member_rows() -> None:
     """The null member publishes rows whose field is null, which a non-nullable
     attribute refuses mid-publish; the compiler says so before it gets there."""

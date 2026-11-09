@@ -338,13 +338,18 @@ def test_unparseable_file_reports_a_line_and_none_of_its_text(tmp_path: Path) ->
     assert "SECRET-TEXT-IN-FILE" not in str(e.value)
 
 
-def test_missing_rdf_extra_names_the_install_command(
+def test_missing_rdf_extra_is_a_setup_error_naming_the_install_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`stel compile` used to exit 1 with no output: the import error escaped
+    the configuration boundary (PR #773 review)."""
     _project(tmp_path, "ex:a a owl:Class .\n", {"include": [f"{EX}a"]})
     monkeypatch.setitem(sys.modules, "rdflib", None)
-    with pytest.raises(ImportError, match=r"pip install 'stel\[rdf\]'"):
-        load_project(tmp_path)
+
+    result = CliRunner().invoke(cli, ["compile", "--project-dir", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "pip install 'stel[rdf]'" in result.output
 
 
 def test_project_without_ontologies_still_validates_at_construction() -> None:
@@ -380,9 +385,13 @@ def test_ontology_path_stays_inside_the_project_and_off_symlinks(
         load_project(project)
 
 
-def test_rdf_xml_does_not_resolve_external_entities_or_local_paths(tmp_path: Path) -> None:
+@pytest.mark.parametrize("spelling", ["relative", "absolute"])
+def test_rdf_xml_does_not_resolve_external_entities_or_local_paths(
+    tmp_path: Path, spelling: str
+) -> None:
     """A SYSTEM entity must not read a file, and a relative IRI must not take
-    this machine's path as its base (it would reach identities and artifacts)."""
+    this machine's path as its base (it would reach identities and artifacts),
+    even when `path:` is spelled absolute (PR #773 review)."""
     secret = tmp_path / "secret.txt"
     secret.write_text("SECRET-CONTENT", encoding="utf-8")
     (tmp_path / "onto.rdf").write_text(
@@ -401,7 +410,9 @@ def test_rdf_xml_does_not_resolve_external_entities_or_local_paths(tmp_path: Pat
                 "name": "onto",
                 "ontologies": [
                     {
-                        "path": "onto.rdf",
+                        "path": str(tmp_path / "onto.rdf")
+                        if spelling == "absolute"
+                        else "onto.rdf",
                         "vocabulary": "v",
                         "include": ["https://stel.invalid/onto.rdf#a"],
                     }

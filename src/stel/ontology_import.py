@@ -45,7 +45,7 @@ from .config.loader import (
 )
 from .config.ontology import OntologyImport, OntologyInclude
 from .config.vocabulary import RelationTypeDef, Vocabulary, VocabularyTerm
-from .optional_dependencies import import_optional_dependency
+from .optional_dependencies import OptionalDependencyError, import_optional_dependency
 from .paths import resolve_within_project
 
 if TYPE_CHECKING:
@@ -113,17 +113,26 @@ def _parse(ontology: OntologyImport, project_dir: Path, surface: str) -> Graph:
     configured = project_dir / ontology.path
     _reject_symlink_directory_components(configured, project_dir, description=surface)
     _validate_config_file(configured, allowed_root=project_dir, description=surface)
-    rdflib = import_optional_dependency(
-        "rdflib", extra="rdf", feature="Ontology import (`ontologies:`)"
-    )
+    try:
+        rdflib = import_optional_dependency(
+            "rdflib", extra="rdf", feature="Ontology import (`ontologies:`)"
+        )
+    except OptionalDependencyError as exc:
+        # A declared feature whose extra is absent is a setup error, so it
+        # crosses the same boundary as every other load failure: every CLI
+        # command reports the install command and exits 2.
+        raise ConfigError(str(exc)) from exc
     graph = rdflib.Graph()
     data = path.read_bytes()
     # A fixed base, not the file's location: rdflib would otherwise resolve a
     # relative IRI against this machine's absolute path, putting it into
     # identities and artifacts. Hierarchical, because rdflib leaves a relative
     # reference unresolved against a `urn:` base, and under the reserved
-    # `.invalid` domain (RFC 2606), so it can never name a real resource.
-    base = f"{RELATIVE_IRI_BASE}{PurePosixPath(ontology.path).as_posix()}"
+    # `.invalid` domain (RFC 2606), so it can never name a real resource. The
+    # path is the validated project-relative one, so an absolute `path:` inside
+    # the project yields the same base as its relative spelling.
+    relative = path.relative_to(project_dir.resolve())
+    base = f"{RELATIVE_IRI_BASE}{PurePosixPath(relative).as_posix()}"
     try:
         graph.parse(data=data, format=ontology.parser_format(), publicID=base)
     except Exception as exc:  # rdflib raises a different type per parser

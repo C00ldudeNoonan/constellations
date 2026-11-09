@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +17,12 @@ import polars as pl
 from ...backends.llm_backend import extract_fields_with_usage
 from ...budget import BudgetGuard
 from ...config.profile import DEFAULT_LLM_PROVIDER, LLMConfig
+from ...config.relation_characteristics import (
+    RelationOrientation,
+    canonical_orientations,
+    has_characteristics,
+    symmetric_names,
+)
 from ...execution.cost import estimate_cost
 from ...providers import get_inference_provider, resolve_provider_model
 from ...relation_validity import INSTANT_DTYPE, is_temporal, to_utc_instant
@@ -23,6 +30,7 @@ from ...transforms import IncrementalContract, TransformContext
 from ..relations import (
     Mention,
     ModelAssertionExtractorOptions,
+    Relation,
     RelationAssertion,
     RelationExtractor,
     RelationInference,
@@ -89,7 +97,10 @@ def run_relations(
     extractor = get_relation_extractor(options.extractor)
     infer = _build_inference(ctx) if extractor.requires_inference() else None
     frame = _mentions_frame(deps, options)
-    schema = _output_schema(options)
+    characterized = has_characteristics(ctx.relations)
+    orientations = canonical_orientations(ctx.relations)
+    symmetric = symmetric_names(ctx.relations)
+    schema = _output_schema(options, asserted_type=characterized)
     grouped = _grouped_mentions(frame, options, extractor)
     if not grouped:
         return pl.DataFrame(schema=schema)
@@ -102,15 +113,60 @@ def run_relations(
     )
     rows: list[dict[str, Any]] = []
     for document_id in sorted(grouped):
+        # Keyed by relation_id: once an inverse assertion is stored as its
+        # partner, `owns` and `owned_by` for one fact are the same row.
+        document_rows: dict[str, dict[str, Any]] = {}
         for relation in extractor.extract(grouped[document_id], options, infer=infer):
+            asserted_type = relation.relation_type
+            relation = orient_relation(relation, orientations, symmetric)
             row = _relation_row(document_id, relation, options, extractor)
+            if characterized:
+                row["asserted_type"] = asserted_type
             if options.effective_date_field is not None:
                 row["valid_from"] = valid_from.get(document_id)
                 row["valid_to"] = None
             if options.observed_at_field is not None:
                 row["observed_at"] = observed_at.get(document_id)
-            rows.append(row)
+            kept = document_rows.get(row["relation_id"])
+            if kept is None or _confidence(row) > _confidence(kept):
+                document_rows[row["relation_id"]] = row
+        rows.extend(document_rows.values())
     return pl.DataFrame(rows, schema=schema, strict=False)
+
+
+def _confidence(row: Mapping[str, Any]) -> float:
+    confidence = row["confidence"]
+    return -math.inf if confidence is None else float(confidence)
+
+
+def orient_relation(
+    relation: Relation,
+    orientations: Mapping[str, RelationOrientation],
+    symmetric: frozenset[str],
+) -> Relation:
+    """Store a relation in its canonical orientation (issue #775).
+
+    An inverse assertion becomes its declared partner with subject and object
+    swapped. A symmetric relation takes document order, earlier mention first,
+    so `A(x, y)` and `A(y, x)` are one row. Anything else passes through.
+    """
+    orientation = orientations.get(relation.relation_type)
+    if orientation is not None and orientation.swap:
+        return replace(
+            relation,
+            subject=relation.object,
+            object=relation.subject,
+            relation_type=orientation.canonical,
+        )
+    if relation.relation_type in symmetric and _order_key(relation.subject) > _order_key(
+        relation.object
+    ):
+        return replace(
+            relation, subject=relation.object, object=relation.subject, directed=False
+        )
+    if relation.relation_type in symmetric:
+        return replace(relation, directed=False)
+    return relation
 
 
 def _document_instants(
@@ -373,8 +429,14 @@ def _required_columns(options: Any, extractor: RelationExtractor) -> list[str]:
     return list(dict.fromkeys(required))
 
 
-def _output_schema(options: Any) -> dict[str, pl.DataType]:
+def _output_schema(options: Any, *, asserted_type: bool) -> dict[str, pl.DataType]:
     schema = dict(_RELATION_SCHEMA)
+    # The type as the extractor asserted it, beside the canonical `relation_type`
+    # (issue #775). Present only when the project declares an inverse or
+    # symmetric relation: a project that declares none must not grow a column on
+    # upgrade, for the reason the validity columns below are opt-in.
+    if asserted_type:
+        schema["asserted_type"] = pl.String()
     if options.include_mention_text:
         schema["subject_text"] = pl.String()
         schema["object_text"] = pl.String()

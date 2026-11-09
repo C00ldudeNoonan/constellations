@@ -340,6 +340,15 @@ class RelationTypeDef(BaseModel):
     # The owl:ObjectProperty's IRI when the pairing was imported from an
     # ontology (issue #767). Pairings of one name never carry different IRIs.
     iri: str | None = None
+    # Characteristics of the relation type (issue #775), like `functional` a
+    # property of the name that every pairing must agree on; the checks live in
+    # `relation_characteristics`. `inverse_of` names the relation that states the
+    # same fact the other way round, so one fact has one canonical row type.
+    # `symmetric` means the fact reads the same either way. `transitive` is
+    # metadata for a downstream traversal; stel computes no closure.
+    inverse_of: str | None = None
+    symmetric: StrictBool = False
+    transitive: StrictBool = False
 
     @field_validator("name", "subject_class", "object_class")
     @classmethod
@@ -349,14 +358,34 @@ class RelationTypeDef(BaseModel):
             raise ValueError("must not be empty")
         return normalized
 
+    @field_validator("inverse_of")
+    @classmethod
+    def _non_empty_inverse(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        normalized = v.strip()
+        if not normalized:
+            raise ValueError("`inverse_of:` must not be empty")
+        return normalized
+
     @field_validator("iri")
     @classmethod
     def _validate_iri(cls, v: str | None) -> str | None:
         return None if v is None else validate_iri(v, surface="relation `iri:`")
 
     @model_serializer(mode="wrap")
-    def _omit_absent_iri(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    def _omit_absent_optionals(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Absent optionals stay out of the dump so a project that declares none
+        # of them serializes byte-for-byte as it did before they existed.
         data = handler(self)
         if self.iri is None:
             data.pop("iri", None)
+        if self.inverse_of is None:
+            data.pop("inverse_of", None)
+        if not self.symmetric:
+            data.pop("symmetric", None)
+        if not self.transitive:
+            data.pop("transitive", None)
         return data

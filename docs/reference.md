@@ -5289,6 +5289,50 @@ A relation may also declare `functional: true` (one current object per subject),
 which `supersede_relations` acts on; every pairing of one name must agree. See
 [Validity intervals and supersession](#validity-intervals-and-supersession).
 
+##### Relation characteristics
+
+`inverse_of`, `symmetric` and `transitive` say what a relation type means, so
+`owns` and `owned_by` stop being two row types for one fact (issue #775):
+
+```yaml
+relations:
+  - {name: owns, subject_class: company, object_class: asset}
+  - {name: owned_by, subject_class: asset, object_class: company, inverse_of: owns}
+  - {name: partners_with, subject_class: company, object_class: company, symmetric: true}
+```
+
+- `inverse_of: B` on `A` says `A(x, y)` holds exactly when `B(y, x)` does. Either
+  side may declare it; the other is inferred, and a relation has at most one
+  inverse. The first-declared name of the pair is canonical, so reordering the
+  YAML keys never changes it, but reordering the `relations:` list does.
+- Each pairing of `A` needs its mirror (subject and object classes swapped) under
+  `B`. A pair that does not mirror fails compile, as does an inverse that names
+  an undeclared relation, itself, or a second partner.
+- `symmetric: true` says the fact reads the same either way; every pairing needs
+  its mirror under the same name. It cannot be combined with `inverse_of`.
+- `transitive: true` is metadata for a downstream graph or traversal; stel
+  computes no closure. An inverse pair must agree on it.
+- Like `functional`, each is a property of the name, so every pairing of one name
+  must agree. A `functional` relation cannot be an inverse or symmetric, because
+  re-orienting a row would move its subject, which supersession keys on.
+
+`extract_relations` stores an inverse assertion as its canonical partner with
+subject and object swapped, and a symmetric relation with the earlier mention as
+subject and `directed: false`, so graph export treats it as undirected. When a project declares any inverse or symmetric relation, the relation
+table gains an `asserted_type` column holding the type the extractor asserted,
+beside the canonical `relation_type`. If one document asserts both `owns` and
+`owned_by` for the same pair, they become one row (the higher `confidence` wins;
+the first on a tie). A project declaring none gets neither the re-orientation nor
+the column, so an incremental relation table sees no schema change.
+
+The orientation (each inverse's canonical name and the symmetric set) is part of
+an `extract_relations` model's `code_version`, so adding or changing `inverse_of`
+or `symmetric`, or reordering an inverse pair, reprocesses that model's rows.
+`transitive` changes no row and does not.
+
+Orientation is per document, by mention position. Merging a symmetric fact
+across documents by entity is a downstream step over the linked entities.
+
 A project that declares neither `classes:` nor `relations:` is unaffected:
 this adds a constraint only where one exists, never a new requirement, and
 the `co_occurrence` extractor (whose `relation_type` is a single operator

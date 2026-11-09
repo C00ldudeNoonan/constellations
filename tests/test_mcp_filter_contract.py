@@ -12,7 +12,15 @@ from pydantic import ValidationError
 from stel.mcp_server.catalog import _filter_capability
 from stel.mcp_server.contracts import BusinessFilter, FilterOperator
 from stel.mcp_server.service import ContextService
-from stel.search import SearchFilterOperator
+from stel.retrieval.base import RetrievalCapabilities, RetrievalFeature
+from stel.search import (
+    SearchError,
+    SearchFilter,
+    SearchFilterOperator,
+    SearchMode,
+    SearchRequest,
+    _validate_capabilities,
+)
 
 
 @pytest.mark.parametrize(
@@ -102,6 +110,43 @@ def test_unknown_operator_spellings_are_refused(spelling: str) -> None:
     with pytest.raises(ValidationError):
         BusinessFilter.model_validate(
             {"field": "filing_date_dt", "operator": spelling, "value": "2025-01-01"}
+        )
+
+
+def test_a_store_that_cannot_filter_refuses_a_range_filter_rather_than_ignoring_it() -> None:
+    """ALE-571: an unsupported filter may stop pruning but is never dropped.
+
+    A store without `METADATA_FILTERING` fails the request closed. Ignoring the
+    window would return filings outside the dates the caller asked for.
+    """
+    capabilities = RetrievalCapabilities(
+        features=frozenset({RetrievalFeature.FULL_TEXT_SEARCH}),
+        distance_metrics=frozenset(),
+        consistency_modes=frozenset({"strong"}),
+        max_batch_size=1,
+        max_id_bytes=None,
+        max_dimensions=None,
+    )
+    request = SearchRequest(
+        model="filings",
+        query="guidance",
+        mode=SearchMode.TEXT,
+        filters=(
+            SearchFilter(
+                "filing_date_dt", SearchFilterOperator.GREATER_THAN_OR_EQUAL, "2025-01-01"
+            ),
+        ),
+    )
+    model = SimpleNamespace(
+        search=SimpleNamespace(full_text=object(), access="open", vector=None)
+    )
+    with pytest.raises(SearchError, match="metadata_filtering"):
+        _validate_capabilities(
+            cast("Any", model),
+            request,
+            capabilities,
+            store_type="nopushdown",
+            policy_filters=(),
         )
 
 

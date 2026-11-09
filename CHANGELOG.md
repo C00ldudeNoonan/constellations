@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.26.0 - 2026-11-09
 
 - A project can declare a segmented search group (ADR-0037, issue #771). `search_groups:`
   in `stel_project.yml` names `search:` models that each publish one partition of a shared
@@ -19,6 +19,17 @@
   ordinary index.
   Upgrading: the MCP server refuses a v5 (or older) manifest, so run `stel compile` (or
   `stel run`) once before starting it. Nothing re-keys.
+
+- A declared relation can say what it means: `inverse_of`, `symmetric` and `transitive`
+  are properties of the relation name, checked at compile time (each pairing needs its
+  mirror, one inverse per relation, no functional inverse). `extract_relations` stores
+  an inverse assertion as its first-declared partner with subject and object swapped,
+  and a symmetric one with the earlier mention as subject and `directed: false`, so
+  `owns` and `owned_by` for one fact are one row. A project that declares an inverse or
+  symmetric relation gets an `asserted_type` column and has the orientation folded into
+  its `extract_relations` models' `code_version`, so adding or changing one reprocesses
+  them; `transitive` is metadata only. A project that declares none is unchanged: no
+  new column and no identity move (issue #775).
 
 - `stel init` no longer copies Python bytecode (`__pycache__/`, `*.pyc`, `*.pyo`) from
   a template into the new project. Importing a template's transform module, as a test
@@ -51,9 +62,10 @@
   the file changes no identity; a label change re-keys models whose enum fields use the
   vocabulary and shows in `stel plan`. Parsing needs the new `rdf` extra
   (`pip install 'stel[rdf]'`, rdflib) (issue #767, ADR-0057).
-  Upgrading: the serving manifest is now v5 (an optional `iri` on declared terms and
-  classes). The MCP server refuses a v4 manifest; recompile serving manifests on upgrade.
-  A declaration with no IRIs dumps exactly as before.
+  Upgrading: declared terms and classes may carry an optional `iri`, which took the
+  serving manifest to v5; the segmented-search-group entry above takes it to v6 in the
+  same release, so recompile serving manifests on upgrade. A declaration with no IRIs
+  dumps exactly as before.
 - MCP `BusinessFilter` accepts `gte` and `lte` as spellings of the range operators `ge`
   and `le`. They are normalized on input, so `list_context_models`, the query log and
   every store still see only `ge` and `le`. The range operators themselves (`lt`, `le`,
@@ -94,6 +106,16 @@
   edges carry the four fields and the manifest is now `stel.graph_export/v2`. Existing
   models are unaffected: no `code_version` moves and no column appears until a model
   opts in (issue #766, ADR-0056).
+
+- `stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR]`
+  writes a project's linked entities and relations as a graph a downstream store can
+  load: `nodes.jsonl` (one row per resolved entity, keyed by the agent-context
+  `entity_id` so it joins to governed metrics, with its class and ancestors),
+  `edges.jsonl` (one row per asserted fact whose two mentions resolve to two matched
+  entities, naming its document, extractor version and the resolvers of each end) and
+  `graph_manifest.json` (written last, with per-file SHA-256 and counts of what was left
+  out and why). `--entity-name` is required because the links table does not record
+  it. Output is deterministic and carries no timestamp (issue #762, ADR-0055).
 
 ## v0.25.0 - 2026-11-07
 

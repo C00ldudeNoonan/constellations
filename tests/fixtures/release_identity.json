@@ -22,7 +22,7 @@
     },
     "backend:llm": {
       "extraction.backend": "8ab5e0ec8db1481b",
-      "extraction.backend_implementation": "fca791b0b0771872",
+      "extraction.backend_implementation": "52a86326478dd12a",
       "extraction.inference": "4a404b088580f445",
       "extraction.options": "01322121aebb532a"
     },
@@ -162,11 +162,5 @@
       "transform_code_hash": "5cf5f1773b155e4e"
     }
   },
-  "intended_changes": [
-    {
-      "case": "backend:llm",
-      "field": "extraction.backend_implementation",
-      "reason": "A partitioned search publish reconciles stale keys against its own partition (issue #764): the state absence probe gained predicates in adapters/base.py, duckdb.py and bigquery.py. The llm backend's identity hashes those modules through its import closure but never reads an absence probe, and `DuckDBAdapter.replace_children` now reconciles the schema before deleting reprocessed parents (`append_new_columns` fix). The llm backend never reads either, so its output is unchanged; run `stel plan`, then `stel adopt` for llm-extraction models."
-    }
-  ]
+  "intended_changes": []
 }

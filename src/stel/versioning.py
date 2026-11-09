@@ -25,6 +25,7 @@ from .config.model import (
 )
 from .config.profile import DEFAULT_LLM_PROVIDER
 from .config.project import ProjectConfig
+from .config.relation_characteristics import orientation_identity
 from .dag import parse_ref
 from .embedding import EmbeddingIdentity
 from .hashing import HASH_DIGEST_SIZE, canonical_json
@@ -40,6 +41,7 @@ from .providers import (
     profile_options_fingerprint,
     resolve_provider_model,
 )
+from .relation_contracts import RELATION_TRANSFORM_MODULE
 from .retrieval.evolution import search_code_identity
 from .sql_models import SQL_COMPILER_CONTRACT_VERSION
 from .transforms import transform_code_version_identity
@@ -404,7 +406,7 @@ def _model_code_version_payload(
             ).to_dict(),
         }
 
-    return code_version_payload(
+    payload = code_version_payload(
         extraction=model.extraction,
         transform=model.transform,
         ml=model.ml,
@@ -434,6 +436,16 @@ def _model_code_version_payload(
         unique_key=model.unique_key,
         on_schema_change=model.on_schema_change,
     )
+    # How `extract_relations` orients its rows comes from the project's
+    # `relations:`, which no model option carries (issue #775). Without it, a
+    # changed `inverse_of` would leave an incremental table's unchanged
+    # documents on the old orientation. Absent when the project declares no
+    # inverse or symmetric relation, so existing identities do not move.
+    if model.transform is not None and model.transform.module == RELATION_TRANSFORM_MODULE:
+        orientation = orientation_identity(project.relations)
+        if orientation is not None:
+            payload["relation_orientation"] = orientation
+    return payload
 
 
 def describe_model_inference(

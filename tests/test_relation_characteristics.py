@@ -15,6 +15,7 @@ import polars as pl
 import pytest
 
 from stel.adapters import parse_warehouse_config
+from stel.config.model import ModelConfig, TransformConfig
 from stel.config.project import ProjectConfig
 from stel.config.relation_characteristics import (
     canonical_orientations,
@@ -23,6 +24,7 @@ from stel.config.relation_characteristics import (
 from stel.config.vocabulary import RelationTypeDef
 from stel.text.transforms import extract_relations
 from stel.transforms import TransformContext
+from stel.versioning import _model_code_version_payload, compute_model_code_version
 
 
 def _rel(name: str, subject: str, obj: str, **extra: Any) -> RelationTypeDef:
@@ -261,3 +263,82 @@ def test_a_project_without_characteristics_gains_no_column() -> None:
     assert "asserted_type" not in out.columns
     d1 = out.filter(pl.col("document_id") == "d1")
     assert sorted(d1["relation_type"].to_list()) == ["owned_by", "owns"]
+
+
+def test_a_symmetric_relation_is_published_undirected() -> None:
+    """A symmetric fact has no direction; `directed=True` would let a consumer
+    read mention order as an assertion, and graph export only normalizes
+    endpoints for undirected rows (review of #777)."""
+    relations = (_rel("partners_with", "org", "org", symmetric=True),)
+    rules = [{"subject_label": "ORG", "object_label": "ORG", "relation_type": "partners_with"}]
+    d2 = _MENTIONS.filter(pl.col("document_id") == "d2")
+    out = extract_relations.run({"mentions": d2}, _ctx(rules, relations))
+
+    assert out["directed"].to_list() == [False]
+
+
+# --- incremental identity (review of #777) -----------------------------------
+
+
+def _relation_model() -> ModelConfig:
+    return ModelConfig(
+        name="relations",
+        materialization="incremental",
+        depends_on=["mentions"],
+        transform=TransformConfig(
+            type="python",
+            module="stel.text.transforms.extract_relations",
+            options={"mentions": "mentions"},
+        ),
+    )
+
+
+def _version(tmp_path: Path, *relations: RelationTypeDef) -> str:
+    return compute_model_code_version(_relation_model(), _project(*relations), tmp_path)
+
+
+def test_changing_how_rows_are_oriented_changes_the_model_identity(tmp_path: Path) -> None:
+    """An unchanged document is skipped by an incremental run, so rows written
+    under the old orientation would stay unless the identity moves."""
+    plain = (_rel("owns", "org", "asset"), _rel("owned_by", "asset", "org"))
+    inverse = (
+        _rel("owns", "org", "asset"),
+        _rel("owned_by", "asset", "org", inverse_of="owns"),
+    )
+    reordered = (
+        _rel("owned_by", "asset", "org"),
+        _rel("owns", "org", "asset", inverse_of="owned_by"),
+    )
+    versions = {
+        _version(tmp_path, *declared) for declared in (plain, inverse, reordered)
+    }
+
+    assert len(versions) == 3
+
+
+def test_a_project_without_orientation_keeps_its_model_identity(tmp_path: Path) -> None:
+    """Existing projects must not be reprocessed, and `transitive` (metadata
+    that changes no row) must not reprocess either."""
+    plain = (_rel("owns", "org", "asset"),)
+    transitive = (_rel("owns", "org", "asset", transitive=True),)
+
+    assert _version(tmp_path, *plain) == _version(tmp_path, *transitive)
+    payload = _model_code_version_payload(_relation_model(), _project(*plain), tmp_path)
+    assert "relation_orientation" not in payload
+
+
+def test_orientation_does_not_enter_other_models_identity(tmp_path: Path) -> None:
+    other = ModelConfig(
+        name="other",
+        materialization="incremental",
+        transform=TransformConfig(type="python", module="transforms.other"),
+    )
+    inverse = (
+        _rel("owns", "org", "asset"),
+        _rel("owned_by", "asset", "org", inverse_of="owns"),
+    )
+    plain = (_rel("owns", "org", "asset"), _rel("owned_by", "asset", "org"))
+
+    assert compute_model_code_version(
+        other, _project(*inverse), tmp_path
+    ) == compute_model_code_version(other, _project(*plain), tmp_path)

@@ -28,6 +28,7 @@ __all__ = [
     "canonical_orientations",
     "check_relation_characteristics",
     "has_characteristics",
+    "orientation_identity",
     "symmetric_names",
 ]
 
@@ -67,6 +68,26 @@ def canonical_orientations(
         canonical = min(name, other, key=first_seen.__getitem__)
         orientations[name] = RelationOrientation(canonical=canonical, swap=name != canonical)
     return orientations
+
+
+def orientation_identity(
+    relations: Sequence[RelationTypeDef],
+) -> dict[str, object] | None:
+    """What decides how rows are oriented, for a model's code identity.
+
+    `None` when nothing is re-oriented, so a project that declares no inverse or
+    symmetric relation keeps the identity it had. `transitive` is metadata that
+    changes no row, so it is not part of it.
+    """
+    if not has_characteristics(relations):
+        return None
+    return {
+        "inverse": {
+            name: [orientation.canonical, orientation.swap]
+            for name, orientation in sorted(canonical_orientations(relations).items())
+        },
+        "symmetric": sorted(symmetric_names(relations)),
+    }
 
 
 def check_relation_characteristics(relations: Sequence[RelationTypeDef]) -> None:

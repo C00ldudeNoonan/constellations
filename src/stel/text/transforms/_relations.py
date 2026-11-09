@@ -161,7 +161,11 @@ def orient_relation(
     if relation.relation_type in symmetric and _order_key(relation.subject) > _order_key(
         relation.object
     ):
-        return replace(relation, subject=relation.object, object=relation.subject)
+        return replace(
+            relation, subject=relation.object, object=relation.subject, directed=False
+        )
+    if relation.relation_type in symmetric:
+        return replace(relation, directed=False)
     return relation
 
 

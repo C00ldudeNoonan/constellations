@@ -5318,12 +5318,17 @@ relations:
 
 `extract_relations` stores an inverse assertion as its canonical partner with
 subject and object swapped, and a symmetric relation with the earlier mention as
-subject. When a project declares any inverse or symmetric relation, the relation
+subject and `directed: false`, so graph export treats it as undirected. When a project declares any inverse or symmetric relation, the relation
 table gains an `asserted_type` column holding the type the extractor asserted,
 beside the canonical `relation_type`. If one document asserts both `owns` and
 `owned_by` for the same pair, they become one row (the higher `confidence` wins;
 the first on a tie). A project declaring none gets neither the re-orientation nor
 the column, so an incremental relation table sees no schema change.
+
+The orientation (each inverse's canonical name and the symmetric set) is part of
+an `extract_relations` model's `code_version`, so adding or changing `inverse_of`
+or `symmetric`, or reordering an inverse pair, reprocesses that model's rows.
+`transitive` changes no row and does not.
 
 Orientation is per document, by mention position. Merging a symmetric fact
 across documents by entity is a downstream step over the linked entities.

@@ -12,14 +12,13 @@
   to identify affected models. After verifying their output would be unchanged,
   `stel adopt --select MODEL` can restamp their published state.
 
-- A compile or run for one target no longer takes another target's MCP server down (issue
-  #760). `target/manifest.json` is still written for whichever target ran last, but each
-  target now also has its own manifest under `target/manifests/`, replaced only by that
-  target's compile or run. `stel mcp serve --target X` and the concept-cloud server read the
-  manifest for `X`, so a `stel run --target dev` leaves prod serving. A target that never
-  compiled is refused with `stel compile --target X`. Upgrading: run `stel compile --target
-  <target>` once per served target, since a manifest written before this release has no
-  per-target copy.
+- Each target has its own serving manifest under `target/manifests/` (issue #760,
+  ALE-621). MCP and concept-cloud serving use the manifest for their resolved
+  warehouse target, including the profile default. A dev run leaves prod's
+  manifest available to the server and its healthcheck. The shared
+  `target/manifest.json` reflects the latest compile, run, or build across all
+  targets. When upgrading, run `stel compile --target <target>` once for each
+  served target to create its copy.
 
 - Scoped embedding runs limit warehouse vector reuse to the filtered slice
   and the window's layout bounds (issue #761). Use `stel run --new-only`

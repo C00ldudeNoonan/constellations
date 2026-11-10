@@ -124,7 +124,7 @@ installation command.
 | **Materialization**  | `full` (always replace) or `incremental` (skip unchanged input on re-runs).      |
 | **Tests**          | `not_null`, `unique`, `min_rows`, custom Python — with `severity: warn` if you want.|
 | **Profile**        | Warehouse + LLM + embedding-provider config, swappable per `--target dev|prod`. No credentials in models. |
-| **Artifacts**      | `target/manifest.json` (last target to run) and `target/manifests/` (one per target, what MCP serves), `target/run_results.json`, `target/sources.yml` (for dbt). |
+| **Artifacts**      | `target/manifest.json` (latest compile, run, or build) and `target/manifests/` (one per target, used by MCP), `target/run_results.json`, `target/sources.yml` (for dbt). |
 
 ## Backends
 
@@ -7020,7 +7020,8 @@ What it does and does not do:
 run results under `target-path`:
 
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
-  model, DAG nodes+edges+execution order. Re-generated each run. A project
+  model, DAG nodes+edges+execution order. The shared copy reflects the most
+  recent compile, run, or build across all targets. A project
   with a search or agent-context model writes the serving manifest
   (`manifest_version: 6`), which also carries `declarations`: the project's
   `classes:` and `vocabularies:` as compiled, because the MCP server reads the
@@ -7029,6 +7030,11 @@ run results under `target-path`:
   declaration with no IRIs is otherwise the same as v4's. v6 adds
   `search_groups`: each segmented search group's members and partition bounds
   as compiled (issue #771).
+- **`manifests/<slug>-<digest>.json`** — a copy of the manifest for each
+  compiled target. MCP and concept-cloud serving select the copy for their
+  resolved warehouse target, including the profile default when `--target`
+  is omitted. Manifest healthchecks can make the same selection with
+  `ArtifactCatalog.load(project_dir, expected_target=target_name)`.
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed, and `sources_considered`) plus per-model documents
   processed/skipped, rows written, duration, the model's own `started_at` and

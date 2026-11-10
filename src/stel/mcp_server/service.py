@@ -592,7 +592,9 @@ class ContextService:
                 _refuse_unenforceable_identity(session)
                 warehouse_identity = GrantWarehouseIdentityResolver(store)
         return cls(
-            catalog=ArtifactCatalog.load(project_dir, expected_target=target),
+            catalog=ArtifactCatalog.load(
+                project_dir, expected_target=session.resolve(None).profile.target_name
+            ),
             repository=repository,
             context_search=PortableContextSearch(session),
             principal_resolver=principal_resolver or EnvironmentPrincipalResolver(),
@@ -600,6 +602,11 @@ class ContextService:
             warehouse_identity=warehouse_identity,
             settings=settings,
         )
+
+    @property
+    def catalog(self) -> ArtifactCatalog:
+        """The compiled catalog for the same target as the serving warehouse."""
+        return self._catalog
 
     def close(self) -> None:
         self._limiter.close()

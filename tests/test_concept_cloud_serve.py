@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPResponse
 from http.server import ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -284,8 +285,8 @@ def test_a_model_the_project_does_not_serve_is_refused_at_startup(
         }
     )
     monkeypatch.setattr(
-        "stel.concept_cloud.serve.ArtifactCatalog.load",
-        classmethod(lambda cls, project_dir, *, expected_target=None: catalog),
+        "stel.concept_cloud.serve.ContextService.from_project",
+        lambda *args, **kwargs: SimpleNamespace(catalog=catalog, close=lambda: None),
     )
     export = placeholder_export().model_copy(
         update={"source_access": SourceAccess(model="missing_model")}

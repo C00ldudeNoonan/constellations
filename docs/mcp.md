@@ -27,14 +27,22 @@ project:
 uv add 'stel[mcp,lancedb]'
 ```
 
-The server reads the manifest compiled for its `--target` (under
-`target/manifests/`), then reads authorized rows through the configured
-warehouse adapter. Each target has its own file, so a `stel run --target dev`
-does not replace what prod serves; a target that has not been compiled is
-refused with `stel compile --target <target>`. It does not read `run_results.json`: how
-current an index is comes from the serving ledger instead, for the reasons
-under [How current an index is](#how-current-an-index-is). Run the project
-before starting the server so the manifest and the relations agree:
+The server loads the manifest under `target/manifests/` for the same target it
+uses for warehouse reads. Set `--target` to choose a profile output or omit it
+to use the profile default. Each target has its own manifest, so a
+`stel run --target dev` leaves prod's serving manifest in place. After upgrading
+from a release that only wrote the shared manifest, run
+`stel compile --target <target>` once for each served target. For a project
+with inline DuckDB configuration, run `stel compile`.
+
+Manifest healthchecks should call
+`ArtifactCatalog.load(project_dir, expected_target="prod")` with the target
+the server uses. The shared `target/manifest.json` reflects the most recent
+compile, run, or build across all targets. The serving ledger tracks
+[how current an index is](#how-current-an-index-is).
+
+Run the project before starting the server so the manifest and the relations
+agree:
 
 ```bash
 uv run stel run

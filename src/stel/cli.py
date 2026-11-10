@@ -2955,6 +2955,7 @@ def _serve_concept_cloud(
     service and the catalog, which no other `stel` invocation needs.
     """
     from .concept_cloud.serve import ConceptCloudServeError, serve_concept_cloud
+    from .mcp_server.catalog import ArtifactCatalogError
 
     try:
         serve_concept_cloud(
@@ -2967,7 +2968,7 @@ def _serve_concept_cloud(
         )
     except ConceptCloudServeError as e:
         raise click.ClickException(str(e)) from e
-    except (AdapterError, *_CONFIG_ERRORS) as e:
+    except (AdapterError, ArtifactCatalogError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e
 
 

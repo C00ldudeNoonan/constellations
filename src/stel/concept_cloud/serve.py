@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -28,7 +29,6 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import parse_qs, urlparse
 
-from ..mcp_server.catalog import ArtifactCatalog
 from ..mcp_server.service import ContextService
 from .schema import ConceptCloudExport
 from .sentences import (
@@ -129,27 +129,29 @@ def _prepare(
             "reach. Re-export with `--context-model <model>`."
         )
     model = export.source_access.model
-    catalog = ArtifactCatalog.load(project_dir, expected_target=target)
-    resource = catalog.get(model)
-    if resource is None:
-        available = ", ".join(sorted(item.name for item in catalog.all())) or "(none)"
-        raise ConceptCloudServeError(
-            f"The bundle names context model '{model}', which this project "
-            f"does not serve. Available context models: {available}"
+    with ExitStack() as startup:
+        service = ContextService.from_project(
+            project_dir, target=target, profiles_dir=profiles_dir
         )
-    service = ContextService.from_project(
-        project_dir, target=target, profiles_dir=profiles_dir
-    )
-    # Fails loudly at boot on broken credentials rather than as a per-click
-    # error, for the reason `serve_stdio` does it (issue #365).
-    service.warm_up()
-    endpoint = _Endpoint(
-        service=service,
-        model=model,
-        mode=_resolve_mode(resource.modes, model=model),
-        declared=declared_labels(catalog.vocabularies),
-        displays={c.canonical_id: c.display for c in export.concepts},
-    )
+        startup.callback(service.close)
+        catalog = service.catalog
+        resource = catalog.get(model)
+        if resource is None:
+            available = ", ".join(sorted(item.name for item in catalog.all())) or "(none)"
+            raise ConceptCloudServeError(
+                f"The bundle names context model '{model}', which this project "
+                f"does not serve. Available context models: {available}"
+            )
+        endpoint = _Endpoint(
+            service=service,
+            model=model,
+            mode=_resolve_mode(resource.modes, model=model),
+            declared=declared_labels(catalog.vocabularies),
+            displays={c.canonical_id: c.display for c in export.concepts},
+        )
+        # Surface credential errors at startup, before the first click (#365).
+        service.warm_up()
+        startup.pop_all()
     return endpoint, service
 
 

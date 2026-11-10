@@ -1179,7 +1179,9 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
 
 
 @contextmanager
-def _layout_target(tmp_path: Path) -> Iterator[Any]:
+def _layout_target(
+    tmp_path: Path, *, hashes: tuple[str, str, str] = ("ha", "hb", "hc")
+) -> Iterator[Any]:
     """A DuckDB embed target with two layout columns beside the reuse columns:
     DuckDB has no layout of its own, so the pruning is handed to the reader
     directly, and DuckDB executes the predicates for real."""
@@ -1196,7 +1198,7 @@ def _layout_target(tmp_path: Path) -> Iterator[Any]:
                     "chunk_id": ["a", "b", "c"],
                     "filing_date": [date(2026, 1, 5), date(2026, 2, 9), date(2026, 3, 1)],
                     "symbol": ["AAPL", "MSFT", "AAPL"],
-                    "embedding_input_hash": ["ha", "hb", "hc"],
+                    "embedding_input_hash": list(hashes),
                     "embedding_config_hash": ["g", "g", "g"],
                     "embedding": [[0.1], [0.2], [0.3]],
                     "embedded_at": ["t", "t", "t"],
@@ -1305,11 +1307,35 @@ def test_scoped_reuse_reads_only_the_windows_layout(
     assert set(found) == {"hc"}
     key_scan, lookup = captured
     assert key_scan == (cutoff,)
-    assert ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("b", "c")) in lookup
+    assert ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("c",)) in lookup
     assert ReadPredicate(
         "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 3, 1)
     ) in lookup
     assert ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)) in lookup
+
+
+def test_scoped_reuse_selects_a_duplicate_inside_each_window(tmp_path: Path) -> None:
+    """Issue #761: a copy in another layout must not shadow an in-window copy."""
+    from stel.adapters import ReadPredicate, ReadPredicateOperator
+
+    cutoff = ReadPredicate(
+        "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 2, 1)
+    )
+    with _layout_target(tmp_path, hashes=("ha", "shared", "shared")) as adapter:
+        reader = _layout_reader(
+            adapter,
+            LayoutPruningColumns("filing_date", ("symbol",)),
+            read_predicates=(cutoff,),
+        )
+        for expected, symbol, bounds in (
+            ("b", "MSFT", (date(2026, 2, 8), date(2026, 2, 10))),
+            ("c", "AAPL", (date(2026, 3, 1),)),
+        ):
+            found = reader.rows_for(
+                ["shared"],
+                upstream_rows=[{"filing_date": day, "symbol": symbol} for day in bounds],
+            )
+            assert found["shared"]["chunk_id"] == expected
 
 
 def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(

@@ -1098,6 +1098,34 @@ def _iter_removed_state_keys(
         yield missing[offset : offset + _REMOVAL_PAGE_ROWS]
 
 
+def _matches_window_layout(
+    layout: tuple[Any, ...], checks: Sequence[tuple[int, ReadPredicate]]
+) -> bool:
+    for index, predicate in checks:
+        value = layout[index]
+        bound = predicate.value
+        if predicate.operator is ReadPredicateOperator.IN:
+            assert isinstance(bound, tuple)
+            if value not in bound:
+                return False
+            continue
+        # A target can still carry an older layout type. Comparing unlike
+        # bounds or mixing naive and aware datetimes cannot prove a match.
+        if bound is None or type(value) is not type(bound):
+            return False
+        if isinstance(value, datetime) and isinstance(bound, datetime):
+            if (value.utcoffset() is None) != (bound.utcoffset() is None):
+                return False
+        if predicate.operator is ReadPredicateOperator.GREATER_THAN_OR_EQUAL:
+            if not value >= bound:
+                return False
+        else:
+            assert predicate.operator is ReadPredicateOperator.LESS_THAN_OR_EQUAL
+            if not value <= bound:
+                return False
+    return True
+
+
 class _EmbeddingReuseReader:
     """Bounded, content-addressed reads of the existing embed target.
 
@@ -1183,12 +1211,11 @@ class _EmbeddingReuseReader:
         self._read_predicates = tuple(read_predicates)
         self._usable = False
         self._target_keys: dict[str, Any] = {}
-        # One representative typed id per distinct text hash, indexed only
-        # for rows recorded under *this* run's embedding configuration.
+        # One primary representative per distinct text hash, indexed only
+        # for rows recorded under this run's embedding configuration.
         #
-        # Both halves matter. One representative is enough because every row
-        # carrying that hash under that config holds a vector for the same
-        # text, so any of them answers. Filtering by config at index time is
+        # An unfiltered run can use any row carrying the hash under that
+        # config, since each holds a vector for the same text. Filtering by config is
         # what stops a stale row shadowing a usable one: a target can hold
         # the same text twice under two configs (duplicate text plus a config
         # change plus a partial publish), and indexing without the filter
@@ -1205,6 +1232,9 @@ class _EmbeddingReuseReader:
         # (a month, a symbol), so 3.67M rows share a few thousand tuples and
         # the cost per hash is one dict slot.
         self._layout_by_text_hash: dict[str, tuple[Any, ...]] = {}
+        # Scoped runs also retain one key per other layout for duplicate
+        # hashes. A unique hash or duplicates at one layout need no entry.
+        self._scoped_alternatives: dict[str, dict[tuple[Any, ...], Any]] = {}
         self._load_keys()
 
     def _load_keys(self) -> None:
@@ -1250,6 +1280,7 @@ class _EmbeddingReuseReader:
         target_keys: dict[str, Any] = {}
         keys_by_text_hash: dict[str, Any] = {}
         layout_by_text_hash: dict[str, tuple[Any, ...]] = {}
+        scoped_alternatives: dict[str, dict[tuple[Any, ...], Any]] = {}
         interned: dict[tuple[Any, ...], tuple[Any, ...]] = {}
         with self._timings.phase("reuse"):
             with self._adapter.table_snapshot(
@@ -1269,11 +1300,13 @@ class _EmbeddingReuseReader:
                         target_keys,
                         keys_by_text_hash,
                         layout_by_text_hash,
+                        scoped_alternatives,
                         interned,
                     )
         self._target_keys = target_keys
         self._keys_by_text_hash = keys_by_text_hash
         self._layout_by_text_hash = layout_by_text_hash
+        self._scoped_alternatives = scoped_alternatives
 
     def _index_batch(
         self,
@@ -1281,6 +1314,7 @@ class _EmbeddingReuseReader:
         target_keys: dict[str, Any],
         keys_by_text_hash: dict[str, Any],
         layout_by_text_hash: dict[str, tuple[Any, ...]],
+        scoped_alternatives: dict[str, dict[tuple[Any, ...], Any]],
         interned: dict[tuple[Any, ...], tuple[Any, ...]],
     ) -> None:
         frame = pl.from_arrow(batch)
@@ -1305,14 +1339,16 @@ class _EmbeddingReuseReader:
             # another embedding configuration holds a vector this run cannot
             # use. Both still answer `target_key` for removals, which is why
             # these skip the index rather than the row.
-            if (
-                isinstance(text_hash, str)
-                and text_hash
-                and config_hash == self._config_hash
-            ):
-                keys_by_text_hash[text_hash] = value
-                if layouts is not None:
-                    layout_by_text_hash[text_hash] = interned.setdefault(layout, layout)
+            if not isinstance(text_hash, str) or not text_hash or config_hash != self._config_hash:
+                continue
+            if layouts is not None:
+                layout = interned.setdefault(layout, layout)
+                if self._read_predicates and text_hash in layout_by_text_hash:
+                    if layout != layout_by_text_hash[text_hash]:
+                        scoped_alternatives.setdefault(text_hash, {})[layout] = value
+                    continue
+                layout_by_text_hash[text_hash] = layout
+            keys_by_text_hash[text_hash] = value
 
     def _retry_snapshot_read[T](self, operation: Callable[[], T]) -> T:
         for attempt in range(1, self._SNAPSHOT_ATTEMPTS + 1):
@@ -1357,6 +1393,15 @@ class _EmbeddingReuseReader:
         """
         if not self._usable:
             return {}
+        window_predicates = (
+            layout_pruning_predicates(self._pruning, upstream_rows, exclude=self._id_field)
+            if upstream_rows
+            else ()
+        )
+        layout_columns = self._pruning.columns
+        window_checks = [
+            (layout_columns.index(predicate.column), predicate) for predicate in window_predicates
+        ]
         typed: list[tuple[Any, tuple[Any, ...]]] = []
         unknown = 0
         untyped = 0
@@ -1365,6 +1410,20 @@ class _EmbeddingReuseReader:
             if key is None:
                 unknown += 1
                 continue
+            layout = self._layout_by_text_hash.get(text_hash, ())
+            if window_checks and not _matches_window_layout(layout, window_checks):
+                alternate = next(
+                    (
+                        (candidate_key, candidate_layout)
+                        for candidate_layout, candidate_key
+                        in self._scoped_alternatives.get(text_hash, {}).items()
+                        if _matches_window_layout(candidate_layout, window_checks)
+                    ),
+                    None,
+                )
+                if alternate is None:
+                    continue
+                key, layout = alternate
             # A key the predicate contract cannot carry (DuckDB DECIMAL,
             # BigQuery NUMERIC) skips reuse rather than failing the resume:
             # the row re-embeds -- correct output, paid call -- which is the
@@ -1372,7 +1431,7 @@ class _EmbeddingReuseReader:
             if not isinstance(key, str | int | float | bool | date | datetime):
                 untyped += 1
                 continue
-            typed.append((key, self._layout_by_text_hash.get(text_hash, ())))
+            typed.append((key, layout))
         if untyped:
             log.debug(
                 "embed reuse lookup skipped %d text hash(es) whose target row "
@@ -1385,14 +1444,6 @@ class _EmbeddingReuseReader:
                 "not hold, without reading the vector column",
                 unknown,
             )
-        # A scoped run trades reuse outside the current window for bounded
-        # vector reads. The key scan is scoped too, so an out-of-scope duplicate
-        # cannot shadow a representative inside the run's filter.
-        window_predicates = (
-            layout_pruning_predicates(self._pruning, upstream_rows, exclude=self._id_field)
-            if upstream_rows
-            else ()
-        )
         found: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(typed), self._LOOKUP_KEYS_PER_READ):
             chunk = typed[offset : offset + self._LOOKUP_KEYS_PER_READ]

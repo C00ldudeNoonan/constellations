@@ -1009,8 +1009,9 @@ Proceed? [y/N]:
 What it projects is what a plan can see without reading a source: published
 rows that would reprocess. New input, a first build and a `full` model's
 per-run rebuild are not in it, so a large new ingest passes under the
-threshold. The run budget's `max_cost_usd` is the cap that sees everything;
-this is a question asked before starting. A paid model with no priced history
+threshold. `stel run --new-only` skips published keys, so it has no
+reprocessing cost to project. The run budget's `max_cost_usd` also covers new
+input. A paid model with no priced history
 is named in a warning and left out of the total rather than blocking every
 run. A run log that cannot be read is different: it refuses the run, because
 pricing nothing would project $0, and `--accept-cost` runs without the check. The threshold needs `run_log` enabled on the target and is rejected at

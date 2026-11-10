@@ -13,7 +13,9 @@ years when its text matches an older filing.
 For a run with `--read-filter`, apply the filters to the target key scan
 and vector reads. Use the current input window's partition range and
 distinct clustering values where those values can be expressed as
-predicates. The local response cache still looks up vectors by content.
+predicates. Keep one candidate per text hash and distinct layout so a
+duplicate in another layout cannot hide a match inside the window.
+The local response cache still looks up vectors by content.
 Unfiltered runs retain corpus-wide warehouse reuse for re-keying.
 
 Keeping corpus-wide reuse for scoped runs would avoid some provider

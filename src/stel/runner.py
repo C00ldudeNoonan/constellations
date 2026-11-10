@@ -403,20 +403,23 @@ def run_project(
             warehouse=resolved.warehouse,
         )
         log.info("connected to %s warehouse", resolved.warehouse.type)
-        _enforce_spend_guards(
-            selected,
-            models_by_name=models_by_name,
-            dag=dag,
-            project=project,
-            project_dir=project_dir,
-            adapter=adapter,
-            resolved=resolved,
-            full_refresh=full_refresh,
-            reprocess_all=reprocess_all,
-            accept_reprocess=accept_reprocess or new_only,
-            accept_cost=accept_cost,
-            confirm_cost=confirm_cost,
-        )
+        # Both pre-run guards count reprocessing of published rows. New-only
+        # skips those keys, and the run budget still governs provider calls.
+        if not new_only:
+            _enforce_spend_guards(
+                selected,
+                models_by_name=models_by_name,
+                dag=dag,
+                project=project,
+                project_dir=project_dir,
+                adapter=adapter,
+                resolved=resolved,
+                full_refresh=full_refresh,
+                reprocess_all=reprocess_all,
+                accept_reprocess=accept_reprocess,
+                accept_cost=accept_cost,
+                confirm_cost=confirm_cost,
+            )
         if threads > 1 and len(selected) > 1:
             results_by_name = _run_in_batches(dag, selected, adapter, _run, threads)
         else:

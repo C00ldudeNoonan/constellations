@@ -80,6 +80,14 @@ def target_manifest_path(target_dir: Path, target_name: str) -> Path:
     return target_dir / TARGET_MANIFESTS_DIRNAME / f"{slug}-{digest}.json"
 
 
+_TARGET_MANIFEST_NAME = re.compile(r"^[a-z0-9_-]+-[0-9a-f]{8}\.json$")
+
+
+def is_target_manifest_name(filename: str) -> bool:
+    """Whether a file is named the way `target_manifest_path` names its output."""
+    return _TARGET_MANIFEST_NAME.fullmatch(filename) is not None
+
+
 @dataclass(frozen=True)
 class ManifestSnapshot:
     """An immutable artifact captured from the configuration used to execute."""

@@ -22,6 +22,7 @@ from stel.manifest import (
     write_manifest,
 )
 from stel.mcp_server.catalog import ArtifactCatalog, ArtifactCatalogError
+from stel.runner import clean_project
 
 
 def _write_project(tmp_path: Path) -> None:
@@ -103,6 +104,39 @@ def test_the_shared_manifest_still_serves_a_load_with_no_target(tmp_path: Path) 
     write_manifest(tmp_path, target="dev")
 
     assert ArtifactCatalog.load(tmp_path) is not None
+
+
+def test_clean_removes_its_manifests_and_keeps_what_is_not_its_own(
+    tmp_path: Path,
+) -> None:
+    """Review of #781: `target/manifests/` may already hold a warehouse.
+
+    A `duckdb.path` under that directory is valid configuration, and the
+    directory did not belong to stel before #760. Clean removes only files
+    named the way `target_manifest_path` names them.
+    """
+    _write_project(tmp_path)
+    write_manifest(tmp_path, target="prod")
+    write_manifest(tmp_path, target="dev")
+    manifests = tmp_path / "target" / TARGET_MANIFESTS_DIRNAME
+    warehouse = manifests / "warehouse.duckdb"
+    warehouse.write_bytes(b"not ours")
+
+    clean_project(tmp_path)
+
+    assert warehouse.read_bytes() == b"not ours"
+    assert [path.name for path in manifests.iterdir()] == ["warehouse.duckdb"]
+
+
+def test_clean_removes_the_manifests_directory_when_only_its_files_were_there(
+    tmp_path: Path,
+) -> None:
+    _write_project(tmp_path)
+    write_manifest(tmp_path, target="prod")
+
+    clean_project(tmp_path)
+
+    assert not (tmp_path / "target").exists()
 
 
 def test_a_target_name_never_reaches_the_filename_as_a_path(tmp_path: Path) -> None:

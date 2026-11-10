@@ -67,6 +67,7 @@ history (issue #311).
 | [0055](0055-graph-export-is-a-cli-over-per-fact-edges.md) | Graph export is a `stel graph-export` CLI writing JSON Lines, one edge per extracted fact, with nodes keyed by the agent-context `entity_id` and `entity_name` required | accepted |
 | [0056](0056-supersession-is-a-full-step-over-the-relation-table.md) | Supersession is a `full` step over the relation table and entity links, not part of the incremental extractor; `functional: true` is declared on the relation type; graph export carries validity as schema v2 | accepted |
 | [0057](0057-an-ontology-import-is-an-allow-list-resolved-at-load.md) | An ontology import is a required, ordered allow-list resolved into `vocabularies:`, `classes:` and `relations:` at load; links outside it are not followed, and ambiguity fails rather than picks | accepted |
+| [0058](0058-bigquery-writer-recovery-requires-quiescence.md) | A stopped BigQuery writer claim can be recovered after accounting for outstanding API requests and verifying terminal jobs | accepted, amends 0048 |
 
 ## When to write one
 

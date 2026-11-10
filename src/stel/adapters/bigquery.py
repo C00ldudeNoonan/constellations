@@ -57,6 +57,7 @@ from ..credentials import (
     CredentialResolutionError,
 )
 from ..hashing import canonical_fingerprint
+from ..interrupts import check_interruption, defer_interrupts, interruption_requested
 from ..logging_setup import REPORTER_ECHO_EXTRA
 from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
@@ -66,6 +67,7 @@ from .base import (
     NO_LAYOUT_PRUNING,
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
+    WRITER_CLAIM_TABLE,
     AdapterCapabilityError,
     AdapterError,
     LayoutPruningColumns,
@@ -108,7 +110,7 @@ from .base import (
 )
 from .base import STATE_TABLE as _STATE_TABLE
 from .base import SYNC_WATERMARK_TABLE as _SYNC_WATERMARK_TABLE
-from .bigquery_writer import BigQueryWriterClaim
+from .bigquery_writer import BigQueryWriterClaim, release_writer_claim, writer_claim_status
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -1395,13 +1397,44 @@ class BigQueryAdapter(WarehouseAdapter):
         mutation APIs also participate, including first creation and append.
         Read-only source discovery uses preflight_reads and does not claim.
         """
-        with self._writer_lock:
-            self._enter_writer_claim()
+        entered = False
+        interrupted = False
         try:
+            with defer_interrupts(), self._writer_lock:
+                check_interruption()
+                self._enter_writer_claim()
+                entered = True
+            check_interruption()
             yield
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         finally:
-            with self._writer_lock:
-                self._leave_writer_claim()
+            if entered:
+                with defer_interrupts(), self._writer_lock:
+                    self._leave_writer_claim(interrupted=interrupted or interruption_requested())
+        check_interruption()
+
+    @contextmanager
+    def _writer_claim_recovery_client(self) -> Iterator[Any]:
+        try:
+            client = self._make_client()
+        except AdapterError:
+            raise
+        except Exception:
+            raise AdapterError("Could not connect to BigQuery for writer claim recovery.") from None
+        try:
+            yield client
+        finally:
+            client.close()
+
+    def writer_claim_status(self) -> dict[str, str | int | None]:
+        with self._writer_claim_recovery_client() as client:
+            return writer_claim_status(client, self._table_id(WRITER_CLAIM_TABLE))
+
+    def release_writer_claim(self, *, run_id: str) -> None:
+        with self._writer_claim_recovery_client() as client:
+            release_writer_claim(client, self._table_id(WRITER_CLAIM_TABLE), run_id=run_id)
 
     def _enter_writer_claim(self) -> None:
         if self._writer_poisoned:
@@ -1416,7 +1449,8 @@ class BigQueryAdapter(WarehouseAdapter):
         owns_client = self._client is None
         client = self._make_client() if owns_client else self.client
         claim = BigQueryWriterClaim(
-            client, _bigquery(), self._cfg.project, self._cfg.schema_name, self._cfg.location
+            client, _bigquery(), self._cfg.project, self._cfg.schema_name, self._cfg.location,
+            execution_project=self._cfg.execution_project or self._cfg.project,
         )
         try:
             claim.acquire()
@@ -1427,14 +1461,14 @@ class BigQueryAdapter(WarehouseAdapter):
         self._writer_claim = claim
         self._writer_owns_client = owns_client
 
-    def _leave_writer_claim(self) -> None:
+    def _leave_writer_claim(self, *, interrupted: bool) -> None:
         self._writer_depth -= 1
         if self._writer_depth:
             return
         claim = self._writer_claim
         assert claim is not None
         try:
-            claim.release()
+            claim.release(interrupted=interrupted)
         except BaseException:
             self._writer_poisoned = True
             raise
@@ -1445,6 +1479,7 @@ class BigQueryAdapter(WarehouseAdapter):
             self._writer_owns_client = False
 
     def _submit_claimed_job(self, operation: Callable[[], Any]) -> Any:
+        check_interruption()
         claim = self._writer_claim
         return operation() if claim is None else claim.submit(operation)
 
@@ -2544,6 +2579,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 job_config.labels = {
                     **(job_config.labels or {}), "stel_writer": self._writer_claim.owner
                 }
+                kwargs["job_id_prefix"] = self._writer_claim.job_id_prefix
             if use_query_cache is not None:
                 job_config.use_query_cache = use_query_cache
             kwargs["job_config"] = job_config
@@ -3448,13 +3484,15 @@ class BigQueryAdapter(WarehouseAdapter):
         buffer = io.BytesIO()
         df.write_parquet(buffer)
         buffer.seek(0)
+        kwargs: dict[str, Any] = {}
         if self._writer_claim is not None:
             job_config.labels = {
                 **(job_config.labels or {}), "stel_writer": self._writer_claim.owner
             }
+            kwargs["job_id_prefix"] = self._writer_claim.job_id_prefix
         job = self._submit_claimed_job(
             lambda: self.client.load_table_from_file(
-                buffer, self._table_id(table), job_config=job_config
+                buffer, self._table_id(table), job_config=job_config, **kwargs
             )
         )
         job.result()
@@ -3555,6 +3593,7 @@ class BigQueryAdapter(WarehouseAdapter):
         return f"CAST({expression} AS STRING)"
 
     def estimate_query_bytes(self, sql: str, params: list[Any]) -> int | None:
+        check_interruption()
         bigquery = _bigquery()
         job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
         if params:
@@ -3567,6 +3606,7 @@ class BigQueryAdapter(WarehouseAdapter):
         return None if total is None else int(total)
 
     def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
+        check_interruption()
         bigquery = _bigquery()
         job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
         try:

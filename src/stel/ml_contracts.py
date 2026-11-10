@@ -739,6 +739,7 @@ def _validate_artifact_path_boundaries(
     reserved_paths = [
         target_root / "docs",
         target_root / "manifest.json",
+        target_root / "manifests",
         target_root / "run_results.json",
         target_root / "sources.yml",
         artifact_root / "registry.json",

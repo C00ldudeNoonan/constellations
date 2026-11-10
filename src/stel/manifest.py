@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -59,6 +61,23 @@ MANIFEST_VERSION = 1
 SERVING_MANIFEST_VERSION = 6
 MANIFEST_FILENAME = "manifest.json"
 RUN_RESULTS_FILENAME = "run_results.json"
+# Directory under `target/` holding one manifest per target (issue #760).
+TARGET_MANIFESTS_DIRNAME = "manifests"
+
+
+def target_manifest_path(target_dir: Path, target_name: str) -> Path:
+    """The manifest compiled for one target, beside the shared `manifest.json`.
+
+    `target/manifest.json` is last-writer-wins across targets, so a run against
+    `dev` replaces what `prod` compiled and the prod MCP server refuses it
+    (issue #760). Each target also gets its own file, which only that target's
+    compile or run replaces. A target name is an arbitrary profile key, so it
+    reaches the filename only as a slug plus a digest of the exact name: two
+    names that slug alike stay apart, and nothing path-like gets through.
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "_", target_name.lower()).strip("_")[:40] or "target"
+    digest = hashlib.sha256(target_name.encode("utf-8")).hexdigest()[:8]
+    return target_dir / TARGET_MANIFESTS_DIRNAME / f"{slug}-{digest}.json"
 
 
 @dataclass(frozen=True)
@@ -66,12 +85,19 @@ class ManifestSnapshot:
     """An immutable artifact captured from the configuration used to execute."""
 
     path: Path
+    target_path: Path
     content: str = field(repr=False)
 
     def write(self) -> Path:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(self.content, encoding="utf-8")
+        _write_manifest_files(self.path, self.target_path, self.content)
         return self.path
+
+
+def _write_manifest_files(shared: Path, per_target: Path, content: str) -> None:
+    """Write the per-target manifest first, so the shared copy never leads it."""
+    per_target.parent.mkdir(parents=True, exist_ok=True)
+    per_target.write_text(content, encoding="utf-8")
+    shared.write_text(content, encoding="utf-8")
 
 
 def capture_manifest(
@@ -84,8 +110,10 @@ def capture_manifest(
 ) -> ManifestSnapshot:
     """Freeze values and code identities before execution, without writing yet."""
     payload = _build_manifest_from_project(project, sources, models, project_dir, resolved)
+    target_dir = project_dir / project.target_path
     return ManifestSnapshot(
-        path=project_dir / project.target_path / MANIFEST_FILENAME,
+        path=target_dir / MANIFEST_FILENAME,
+        target_path=target_manifest_path(target_dir, resolved.target_name),
         content=json.dumps(payload, indent=2),
     )
 
@@ -96,6 +124,15 @@ def build_manifest(
     target: str | None = None,
     profiles_dir: Path | None = None,
 ) -> dict[str, Any]:
+    return _build_with_profile(project_dir, target=target, profiles_dir=profiles_dir)[0]
+
+
+def _build_with_profile(
+    project_dir: Path,
+    *,
+    target: str | None,
+    profiles_dir: Path | None,
+) -> tuple[dict[str, Any], ResolvedProfile]:
     project, sources, models = load_project(project_dir)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
@@ -104,7 +141,8 @@ def build_manifest(
         adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
         resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     sources = apply_source_path_overrides(sources, resolved)
-    return _build_manifest_from_project(project, sources, models, project_dir, resolved)
+    payload = _build_manifest_from_project(project, sources, models, project_dir, resolved)
+    return payload, resolved
 
 
 def _build_manifest_from_project(
@@ -177,12 +215,14 @@ def write_manifest(
     target_dir = (project_dir / project.target_path).resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     out = target_dir / MANIFEST_FILENAME
-    out.write_text(
-        json.dumps(
-            build_manifest(project_dir, target=target, profiles_dir=profiles_dir),
-            indent=2,
-        )
-    , encoding="utf-8")
+    payload, resolved = _build_with_profile(
+        project_dir, target=target, profiles_dir=profiles_dir
+    )
+    _write_manifest_files(
+        out,
+        target_manifest_path(target_dir, resolved.target_name),
+        json.dumps(payload, indent=2),
+    )
     return out
 
 

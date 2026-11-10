@@ -63,7 +63,7 @@ from .execution import transform as _transform_execution
 from .execution import usage as _usage_execution
 from .execution.deletion_guard import is_valid_approval
 from .logging_setup import REPORTER_ECHO_EXTRA
-from .manifest import capture_manifest, compute_modified_models
+from .manifest import TARGET_MANIFESTS_DIRNAME, capture_manifest, compute_modified_models
 from .paths import resolve_within_project
 from .plan import (
     ModelPlan,
@@ -1698,7 +1698,7 @@ def clean_project(
                 raise RunError(f"Expected generated artifact to be a file: {artifact}")
             artifact.unlink()
 
-    for dirname in ("docs", "artifacts"):
+    for dirname in ("docs", "artifacts", TARGET_MANIFESTS_DIRNAME):
         artifact_dir = target_dir / dirname
         if artifact_dir.is_symlink():
             raise RunError(f"Refusing to clean symlinked artifact {artifact_dir}.")

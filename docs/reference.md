@@ -124,7 +124,7 @@ installation command.
 | **Materialization**  | `full` (always replace) or `incremental` (skip unchanged input on re-runs).      |
 | **Tests**          | `not_null`, `unique`, `min_rows`, custom Python — with `severity: warn` if you want.|
 | **Profile**        | Warehouse + LLM + embedding-provider config, swappable per `--target dev|prod`. No credentials in models. |
-| **Artifacts**      | `target/manifest.json`, `target/run_results.json`, `target/sources.yml` (for dbt). |
+| **Artifacts**      | `target/manifest.json` (last target to run) and `target/manifests/` (one per target, what MCP serves), `target/run_results.json`, `target/sources.yml` (for dbt). |
 
 ## Backends
 

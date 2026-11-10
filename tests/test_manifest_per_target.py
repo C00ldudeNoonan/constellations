@@ -14,14 +14,18 @@ import json
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from stel.cli import cli
 from stel.manifest import (
     MANIFEST_FILENAME,
     TARGET_MANIFESTS_DIRNAME,
     target_manifest_path,
     write_manifest,
 )
+from stel.mcp_server import server
 from stel.mcp_server.catalog import ArtifactCatalog, ArtifactCatalogError
+from stel.mcp_server.service import ContextService
 from stel.runner import clean_project
 
 
@@ -37,7 +41,7 @@ def _write_project(tmp_path: Path) -> None:
     )
     (tmp_path / "profiles.yml").write_text(
         "context_project:\n"
-        "  target: dev\n"
+        "  target: prod\n"
         "  outputs:\n"
         f"    dev:\n{warehouse.format(name='dev')}"
         f"    prod:\n{warehouse.format(name='prod')}",
@@ -52,8 +56,13 @@ def _write_project(tmp_path: Path) -> None:
     (tmp_path / "models" / "context.yml").write_text(
         "version: 2\n"
         "models:\n"
+        "  - name: raw_documents\n"
+        "    source: ref('documents')\n"
+        "    extraction:\n"
+        "      backend: json\n"
+        "      options: {fields: [title]}\n"
         "  - name: document_chunks\n"
-        "    depends_on: [ref('documents')]\n"
+        "    depends_on: [ref('raw_documents')]\n"
         "    transform:\n"
         "      type: python\n"
         "      module: transforms.context\n"
@@ -77,6 +86,55 @@ def test_a_dev_compile_does_not_take_the_prod_catalog_down(tmp_path: Path) -> No
     catalog = ArtifactCatalog.load(tmp_path, expected_target="prod")
     assert catalog is not None
     assert ArtifactCatalog.load(tmp_path, expected_target="dev") is not None
+
+
+@pytest.mark.e2e
+def test_a_dev_run_preserves_the_prod_healthcheck_and_default_mcp_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ALE-621 (#760): serve the profile's prod target after a dev run."""
+    _write_project(tmp_path)
+    documents = tmp_path / "data" / "documents"
+    documents.mkdir(parents=True)
+    (documents / "one.json").write_text('{"title": "One"}', encoding="utf-8")
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "context.py").write_text(
+        "from stel.agent_context import empty_agent_context_frame\n"
+        "def run(deps):\n"
+        "    return empty_agent_context_frame('document_chunks')\n",
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    args = ["--project-dir", str(tmp_path)]
+    compiled = runner.invoke(cli, [*args, "compile", "--target", "prod"])
+    assert compiled.exit_code == 0, compiled.output
+    target_dir = tmp_path / "target"
+    prod_manifest = target_manifest_path(target_dir, "prod")
+    prod_content = prod_manifest.read_bytes()
+
+    # A dev experiment drops the serving declaration, so its shared manifest
+    # would fail catalog validation if prod serving accidentally read it.
+    config = tmp_path / "models" / "context.yml"
+    model_yaml, _, _ = config.read_text(encoding="utf-8").partition("    agent_context:")
+    config.write_text(model_yaml, encoding="utf-8")
+    ran = runner.invoke(cli, [*args, "run", "--target", "dev"])
+    assert ran.exit_code == 0, ran.output
+    shared = (target_dir / MANIFEST_FILENAME).read_bytes()
+    assert json.loads(shared)["project"]["target"] == "dev"
+    assert target_manifest_path(target_dir, "dev").read_bytes() == shared
+    assert prod_manifest.read_bytes() == prod_content
+
+    ArtifactCatalog.load(tmp_path, expected_target="prod")
+    transports: list[str] = []
+
+    def record_transport(service: ContextService, *, transport: str) -> None:
+        service.close()
+        transports.append(transport)
+
+    monkeypatch.setattr(server, "_run", record_transport)
+    served = runner.invoke(cli, [*args, "mcp", "serve"])
+    assert served.exit_code == 0, served.output
+    assert transports == ["stdio"]
 
 
 def test_each_targets_manifest_names_its_own_target(tmp_path: Path) -> None:

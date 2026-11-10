@@ -134,9 +134,13 @@ class ArtifactCatalog:
             # target's compile or run.
             manifest_path = target_manifest_path(target_dir, expected_target)
             if not manifest_path.is_file():
+                compile_command = (
+                    f"stel compile --target {expected_target}"
+                    if project.profile else "stel compile"
+                )
                 raise ArtifactCatalogError(
                     f"No manifest has been compiled for target '{expected_target}'; "
-                    f"run `stel compile --target {expected_target}`"
+                    f"run `{compile_command}`"
                 )
         manifest = _read_json(manifest_path, required=True)
         if manifest is None:

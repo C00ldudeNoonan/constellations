@@ -388,7 +388,7 @@ def test_the_cli_lets_a_bigquery_target_past_the_identity_gate(
     # Asserting only the absence would pass just as well if the CLI had failed
     # before ever reaching the gate. Naming where it *did* stop is what makes
     # this test capable of failing.
-    assert "manifest.json" in result.output
+    assert "No manifest has been compiled for target 'dev'" in result.output
 
 
 class _RecordingReader:

@@ -12,6 +12,15 @@
   to identify affected models. After verifying their output would be unchanged,
   `stel adopt --select MODEL` can restamp their published state.
 
+- A compile or run for one target no longer takes another target's MCP server down (issue
+  #760). `target/manifest.json` is still written for whichever target ran last, but each
+  target now also has its own manifest under `target/manifests/`, replaced only by that
+  target's compile or run. `stel mcp serve --target X` and the concept-cloud server read the
+  manifest for `X`, so a `stel run --target dev` leaves prod serving. A target that never
+  compiled is refused with `stel compile --target X`. Upgrading: run `stel compile --target
+  <target>` once per served target, since a manifest written before this release has no
+  per-target copy.
+
 ## v0.26.0 - 2026-11-09
 
 - A project can declare a segmented search group (ADR-0037, issue #771). `search_groups:`

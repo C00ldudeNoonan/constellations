@@ -1,6 +1,6 @@
 # ADR-0048: BigQuery writers hold a non-expiring claim
 
-- **Status:** accepted; amends 0047
+- **Status** Accepted. Amends 0047. Recovery amended by [0058](0058-bigquery-writer-recovery-requires-quiescence.md).
 - **Date:** 2026-11-03
 - **Prompted by:** #741, PR #742 (ALE-515)
 

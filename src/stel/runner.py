@@ -752,9 +752,13 @@ def _run_in_batches(
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(threads, len(batch))
         ) as ex:
-            futures = {ex.submit(run_one, name, guarded): name for name in batch}
-            for future in concurrent.futures.as_completed(futures):
-                results_by_name[futures[future]] = future.result()
+            try:
+                futures = {ex.submit(run_one, name, guarded): name for name in batch}
+                for future in concurrent.futures.as_completed(futures):
+                    results_by_name[futures[future]] = future.result()
+            except KeyboardInterrupt:
+                ex.shutdown(wait=True, cancel_futures=True)
+                raise
     return results_by_name
 
 

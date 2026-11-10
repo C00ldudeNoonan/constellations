@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import logging
 import os
 import pickle
 import random
+import re
+import signal
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +22,7 @@ from typing import Any
 import polars as pl
 import pyarrow as pa
 import pytest
+from click.testing import CliRunner
 from pydantic import ValidationError
 
 from stel.adapters import (
@@ -61,8 +66,10 @@ from stel.adapters.bigquery import (
     _coalesced_batches,
     to_query_parameters,
 )
+from stel.adapters.bigquery_writer import BigQueryWriterClaim
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.adapters.serialized import SerializedAdapter
+from stel.cli import cli
 from stel.config.identifiers import LEGACY_SCHEMA_NAME
 from stel.credentials import ProtectedCredential
 from stel.logging_setup import configure_diagnostics_file
@@ -307,6 +314,7 @@ class _FakeClient:
         self.queries: list[tuple[str, Any]] = []
         self.query_kwargs: list[dict[str, Any]] = []
         self.loads: list[tuple[bytes, str, Any]] = []
+        self.load_kwargs: list[dict[str, Any]] = []
         self.tables: dict[str, list[Any]] = {}
         self.table_meta: dict[str, dict[str, Any]] = {}
         self.listing: list[str] = []
@@ -338,9 +346,10 @@ class _FakeClient:
         return self.query_results.pop(0) if self.query_results else _FakeJob()
 
     def load_table_from_file(
-        self, fobj: io.BytesIO, table_id: str, job_config: Any = None
+        self, fobj: io.BytesIO, table_id: str, job_config: Any = None, **kwargs: Any
     ) -> _FakeJob:
         self.loads.append((fobj.read(), table_id, job_config))
+        self.load_kwargs.append(kwargs)
         return _FakeJob()
 
     def get_table(self, table_id: str) -> Any:
@@ -375,13 +384,13 @@ class _FakeClient:
 
         raise NotFound(dataset_id)
 
-    def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
+    def delete_table(self, table_id: str, not_found_ok: bool = False, **kwargs: Any) -> None:
         if table_id in self.claims:
             del self.claims[table_id]
             return
         self.dropped.append(table_id)
 
-    def update_table(self, table: Any, fields: list[str]) -> Any:
+    def update_table(self, table: Any, fields: list[str], **kwargs: Any) -> Any:
         if getattr(table, "table_id", None) == "stel_writer_claim":
             return table
         self.updated_tables.append((table, list(fields)))
@@ -1194,9 +1203,9 @@ def test_writer_claim_retains_uncertain_jobs_and_requires_quiescent_recovery(fai
 
     class UncertainClient(_FakeClient):
         def load_table_from_file(
-            self, fobj: io.BytesIO, table_id: str, job_config: Any = None
+            self, fobj: io.BytesIO, table_id: str, job_config: Any = None, **kwargs: Any
         ) -> _FakeJob:
-            super().load_table_from_file(fobj, table_id, job_config)
+            super().load_table_from_file(fobj, table_id, job_config, **kwargs)
             if failure == "lost_response":
                 raise TimeoutError("sensitive-provider-response")
             return pending
@@ -1262,12 +1271,14 @@ def test_writer_claim_tracks_jobs_without_transparent_retries_or_completed_job_g
         assert client.loads[0][2].labels["stel_writer"] == claim.owner
         assert client.queries[0][1].labels["stel_writer"] == claim.owner
         assert client.query_kwargs[0]["job_retry"] is None
+        assert client.query_kwargs[0]["job_id_prefix"] == f"stel_{claim.owner}_"
+        assert client.load_kwargs[0]["job_id_prefix"] == f"stel_{claim.owner}_"
 
 
 def test_writer_claim_retains_ambiguous_table_metadata_mutation() -> None:
     """#741: a timed-out table deletion must not land after authority moves to another writer."""
     class LostDeleteClient(_FakeClient):
-        def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
+        def delete_table(self, table_id: str, not_found_ok: bool = False, **kwargs: Any) -> None:
             is_claim = table_id in self.claims
             super().delete_table(table_id, not_found_ok)
             if not is_claim:
@@ -1282,6 +1293,196 @@ def test_writer_claim_retains_ambiguous_table_metadata_mutation() -> None:
     with pytest.raises(AdapterError, match="claim unavailable"):
         _adapter(client).append_rows("docs", pl.DataFrame({"document_id": ["a"]}))
     assert not client.loads
+
+
+@pytest.mark.parametrize(
+    ("command", "entry_point", "during_submission", "terminal_after_cancel"),
+    [
+        ("run", "run_project", False, True),
+        ("build", "build_project", False, True),
+        ("adopt", "adopt_project", False, True),
+        ("run", "run_project", True, True),
+        ("run", "run_project", False, False),
+    ],
+)
+def test_sigterm_unwinds_bigquery_writer_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    entry_point: str,
+    during_submission: bool,
+    terminal_after_cancel: bool,
+) -> None:
+    """#759: the command must cancel its job and release the claim on SIGTERM."""
+    class InterruptedJob(_FakeJob):
+        state = "RUNNING"
+        cancel_requested = False
+
+        def result(self, timeout: Any = None) -> list[_FakeRow]:
+            signal.raise_signal(signal.SIGTERM)
+            pytest.fail("SIGTERM did not interrupt the job wait")
+
+        def reload(self, *, client: Any, retry: Any, timeout: float) -> None:
+            pass
+
+        def cancel(self, **kwargs: Any) -> bool:
+            self.cancel_requested = True
+            if terminal_after_cancel:
+                self.state = "DONE"
+            return True
+
+    class InterruptingClient(_FakeClient):
+        def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
+            submitted = super().query(sql, job_config, **kwargs)
+            if during_submission:
+                signal.raise_signal(signal.SIGTERM)
+            return submitted
+
+    now = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(
+        "stel.adapters.bigquery_writer.time",
+        SimpleNamespace(monotonic=lambda: now, sleep=advance),
+    )
+    job = InterruptedJob()
+    client = InterruptingClient()
+    client.query_results.append(job)
+    adapter = _adapter(client)
+
+    def execute(*args: Any, **kwargs: Any) -> None:
+        with adapter.writer_claim():
+            try:
+                adapter.scalar("SELECT 1")
+            except KeyboardInterrupt:
+                with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(KeyboardInterrupt):
+                    pool.submit(adapter.scalar, "SELECT 2").result()
+                raise
+
+    monkeypatch.setattr(f"stel.cli.{entry_point}", execute)
+    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        result = CliRunner().invoke(cli, [command, "--select", "docs"])
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert result.exit_code == 1, result.output
+    assert job.cancel_requested
+    assert len(client.queries) == 1
+    if terminal_after_cancel:
+        assert "Aborted!" in result.output
+        assert not client.claims
+    else:
+        assert "claim retained" in result.output
+        assert client.claims
+
+
+def test_writer_claim_cli_verifies_all_jobs_before_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#759: recover only the specified stopped holder with complete, terminal job evidence."""
+    from google.cloud import bigquery
+
+    created = datetime(2026, 11, 7, 18, 33, 24, tzinfo=UTC)
+
+    class RecoveryClient(_FakeClient):
+        changed = False
+
+        def create_table(self, table: Any, exists_ok: bool = False) -> Any:
+            table._properties.update(
+                etag="claim-etag", creationTime=int(created.timestamp() * 1000)
+            )
+            return super().create_table(table, exists_ok)
+
+        def list_jobs(self, **kwargs: Any) -> Any:
+            assert kwargs == {
+                "project": "original-billing",
+                "all_users": True,
+                "min_creation_time": created,
+            }
+            return SimpleNamespace(pages=[SimpleNamespace(raw_page=page) for page in pages])
+
+        def update_table(self, table: Any, fields: list[str], **kwargs: Any) -> Any:
+            if fields == ["labels"]:
+                from google.api_core.exceptions import PreconditionFailed
+
+                assert table.etag == "claim-etag"
+                assert kwargs == {"retry": None}
+                if self.changed:
+                    table.labels.pop("stel_recovery")
+                    raise PreconditionFailed("sensitive API response")
+            return super().update_table(table, fields, **kwargs)
+
+        def delete_table(self, table_id: str, not_found_ok: bool = False, **kwargs: Any) -> None:
+            assert kwargs == {"retry": None}
+            assert self.claims[table_id].labels["stel_recovery"]
+            super().delete_table(table_id, not_found_ok)
+
+    client = RecoveryClient()
+    claim = BigQueryWriterClaim(
+        client, bigquery, "proj", "ds", None, execution_project="original-billing"
+    )
+    claim.acquire()
+    with pytest.raises(AdapterError, match="Claim created at " + re.escape(created.isoformat())):
+        with _adapter(client).writer_claim():
+            pytest.fail("the dataset already has a writer")
+
+    (tmp_path / "stel_project.yml").write_text(
+        "name: recovery\nprofile: recovery\n", encoding="utf-8"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "recovery:\n"
+        "  target: prod\n"
+        "  outputs:\n"
+        "    prod:\n"
+        "      warehouse:\n"
+        "        type: bigquery\n"
+        "        project: proj\n"
+        "        dataset: ds\n"
+        "        execution_project: recovery-billing\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(BigQueryAdapter, "_make_client", lambda self: client)
+    runner = CliRunner()
+    args = ["writer-claim", "--project-dir", str(tmp_path), "--profiles-dir", str(tmp_path)]
+    status = runner.invoke(cli, [*args, "status"])
+    assert status.exit_code == 0, status.output
+    payload = json.loads(status.output)
+    assert payload["status"] == "claimed"
+    assert payload["run_id"] == claim.owner
+    assert payload["created_at"] == created.isoformat()
+    assert payload["hostname"] and payload["pid"] == os.getpid()
+    assert payload["started_at"] and payload["execution_project"] == "original-billing"
+
+    job = {"jobReference": {"jobId": f"{claim.job_id_prefix}load"}, "state": "PENDING"}
+    pages = [{"jobs": []}, {"jobs": [job]}]
+    release = [*args, "release", "--run-id", claim.owner]
+    assert runner.invoke(cli, release).exit_code == 2
+    release.append("--confirm-quiescent")
+    result = runner.invoke(cli, release)
+    assert result.exit_code == 1 and "still active" in result.output
+    assert "stel_recovery" not in client.claims[claim.table_id].labels
+
+    job["state"] = "DONE"
+    pages.append({"unreachable": ["europe-west5"]})
+    result = runner.invoke(cli, release)
+    assert result.exit_code == 1 and "every location" in result.output
+    assert claim.table_id in client.claims
+
+    pages.pop()
+    client.changed = True
+    result = runner.invoke(cli, release)
+    assert result.exit_code == 1 and "could not be confirmed" in result.output
+    assert "sensitive API response" not in result.output
+    assert claim.table_id in client.claims
+
+    client.changed = False
+    result = runner.invoke(cli, release)
+    assert result.exit_code == 0, result.output
+    assert not client.claims
+    assert not client.queries
 
 
 def test_list_tables_filters_internal() -> None:
@@ -1567,7 +1768,9 @@ def test_materialize_full_partition_migration_falls_back_to_staged_swap() -> Non
 
 def test_materialize_full_bad_layout_keeps_target() -> None:
     class _FailingLoadClient(_FakeClient):
-        def load_table_from_file(self, fobj: Any, table_id: str, job_config: Any = None) -> Any:
+        def load_table_from_file(
+            self, fobj: Any, table_id: str, job_config: Any = None, **kwargs: Any
+        ) -> Any:
             raise RuntimeError("partition column type mismatch")
 
     client = _FailingLoadClient()
@@ -4848,11 +5051,15 @@ def test_integration_writer_claim_excludes_writers_and_retains_lost_job_response
         with pytest.raises(AdapterError, match="claim unavailable"):
             with contender.writer_claim():
                 pytest.fail("a stranded claim was stolen")
-        # Stop the old writer, confirm the actual submitted job is terminal,
-        # then perform the documented manual recovery on synthetic data only.
+        # Account for the old writer's submitted job before operator recovery.
         for job in jobs:
             job.result()
-        client.delete_table(claim_id, not_found_ok=False)
+        status = contender.writer_claim_status()
+        assert status["status"] == "claimed"
+        run_id = status["run_id"]
+        assert isinstance(run_id, str)
+        assert client.get_table(claim_id).labels["stel_writer"] == run_id
+        contender.release_writer_claim(run_id=run_id)
         with contender.writer_claim(), contender:
             contender.append_rows("docs", frame)
             assert contender.row_count("docs") == 3

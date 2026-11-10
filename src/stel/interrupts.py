@@ -35,19 +35,21 @@ def interrupt_on_termination() -> Iterator[None]:
         if not state.deferred:
             raise KeyboardInterrupt
 
-    previous = {kind: signal.getsignal(kind) for kind in (signal.SIGINT, signal.SIGTERM)}
+    previous = {}
+    for kind in (signal.SIGINT, signal.SIGTERM):
+        handler = signal.getsignal(kind)
+        if handler is not None:
+            previous[kind] = handler
     try:
         _active = state
-        for kind, handler in previous.items():
-            if handler is not None:
-                signal.signal(kind, interrupt)
+        for kind in previous:
+            signal.signal(kind, interrupt)
         yield
     finally:
         state.deferred += 1
         try:
             for kind, handler in previous.items():
-                if handler is not None:
-                    signal.signal(kind, handler)
+                signal.signal(kind, handler)
         finally:
             _active = None
 

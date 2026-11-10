@@ -16,7 +16,7 @@ from ..config import load_project
 from ..config.class_hierarchy import class_names, class_parents
 from ..config.project import ProjectConfig
 from ..config.vocabulary import Vocabulary, check_declaration
-from ..manifest import SERVING_MANIFEST_VERSION
+from ..manifest import MANIFEST_FILENAME, SERVING_MANIFEST_VERSION, target_manifest_path
 from .authorization import PolicyAttribute
 from .contracts import (
     ContextField,
@@ -126,7 +126,19 @@ class ArtifactCatalog:
     ) -> ArtifactCatalog:
         project, _, _ = load_project(project_dir)
         target_dir = (project_dir / project.target_path).resolve()
-        manifest = _read_json(target_dir / "manifest.json", required=True)
+        manifest_path = target_dir / MANIFEST_FILENAME
+        if expected_target is not None:
+            # The shared manifest.json is whichever target compiled last, so a
+            # run against another target would replace it and take this server
+            # down (issue #760). The target's own file is replaced only by that
+            # target's compile or run.
+            manifest_path = target_manifest_path(target_dir, expected_target)
+            if not manifest_path.is_file():
+                raise ArtifactCatalogError(
+                    f"No manifest has been compiled for target '{expected_target}'; "
+                    f"run `stel compile --target {expected_target}`"
+                )
+        manifest = _read_json(manifest_path, required=True)
         if manifest is None:
             raise AssertionError("required manifest read returned no payload")
         catalog = cls.from_payloads(manifest, expected_target=expected_target)

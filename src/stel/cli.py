@@ -17,6 +17,7 @@ from .adapters import (
     create_adapter,
     plan_name_migration,
 )
+from .adapters.bigquery import BigQueryAdapter
 from .adopt import adopt_project
 from .checks import TestResult, run_project_tests
 from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
@@ -46,6 +47,7 @@ from .docs import DocsError, generate_docs, serve_docs
 from .execution.deletion_guard import is_valid_approval
 from .freshness import check_freshness
 from .graph_export import GraphExportError, export_graph, write_graph_export
+from .interrupts import interrupt_on_termination
 from .logging_setup import (
     configure_diagnostics_file,
     configure_verbose_logging,
@@ -248,7 +250,7 @@ def _require_writable_diagnostics_path(path: Path, *, source: str) -> None:
         raise click.UsageError(f"{source}: cannot write {path}: {reason}.")
 
 
-def _run_failure(error: RunError) -> click.ClickException:
+def _run_failure(error: RunError | AdapterError) -> click.ClickException:
     """The failure as the operator sees it.
 
     The message is already artifact-safe; when the native detail it leaves out
@@ -1218,6 +1220,7 @@ def plan(
 @_verbose_option
 @_project_context_options
 @click.pass_context
+@interrupt_on_termination()
 def adopt(
     ctx: click.Context,
     select: str,
@@ -1268,6 +1271,62 @@ def adopt(
             click.echo(f"{result.model}: no published state; nothing to adopt")
         else:
             click.echo(f"{result.model}: materialization full keeps no state; nothing to adopt")
+
+
+@cli.group("writer-claim")
+@_project_context_options
+def writer_claim() -> None:
+    """Inspect or recover a BigQuery dataset's writer claim."""
+
+
+def _writer_claim_adapter(ctx: click.Context) -> BigQueryAdapter:
+    project_dir: Path = ctx.obj["project_dir"]
+    project, _, _ = _load(project_dir)
+    try:
+        resolved = resolve_profile(
+            project, project_dir, target=ctx.obj["target"], profiles_dir=ctx.obj["profiles_dir"]
+        )
+        adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+    except _CONFIG_ERRORS as error:
+        raise ConfigClickError(str(error)) from error
+    if not isinstance(adapter, BigQueryAdapter):
+        raise ConfigClickError("writer-claim requires a BigQuery target.")
+    return adapter
+
+
+@writer_claim.command("status")
+@_project_context_options
+@click.pass_context
+def writer_claim_status(ctx: click.Context) -> None:
+    """Show the dataset's current writer claim as JSON."""
+    try:
+        status = _writer_claim_adapter(ctx).writer_claim_status()
+    except AdapterError as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(json.dumps(status))
+
+
+@writer_claim.command("release")
+@click.option("--run-id", required=True, help="Run ID from writer-claim status.")
+@click.option(
+    "--confirm-quiescent",
+    is_flag=True,
+    help="Confirm the writer cannot resume and all outstanding API requests are accounted for.",
+)
+@_project_context_options
+@click.pass_context
+def writer_claim_release(ctx: click.Context, run_id: str, confirm_quiescent: bool) -> None:
+    """Release the specified claim after verifying its BigQuery jobs are terminal."""
+    if not confirm_quiescent:
+        raise click.UsageError(
+            "Stop the old writer and account for every outstanding API request before "
+            "using --confirm-quiescent. See BigQuery writer claim recovery in the reference."
+        )
+    try:
+        _writer_claim_adapter(ctx).release_writer_claim(run_id=run_id)
+    except AdapterError as error:
+        raise click.ClickException(str(error)) from error
+    click.echo("BigQuery writer claim released.")
 
 
 def _parse_deletion_approvals(values: Sequence[str]) -> dict[str, str]:
@@ -1408,6 +1467,7 @@ def _confirm_cost(projection: CostProjection) -> bool:
 @_verbose_option
 @_project_context_options
 @click.pass_context
+@interrupt_on_termination()
 def run(
     ctx: click.Context,
     full_refresh: bool,
@@ -1452,20 +1512,23 @@ def run(
                 "would reprocess every published row on every file change. Run "
                 "it once by hand instead."
             )
-        _run_watch(
-            project_dir,
-            profiles_dir=profiles_dir,
-            target=target,
-            full_refresh=full_refresh,
-            select=select,
-            exclude=exclude,
-            threads=threads,
-            source_filter=source_filter,
-            read_filter=read_filter,
-            accept_reprocess=accept_reprocess,
-            accept_cost=accept_cost,
-            confirm_cost=_cost_confirmation(json_output),
-        )
+        try:
+            _run_watch(
+                project_dir,
+                profiles_dir=profiles_dir,
+                target=target,
+                full_refresh=full_refresh,
+                select=select,
+                exclude=exclude,
+                threads=threads,
+                source_filter=source_filter,
+                read_filter=read_filter,
+                accept_reprocess=accept_reprocess,
+                accept_cost=accept_cost,
+                confirm_cost=_cost_confirmation(json_output),
+            )
+        except AdapterError as error:
+            raise _run_failure(error) from error
         return
 
     start = time.monotonic()
@@ -1491,7 +1554,7 @@ def run(
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
-    except RunError as e:
+    except (RunError, AdapterError) as e:
         raise _run_failure(e) from e
     elapsed = round(time.monotonic() - start, 3)
     _note_diagnostics()
@@ -1694,6 +1757,7 @@ def _usage_summary(
 @_verbose_option
 @_project_context_options
 @click.pass_context
+@interrupt_on_termination()
 def build(
     ctx: click.Context,
     full_refresh: bool,
@@ -1742,7 +1806,7 @@ def build(
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
-    except RunError as e:
+    except (RunError, AdapterError) as e:
         raise _run_failure(e) from e
     elapsed = round(time.monotonic() - start, 3)
     _note_diagnostics()

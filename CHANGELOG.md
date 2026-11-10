@@ -2,11 +2,15 @@
 
 ## Unreleased
 
-- Scoped embedding runs limit warehouse vector reuse to the filtered slice
-  and the window's layout bounds (issue #761). Use `stel run --new-only`
-  to catch up incremental embed keys that have no state row, and
-  `stel plan --pending --read-filter FIELD OP VALUE` to measure the slice
-  before running it.
+- BigQuery `stel run`, `build` and `adopt` handle SIGTERM and retain the writer
+  claim when outstanding work cannot be confirmed terminal.
+  `stel writer-claim status` shows the holder, and `stel writer-claim release` checks BigQuery job
+  state after the operator confirms that the holder has stopped and all API
+  requests are accounted for (issue #759, ALE-620). [Recovery procedure](docs/reference.md#bigquery-writer-claim-recovery)
+- Upgrading moves `extraction.backend_implementation` for the `llm` backend
+  because its source fingerprint includes the BigQuery adapter. Use `stel plan`
+  to identify affected models. After verifying their output would be unchanged,
+  `stel adopt --select MODEL` can restamp their published state.
 
 - A compile or run for one target no longer takes another target's MCP server down (issue
   #760). `target/manifest.json` is still written for whichever target ran last, but each
@@ -16,6 +20,12 @@
   compiled is refused with `stel compile --target X`. Upgrading: run `stel compile --target
   <target>` once per served target, since a manifest written before this release has no
   per-target copy.
+
+- Scoped embedding runs limit warehouse vector reuse to the filtered slice
+  and the window's layout bounds (issue #761). Use `stel run --new-only`
+  to catch up incremental embed keys that have no state row, and
+  `stel plan --pending --read-filter FIELD OP VALUE` to measure the slice
+  before running it.
 
 ## v0.26.0 - 2026-11-09
 

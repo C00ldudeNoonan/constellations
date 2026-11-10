@@ -492,7 +492,7 @@ source access must still be restricted. The target and state must agree before
 the run and again within the guarded deletion transaction. A mismatch requires
 investigation and repair before retrying; the guard does not repair state.
 
-On BigQuery, every `run` and `build` (including unguarded models) holds the
+On BigQuery, every `run`, `build` and writing `adopt` holds the
 dataset's `stel_writer_claim` table from before discovery until publication
 finishes. Model publication and state mutation APIs also acquire this claim
 when called independently. Acquisition uses the table-creation API, so two
@@ -509,37 +509,14 @@ alone cannot exclude BigQuery append loads or insert-only writes. Do not run
 such writers concurrently with guarded extraction. A claim is not an IAM fence.
 
 The claim never expires or gets stolen automatically. Every query and load
-submitted while it is held carries a `stel_writer` job label matching the claim
-table's label. Transparent query-job retries are disabled while claimed. A
-normal return or confirmed terminal job failure permits release. A lost
-submission response, unfinished job or failed ownership check retains the
-claim and refuses further publication. A failed run may therefore require
+submitted while it is held carries a `stel_writer` job label and a job ID
+prefix tied to the claim's run ID. Transparent query-job retries are disabled
+while claimed. A normal return or confirmed terminal job failure permits release.
+A lost submission response, unfinished job or failed ownership check retains
+the claim and refuses further publication. A failed run may therefore require
 operator recovery even if the warehouse job later finishes successfully.
 Ambiguous table metadata API mutations also retain the claim. These are not
 jobs; use warehouse audit records to establish that their requests completed.
-
-To recover a stranded BigQuery writer claim:
-
-1. Stop the old writer and prevent it from resuming. Pause competing writers
-   while investigating; the claim's age does not establish that it is safe.
-2. Read the `stel_writer` label on `PROJECT.DATASET.stel_writer_claim`. Inspect
-   all matching jobs in every execution/billing project and location used by
-   the writer, with access to jobs submitted by its service account. Wait for
-   completion or cancel and then **confirm terminal status**. A cancellation
-   request or process exit alone is insufficient. If submission was ambiguous,
-   do not recover until outstanding submissions and jobs are accounted for.
-   Account for ambiguous metadata API requests as well; if completion cannot be
-   established, leave the claim in place.
-3. Inspect and repair target/state consistency as needed. Only after the old
-   writer cannot submit and all its jobs are terminal, manually delete that
-   dataset's `stel_writer_claim` table through the BigQuery console or API.
-4. Start a fresh process and rerun without approval first. Review the newly
-   discovered deletion fingerprint before authorizing removals.
-
-stel deliberately provides no timed or force-unlock command. Never delete a
-live claim or configure expiration on it; doing so invalidates this guarantee.
-ADR [0048](adr/0048-bigquery-writers-hold-a-non-expiring-claim.md) records the
-protocol and its recovery boundary.
 
 Guarded models cannot be full-refreshed: use an approved incremental run for
 intentional source removals. An approval cannot be combined with a source or
@@ -549,6 +526,45 @@ removals. Do not rely on a filtered run to remove obsolete sensitive content;
 run an unfiltered build after reviewing the source instead. The guard protects
 the extraction deletion decision; it does not verify source completeness or
 guarantee later models complete successfully.
+
+### BigQuery writer claim recovery
+
+On `run`, `build` and `adopt`, SIGTERM unwinds the command like Ctrl-C. stel
+stops new BigQuery submissions. Once in-flight work unwinds, claim cleanup
+attempts to cancel outstanding jobs and allows up to 10 seconds for them to
+report terminal status. It retains the claim if any job or request remains
+uncertain. A hard kill, such as an OOM kill, requires operator recovery.
+
+1. Run `stel writer-claim status --target prod`. The JSON shows the claim's
+   run ID, BigQuery creation time, hostname, PID, start time and execution
+   project. The hostname and PID describe the holder's process namespace.
+2. Stop the old writer and prevent it from resuming. Pause competing writers
+   while investigating. Use BigQuery audit records to account for all API
+   requests from the holder, including job submissions whose responses were
+   lost and table metadata requests that have no job ID. Wait for completion
+   or cancel outstanding jobs and confirm terminal status. Inspect target and
+   state consistency and repair it if needed. Leave the claim in place if any
+   request cannot be accounted for.
+3. Use `stel writer-claim release --target prod --run-id RUN_ID
+   --confirm-quiescent`. The confirmation covers the stopped writer and its
+   API requests. The command independently checks all pages of the BigQuery
+   job listing across locations in the recorded execution project and
+   requires every matching job to be `DONE`. Use credentials that can list
+   jobs submitted by all users in that project. The command checks the
+   specified claim again before deleting it.
+4. Start a fresh process and rerun without approval first. Review the newly
+   discovered deletion fingerprint before authorizing removals.
+
+For a legacy claim with missing recovery metadata, use the `stel_writer`
+label to identify its jobs in every execution project and location used by
+the holder. For an uncertain recovery attempt, also account for its claim
+update and deletion requests. After verifying the same quiescence and
+terminal-job conditions above, an operator can delete the claim through the
+BigQuery console or API. Claim age alone is insufficient evidence for release.
+
+See [ADR-0048](adr/0048-bigquery-writers-hold-a-non-expiring-claim.md) for the
+claim protocol and [ADR-0058](adr/0058-bigquery-writer-recovery-requires-quiescence.md)
+for recovery.
 
 ### Useful flags
 

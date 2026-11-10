@@ -15,6 +15,7 @@ row is next rewritten for another reason. Every restamp is appended to
 from __future__ import annotations
 
 import getpass
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,7 +69,9 @@ def adopt_project(
     resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     who = getpass.getuser()
     results: list[AdoptionResult] = []
-    with adapter:
+    claim = nullcontext() if dry_run else adapter.writer_claim()
+    connection = adapter.preflight_reads() if dry_run else adapter
+    with claim, connection:
         for model in planned:
             identity = compute_model_code_identity(
                 model, project, project_dir, resolved=resolved

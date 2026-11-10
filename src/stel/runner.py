@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from .adapters import (
     AdapterError,
@@ -766,7 +766,7 @@ def _run_in_batches(
     dag: ProjectDAG,
     selected: list[str],
     adapter: WarehouseAdapter,
-    run_one: Any,
+    run_one: Callable[[str, WarehouseAdapter], ModelRunResult],
     threads: int,
 ) -> dict[str, ModelRunResult]:
     """Run topological generations: models within a batch are independent and
@@ -777,13 +777,26 @@ def _run_in_batches(
         if len(batch) == 1:
             results_by_name[batch[0]] = run_one(batch[0], guarded)
             continue
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(threads, len(batch))
-        ) as ex:
-            futures = {ex.submit(run_one, name, guarded): name for name in batch}
-            for future in concurrent.futures.as_completed(futures):
-                results_by_name[futures[future]] = future.result()
+        results_by_name.update(_run_parallel_batch(batch, guarded, run_one, threads))
     return results_by_name
+
+
+def _run_parallel_batch(
+    batch: Sequence[str],
+    adapter: WarehouseAdapter,
+    run_one: Callable[[str, WarehouseAdapter], ModelRunResult],
+    threads: int,
+) -> dict[str, ModelRunResult]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(threads, len(batch))) as executor:
+        try:
+            futures = {executor.submit(run_one, name, adapter): name for name in batch}
+            return {
+                futures[future]: future.result()
+                for future in concurrent.futures.as_completed(futures)
+            }
+        except KeyboardInterrupt:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
 
 def _discover_sources(

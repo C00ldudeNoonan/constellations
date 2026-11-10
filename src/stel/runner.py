@@ -61,7 +61,12 @@ from .execution import transform as _transform_execution
 from .execution import usage as _usage_execution
 from .execution.deletion_guard import is_valid_approval
 from .logging_setup import REPORTER_ECHO_EXTRA
-from .manifest import capture_manifest, compute_modified_models
+from .manifest import (
+    TARGET_MANIFESTS_DIRNAME,
+    capture_manifest,
+    compute_modified_models,
+    is_target_manifest_name,
+)
 from .paths import resolve_within_project
 from .plan import (
     ModelPlan,
@@ -1695,8 +1700,32 @@ def clean_project(
                 )
             shutil.rmtree(artifact_dir)
 
+    _clean_target_manifests(target_dir)
+
     try:
         target_dir.rmdir()
     except OSError:
         pass
     return str(target_dir)
+
+
+def _clean_target_manifests(target_dir: Path) -> None:
+    """Remove the per-target manifests stel wrote, and nothing else in there.
+
+    `target/manifests/` is a name an existing project may already use for
+    something else (a warehouse path under it is valid configuration), so the
+    directory is not stel's to delete wholesale; only files named the way
+    `target_manifest_path` names them are (issue #760).
+    """
+    manifests_dir = target_dir / TARGET_MANIFESTS_DIRNAME
+    if manifests_dir.is_symlink():
+        raise RunError(f"Refusing to clean symlinked artifact {manifests_dir}.")
+    if not manifests_dir.is_dir():
+        return
+    for entry in manifests_dir.iterdir():
+        if is_target_manifest_name(entry.name) and entry.is_file() and not entry.is_symlink():
+            entry.unlink()
+    try:
+        manifests_dir.rmdir()
+    except OSError:
+        pass  # something that is not ours lives there; leave it

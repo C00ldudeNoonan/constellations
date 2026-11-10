@@ -27,8 +27,11 @@ project:
 uv add 'stel[mcp,lancedb]'
 ```
 
-The server reads `target/manifest.json`, then reads authorized rows through
-the configured warehouse adapter. It does not read `run_results.json`: how
+The server reads the manifest compiled for its `--target` (under
+`target/manifests/`), then reads authorized rows through the configured
+warehouse adapter. Each target has its own file, so a `stel run --target dev`
+does not replace what prod serves; a target that has not been compiled is
+refused with `stel compile --target <target>`. It does not read `run_results.json`: how
 current an index is comes from the serving ledger instead, for the reasons
 under [How current an index is](#how-current-an-index-is). Run the project
 before starting the server so the manifest and the relations agree:

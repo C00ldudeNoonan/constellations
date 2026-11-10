@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import fnmatch
-import json
 import logging
 import os
 import shutil
@@ -18,7 +17,6 @@ from typing import Any, cast
 from .adapters import (
     AdapterError,
     ReadPredicate,
-    ReadPredicateOperator,
     StateScope,
     SyncWatermark,
     TableContentFingerprint,
@@ -78,6 +76,7 @@ from .profile import (
     resolve_profile,
 )
 from .progress import get_reporter
+from .read_filters import parse_read_filters
 from .reprocess_guard import format_refusals, guard_reprocess
 from .search_groups import model_partition_predicates
 from .sources import SourceError, get_document_source
@@ -219,6 +218,7 @@ def run_project(
     state: Path | None = None,
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
+    new_only: bool = False,
     deletion_approvals: Mapping[str, str] | None = None,
     accept_reprocess: bool = False,
     accept_cost: bool = False,
@@ -226,6 +226,11 @@ def run_project(
     persist_manifest: bool = False,
 ) -> list[ModelRunResult]:
     """Execute selected models; CLI callers also persist the captured manifest."""
+    if new_only and (full_refresh or reprocess_all or deletion_approvals):
+        raise RunError(
+            "--new-only cannot be combined with --full-refresh, --reprocess-all, "
+            "or source deletion approval."
+        )
     _reject_conflicting_reprocess_flags(
         full_refresh=full_refresh, reprocess_all=reprocess_all
     )
@@ -282,6 +287,19 @@ def run_project(
             resolved=resolved,
         ),
     )
+    if new_only:
+        selected_names = set(selected)
+        unsupported = sorted(
+            model.name
+            for model in models
+            if model.name in selected_names
+            and (model.embed is None or model.materialization != "incremental")
+        )
+        if unsupported:
+            raise RunError(
+                "--new-only requires only incremental embed models. Unsupported: "
+                + ", ".join(unsupported)
+            )
     if deletion_approvals and not set(deletion_approvals).issubset(selected):
         raise RunError("Source deletion approval names a model outside the selection.")
     validate_warehouse_capabilities(
@@ -306,6 +324,7 @@ def run_project(
         # Either filter flag makes the whole invocation additive: absence from
         # a deliberately narrowed run is not removal (issue #417).
         subset_run = True
+    subset_run = subset_run or new_only
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )
@@ -372,6 +391,7 @@ def run_project(
             subset_run=subset_run,
             deletion_approval=(deletion_approvals or {}).get(name),
             read_predicates=read_predicates,
+            new_only=new_only,
         )
 
     started_at = datetime.now(UTC).isoformat()
@@ -393,7 +413,7 @@ def run_project(
             resolved=resolved,
             full_refresh=full_refresh,
             reprocess_all=reprocess_all,
-            accept_reprocess=accept_reprocess,
+            accept_reprocess=accept_reprocess or new_only,
             accept_cost=accept_cost,
             confirm_cost=confirm_cost,
         )
@@ -875,17 +895,6 @@ def _prepare_subset_run(
     return True
 
 
-_READ_FILTER_OPERATORS = {
-    "eq": ReadPredicateOperator.EQUAL,
-    "ne": ReadPredicateOperator.NOT_EQUAL,
-    "lt": ReadPredicateOperator.LESS_THAN,
-    "le": ReadPredicateOperator.LESS_THAN_OR_EQUAL,
-    "gt": ReadPredicateOperator.GREATER_THAN,
-    "ge": ReadPredicateOperator.GREATER_THAN_OR_EQUAL,
-    "in": ReadPredicateOperator.IN,
-}
-
-
 def _prepare_read_filter(
     read_filter: Sequence[tuple[str, str, str]],
     *,
@@ -930,35 +939,7 @@ def _prepare_read_filter(
             "materialization would replace the whole table with the slice. "
             "Unsafe: " + ", ".join(sorted(unsafe))
         )
-    predicates: list[ReadPredicate] = []
-    for column, operator_name, raw_value in read_filter:
-        operator = _READ_FILTER_OPERATORS.get(operator_name)
-        if operator is None:
-            raise RunError(
-                f"--read-filter operator '{operator_name}' is not one of "
-                f"{sorted(_READ_FILTER_OPERATORS)}"
-            )
-        value: Any
-        if operator is ReadPredicateOperator.IN:
-            try:
-                decoded = json.loads(raw_value)
-            except json.JSONDecodeError:
-                raise RunError(
-                    "--read-filter 'in' takes a JSON array of strings"
-                ) from None
-            if (
-                not isinstance(decoded, list)
-                or not decoded
-                or not all(isinstance(item, str) for item in decoded)
-            ):
-                raise RunError(
-                    "--read-filter 'in' takes a non-empty JSON array of strings"
-                )
-            value = tuple(decoded)
-        else:
-            value = raw_value
-        predicates.append(ReadPredicate(column, operator, value))
-    return tuple(predicates)
+    return parse_read_filters(read_filter)
 
 
 def _run_budget_ledger(resolved: ResolvedProfile) -> BudgetLedger | None:
@@ -1316,6 +1297,7 @@ def _run_model(
     subset_run: bool = False,
     deletion_approval: str | None = None,
     read_predicates: Sequence[ReadPredicate] = (),
+    new_only: bool = False,
 ) -> ModelRunResult:
     kind = _model_kind_label(model)
     log.info("starting %s (%s)", model.name, kind)
@@ -1481,6 +1463,7 @@ def _run_model(
             run_budget=run_budget,
             subset_run=subset_run,
             read_predicates=read_predicates,
+            new_only=new_only,
         )
     elif model.llm is not None:
         result = _run_llm_model(

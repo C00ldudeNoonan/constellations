@@ -302,13 +302,13 @@ def test_overlap_publishes_prior_window_when_next_preparation_fails(
     publications = 0
 
     def fail_second_reuse(
-        self: _EmbeddingReuseReader, text_hashes: Sequence[str]
+        self: _EmbeddingReuseReader, text_hashes: Sequence[str], **kwargs: Any
     ) -> dict[str, dict[str, Any]]:
         nonlocal lookups
         lookups += 1
         if lookups == 2:
             raise ValueError("reuse failed")
-        return original_rows_for(self, text_hashes)
+        return original_rows_for(self, text_hashes, **kwargs)
 
     def count_publication(self: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal publications
@@ -1206,7 +1206,9 @@ def _layout_target(tmp_path: Path) -> Iterator[Any]:
         yield adapter
 
 
-def _layout_reader(adapter: Any, pruning: LayoutPruningColumns) -> Any:
+def _layout_reader(
+    adapter: Any, pruning: LayoutPruningColumns, **kwargs: Any
+) -> Any:
     from stel.config.model import EmbedConfig
     from stel.execution.embed import _EmbeddingReuseReader
     from stel.timing import PhaseTimings
@@ -1224,6 +1226,7 @@ def _layout_reader(adapter: Any, pruning: LayoutPruningColumns) -> Any:
         config_hash="g",
         pruning=pruning,
         timings=PhaseTimings(),
+        **kwargs,
     )
 
 
@@ -1276,6 +1279,37 @@ def test_a_reuse_lookup_is_scoped_to_the_layout_of_the_rows_it_fetches(
             ),
             ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL", "MSFT")),
         ]
+
+
+def test_scoped_reuse_reads_only_the_windows_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #761: an older content match must not widen the vector read."""
+    from stel.adapters import ReadPredicate, ReadPredicateOperator
+
+    cutoff = ReadPredicate(
+        "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 2, 1)
+    )
+    with _layout_target(tmp_path) as adapter:
+        captured = _capture_predicates(adapter, monkeypatch)
+        reader = _layout_reader(
+            adapter,
+            LayoutPruningColumns("filing_date", ("symbol",)),
+            read_predicates=(cutoff,),
+        )
+        found = reader.rows_for(
+            ["ha", "hb", "hc"],
+            upstream_rows=[{"filing_date": date(2026, 3, 1), "symbol": "AAPL"}],
+        )
+
+    assert set(found) == {"hc"}
+    key_scan, lookup = captured
+    assert key_scan == (cutoff,)
+    assert ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("b", "c")) in lookup
+    assert ReadPredicate(
+        "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 3, 1)
+    ) in lookup
+    assert ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)) in lookup
 
 
 def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(

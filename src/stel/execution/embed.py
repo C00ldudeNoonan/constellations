@@ -102,6 +102,7 @@ def run_embed_model(
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
+    new_only: bool = False,
 ) -> ModelRunResult:
     """Run the model, keeping its timings even if it fails.
 
@@ -123,6 +124,7 @@ def run_embed_model(
             run_budget=run_budget,
             subset_run=subset_run,
             read_predicates=read_predicates,
+            new_only=new_only,
             timings=timings,
         )
     except RunError as error:
@@ -143,6 +145,7 @@ def _run_embed_model(
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
+    new_only: bool,
     timings: PhaseTimings,
 ) -> ModelRunResult:
     assert model.embed is not None
@@ -213,9 +216,14 @@ def _run_embed_model(
     rebuild_target = is_incremental and model.name not in existing_tables
     processed_state = (
         adapter.fetch_state(state_scope)
-        if is_incremental and not rebuild_target
+        if is_incremental and (not rebuild_target or new_only)
         else {}
     )
+    if new_only and rebuild_target and processed_state:
+        raise RunError(
+            f"Embed model '{model.name}': --new-only requires the existing target "
+            "when state rows exist. Restore the target or run a full rebuild."
+        )
     # The target is never loaded whole. The previous shape read every row --
     # vectors included -- into Python dicts before any embedding began, which
     # is ~25KB per 768-dim row: at 3.6M chunks that is ~90GB spent before the
@@ -231,6 +239,7 @@ def _run_embed_model(
             config_hash=identity.config_hash,
             pruning=layout_pruning,
             timings=timings,
+            read_predicates=read_predicates,
         )
         if is_incremental and not rebuild_target
         else None
@@ -280,7 +289,7 @@ def _run_embed_model(
     # consumed one page at a time, so a run that removes the whole corpus
     # holds a page rather than the corpus (PR #457 review).
     reconcile_removals = (
-        not subset_run and is_incremental and not rebuild_target
+        not (subset_run or new_only) and is_incremental and not rebuild_target
     )
     removals_in_warehouse = warehouse_key_cast_matches_python(
         schema_probe.schema[config.id_field]
@@ -316,6 +325,9 @@ def _run_embed_model(
     def _window(record_id: str, record: dict[str, Any]) -> _EmbedWork | None:
         """Decide this record's fate without holding anything corpus-sized."""
         nonlocal skipped, cache_hits
+        if new_only and record_id in processed_state:
+            skipped += 1
+            return None
         text_value = record[config.text_field]
         text = "" if text_value is None else str(text_value)
         input_fingerprint = embed_input_fingerprint(record)
@@ -367,7 +379,10 @@ def _run_embed_model(
         wanting = [item for item in window if item.vector is None]
         if not wanting:
             return
-        window_reuse = reuse_reader.rows_for([item.text_hash for item in wanting])
+        window_reuse = reuse_reader.rows_for(
+            [item.text_hash for item in wanting],
+            upstream_rows=[item.record for item in wanting] if read_predicates else (),
+        )
         for item in wanting:
             existing = window_reuse.get(item.text_hash)
             if (
@@ -1129,7 +1144,8 @@ class _EmbeddingReuseReader:
       boilerplate under another symbol), so predicates built from the
       window's values would prune away exactly the rows reuse exists to
       find. Built from the rows being fetched, the predicates cannot exclude
-      one. No layout, no predicates, the read as it was.
+      one in an unfiltered run. A filtered run deliberately limits reuse to
+      the same slice and to the layout bounds available from the input window.
 
     The target is mutable by design: every successful window publishes before
     the next lookup. A BigQuery query result is immutable, but eventually
@@ -1149,6 +1165,7 @@ class _EmbeddingReuseReader:
         config_hash: str,
         pruning: LayoutPruningColumns,
         timings: PhaseTimings,
+        read_predicates: Sequence[ReadPredicate] = (),
     ) -> None:
         self._adapter = adapter
         self._table = table
@@ -1163,6 +1180,7 @@ class _EmbeddingReuseReader:
             "embedded_at",
         )
         self._pruning = pruning
+        self._read_predicates = tuple(read_predicates)
         self._usable = False
         self._target_keys: dict[str, Any] = {}
         # One representative typed id per distinct text hash, indexed only
@@ -1199,6 +1217,10 @@ class _EmbeddingReuseReader:
         if not set(self._columns).issubset(names):
             # A pre-embed table (or an older contract) has nothing to reuse;
             # the old whole-table loader answered {} here too.
+            return
+        if any(predicate.column not in names for predicate in self._read_predicates):
+            # An older target without a filter column cannot provide scoped
+            # reuse. The provider or response cache can still supply vectors.
             return
         # The layout is declared on the model and the predicates run against
         # the target, so a layout column the target does not have (declared
@@ -1239,6 +1261,7 @@ class _EmbeddingReuseReader:
                     *self._pruning.columns,
                 ],
                 batch_size=100_000,
+                predicate=self._read_predicates or None,
             ) as snapshot:
                 for batch in snapshot:
                     self._index_batch(
@@ -1318,7 +1341,12 @@ class _EmbeddingReuseReader:
     # fails before embedding begins.
     _LOOKUP_KEYS_PER_READ = 10_000
 
-    def rows_for(self, text_hashes: Sequence[str]) -> dict[str, dict[str, Any]]:
+    def rows_for(
+        self,
+        text_hashes: Sequence[str],
+        *,
+        upstream_rows: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, dict[str, Any]]:
         """Reuse rows for the window's text hashes, keyed by text hash.
 
         Keyed by content on both ends: the caller asks by text hash and is
@@ -1357,35 +1385,53 @@ class _EmbeddingReuseReader:
                 "not hold, without reading the vector column",
                 unknown,
             )
+        # A scoped run trades reuse outside the current window for bounded
+        # vector reads. The key scan is scoped too, so an out-of-scope duplicate
+        # cannot shadow a representative inside the run's filter.
+        window_predicates = (
+            layout_pruning_predicates(self._pruning, upstream_rows, exclude=self._id_field)
+            if upstream_rows
+            else ()
+        )
         found: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(typed), self._LOOKUP_KEYS_PER_READ):
             chunk = typed[offset : offset + self._LOOKUP_KEYS_PER_READ]
             found.update(
-                self._retry_snapshot_read(partial(self._read_rows_for_chunk, chunk))
+                self._retry_snapshot_read(
+                    partial(self._read_rows_for_chunk, chunk, window_predicates)
+                )
             )
         return found
 
     def _read_rows_for_chunk(
-        self, chunk: Sequence[tuple[Any, tuple[Any, ...]]]
+        self,
+        chunk: Sequence[tuple[Any, tuple[Any, ...]]],
+        window_predicates: Sequence[ReadPredicate],
     ) -> dict[str, dict[str, Any]]:
         # Still predicated on the id column, not on `embedding_input_hash`:
         # the id is what the index resolved to, and keeping the predicate on
         # it means no adapter learns a second keyed-read shape. The hash is
         # the *lookup* key; the id is how the row is fetched.
         layout_columns = self._pruning.columns
+        target_predicates = layout_pruning_predicates(
+            self._pruning,
+            [dict(zip(layout_columns, layout, strict=True)) for _, layout in chunk],
+            exclude=self._id_field,
+        )
+        window_columns = {predicate.column for predicate in window_predicates}
         predicates = [
             ReadPredicate(
                 self._id_field,
                 ReadPredicateOperator.IN,
                 tuple(key for key, _ in chunk),
             ),
-            # Per chunk, not per window: a chunk's own range and value lists
-            # are at most as wide as the window's.
-            *layout_pruning_predicates(
-                self._pruning,
-                [dict(zip(layout_columns, layout, strict=True)) for _, layout in chunk],
-                exclude=self._id_field,
+            *(
+                predicate
+                for predicate in target_predicates
+                if predicate.column not in window_columns
             ),
+            *window_predicates,
+            *self._read_predicates,
         ]
         found: dict[str, dict[str, Any]] = {}
         # Credited whole -- open, pull, and the dict build -- where the

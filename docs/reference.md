@@ -875,14 +875,31 @@ embed, chunk or incremental transform model it reports, from the data and
   A row whose only change is the model's `code_version` is `stel plan`'s
   business, not this count.
 
+Pass `--read-filter FIELD OP VALUE` to scope the pending report. Repeat the
+option to combine predicates with AND. The same filters apply to the new-row
+count and the optional changed-row scan or dry-run estimate. The report leaves
+`deleted_rows` null because a filtered run defers deletion reconciliation.
+
+```bash
+stel plan --pending --dry-run --select document_embeddings --read-filter filing_date ge 2026-10-01
+stel run --new-only --select document_embeddings --read-filter filing_date ge 2026-10-01
+```
+
+`stel run --new-only` processes keys with no state row in selected incremental
+embed models. It skips keys with state even if their input fingerprint or code
+version changed, and defers deletions and the sync watermark to a normal run.
+A missing target with existing state requires recovery before using this mode.
+`--new-only` is incompatible with `--full-refresh`, `--reprocess-all`,
+`--watch`, and deletion approvals.
+
 Any other kind reports `unsupported`; an upstream that does not exist yet
 reports `upstream_missing`. The exit code is **3** when any model has pending
 rows and **0** when none do (1 is an error), so a sensor can branch without
 parsing. `--dry-run` reads nothing, so it exits 0 whatever is waiting, and
 `upstream_missing` and `unsupported` models are not pending; read the `status`
 in the JSON when that distinction matters. `--json` prints `target/pending.json` (`schema_version: 1`).
-`--dry-run` reads nothing and, on BigQuery, prints the bytes the two
-statements would bill; DuckDB does not bill by bytes, so it reports null.
+`--dry-run` reads nothing and, on BigQuery, prints the warehouse's byte estimate for the pending report queries. DuckDB
+does not bill by bytes, so it reports null.
 
 ### Refusing to spend: `on_code_change`
 
@@ -1944,7 +1961,7 @@ columns across the whole target, so on a table whose MERGE was already cheap it
 is the visible cost: a few hundred MiB on the SEC table against the 4.45 GiB it
 replaces.
 
-**The reuse read is scoped to the rows it fetches.** The embed resume
+**Unfiltered reuse reads are scoped to the target rows they fetch.** The embed resume
 resolves each window's text to target rows in memory, then fetches those rows
 by id. Its layout predicates come from *those rows'* values, read once in the
 same key pass as the ids, not from the window's: reuse is keyed by text, so a
@@ -1955,6 +1972,13 @@ rows they cannot exclude one, so no guard is needed. A layout column the
 target does not have (declared after the table was built) is dropped from the
 lookup rather than failing it. A `DATETIME` layout column is bound as
 `DATETIME`, not as the `TIMESTAMP` a Python `datetime` otherwise binds as.
+
+**With `--read-filter`, warehouse reuse stays inside the slice.** The target
+key scan uses the same filters. Each vector read also uses the current
+window's partition range and distinct clustering values wherever the window
+can supply those bounds. A matching vector outside those bounds can trigger
+a provider call if the local response cache has no copy. An older target
+missing a filter column cannot serve scoped warehouse reuse.
 
 **An `embed:` model reads its upstream in layout order** (issue #749). The
 batch's own values prune only as far as the batch is *local* in them, and an

@@ -37,16 +37,19 @@ from typing import Any, Literal
 import polars as pl
 
 from .adapters import AdapterError, StateScope, WarehouseAdapter, create_adapter
-from .adapters.base import PendingUpstreamRequest
+from .adapters.base import PendingUpstreamRequest, ReadPredicate
+from .adapters.pending import estimate_table_read_bytes, pending_upstream
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config.loader import load_project
 from .config.model import ModelConfig
 from .dag import parse_ref
+from .execution import RunError
 from .execution.chunk import chunk_input_hash
 from .execution.embed import embed_input_fingerprint
 from .execution.warehouse import warehouse_options
 from .plan import PlanError
 from .profile import resolve_profile
+from .read_filters import parse_read_filters
 from .transforms.runner import load_incremental_contract
 from .vocabulary_sources import resolve_warehouse_vocabularies
 
@@ -216,6 +219,7 @@ def _pending_for_model(
     adapter: WarehouseAdapter,
     dry_run: bool,
     include_changed: bool,
+    predicates: tuple[ReadPredicate, ...],
 ) -> ModelPending:
     kind = model.kind_label()
     if not adapter.relation_exists(source.upstream):
@@ -229,6 +233,12 @@ def _pending_for_model(
         )
     schema = adapter.read_table_schema(source.upstream)
     available = set(schema.columns)
+    missing_filters = sorted({predicate.column for predicate in predicates} - available)
+    if missing_filters:
+        raise PlanError(
+            f"Model '{model.name}': --read-filter column(s) {', '.join(missing_filters)} "
+            f"are not in upstream '{source.upstream}'. Available: {sorted(available)}"
+        )
     if source.key_column not in available:
         raise PlanError(
             f"Model '{model.name}': upstream '{source.upstream}' has no "
@@ -254,7 +264,8 @@ def _pending_for_model(
         (column for column in layout.membership_columns if column in available),
         None,
     )
-    summary = adapter.pending_upstream(
+    summary = pending_upstream(
+        adapter,
         PendingUpstreamRequest(
             scope=StateScope(model.name),
             upstream=source.upstream,
@@ -262,6 +273,7 @@ def _pending_for_model(
             partition_column=partition,
             cluster_column=cluster,
         ),
+        predicates=predicates,
         dry_run=dry_run,
     )
     identity: dict[str, Any] = {
@@ -275,7 +287,7 @@ def _pending_for_model(
         changed_reason = TRANSFORM_CHANGED_REASON
     full_scan = include_changed and source.fingerprint is not None
     scan_bytes = (
-        adapter.estimate_query_bytes(f"SELECT * FROM {adapter.table_ref(source.upstream)}", [])
+        estimate_table_read_bytes(adapter, source.upstream, predicates)
         if full_scan and dry_run
         else None
     )
@@ -293,26 +305,26 @@ def _pending_for_model(
             changed_reason=changed_reason,
         )
     changed_rows = (
-        _count_changed(model, source, adapter=adapter) if full_scan else None
+        _count_changed(model, source, adapter=adapter, predicates=predicates)
+        if full_scan
+        else None
     )
-    # A run deletes state (and the rows it published) for upstream rows that
-    # are gone, so removals are work too.
+    # Unfiltered runs reconcile removed rows, so deletions are work too.
     pending = summary.new_rows > 0 or summary.deleted_rows > 0 or bool(changed_rows)
+    reason = _pending_reason(summary.new_rows, summary.deleted_rows, changed_rows)
+    if not pending and not predicates:
+        reason = "every upstream key has a state row and no state row is orphaned"
     return ModelPending(
         model.name,
         kind,
         "pending" if pending else "none",
-        (
-            _pending_reason(summary.new_rows, summary.deleted_rows, changed_rows)
-            if pending
-            else "every upstream key has a state row and no state row is orphaned"
-        ),
+        reason,
         **identity,
         new_rows=summary.new_rows,
         partition_min=_render(summary.partition_min),
         partition_max=_render(summary.partition_max),
         cluster_distinct=summary.cluster_distinct,
-        deleted_rows=summary.deleted_rows,
+        deleted_rows=None if predicates else summary.deleted_rows,
         estimated_bytes=summary.estimated_bytes,
         changed_rows=changed_rows,
         changed_reason=changed_reason,
@@ -329,16 +341,22 @@ def _pending_reason(new_rows: int, deleted_rows: int, changed_rows: int | None) 
 
 
 def _count_changed(
-    model: ModelConfig, source: PendingSource, *, adapter: WarehouseAdapter
+    model: ModelConfig,
+    source: PendingSource,
+    *,
+    adapter: WarehouseAdapter,
+    predicates: tuple[ReadPredicate, ...],
 ) -> int:
     """Rows whose state fingerprint differs from the one the row hashes to now.
 
-    Streams the whole upstream, one batch at a time; the state is read whole,
-    which the runners do too. Keys with no state row are `new`, not `changed`."""
+    Streams matching upstream rows one batch at a time. The state is read
+    whole, which the runners do too. Keys with no state row are `new`, not `changed`."""
     assert source.fingerprint is not None
     state = adapter.fetch_state(StateScope(model.name))
     changed = 0
-    with adapter.table_snapshot(source.upstream, batch_size=_SCAN_BATCH_ROWS) as snapshot:
+    with adapter.table_snapshot(
+        source.upstream, batch_size=_SCAN_BATCH_ROWS, predicate=predicates
+    ) as snapshot:
         for batch in snapshot:
             frame = pl.from_arrow(batch)
             assert isinstance(frame, pl.DataFrame)
@@ -356,6 +374,7 @@ def pending_models(
     adapter: WarehouseAdapter,
     dry_run: bool,
     include_changed: bool,
+    predicates: tuple[ReadPredicate, ...] = (),
 ) -> list[ModelPending]:
     results: list[ModelPending] = []
     for model in planned:
@@ -373,6 +392,7 @@ def pending_models(
                     adapter=adapter,
                     dry_run=dry_run,
                     include_changed=include_changed,
+                    predicates=predicates,
                 )
             )
         except AdapterError as error:
@@ -389,11 +409,16 @@ def pending_project(
     profiles_dir: Path | None,
     dry_run: bool,
     include_changed: bool,
+    read_filter: tuple[tuple[str, str, str], ...] = (),
 ) -> PendingReport:
     """Report pending upstream rows for every selected model.
 
     Same preflight as `plan` and `run`, so a bad configuration fails here with
     the message it would fail a run with."""
+    try:
+        predicates = parse_read_filters(read_filter)
+    except (AdapterError, RunError) as error:
+        raise PlanError(str(error)) from error
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     resolved = resolve_profile(
@@ -412,6 +437,7 @@ def pending_project(
             adapter=adapter,
             dry_run=dry_run,
             include_changed=include_changed,
+            predicates=predicates,
         )
     warehouse = resolved.warehouse
     return PendingReport(

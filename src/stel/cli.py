@@ -1084,6 +1084,13 @@ def _model_kind(model: ModelConfig) -> str:
         "with --dry-run."
     ),
 )
+@click.option(
+    "--read-filter",
+    multiple=True,
+    nargs=3,
+    metavar="FIELD OP VALUE",
+    help="With --pending: report only matching upstream rows. Omits deletion counts.",
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -1096,6 +1103,7 @@ def plan(
     pending: bool,
     dry_run: bool,
     include_changed: bool,
+    read_filter: tuple[tuple[str, str, str], ...],
     verbose: int,
     diagnostics_file: Path | None,
 ) -> None:
@@ -1111,6 +1119,8 @@ def plan(
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
     _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=json_output)
+    if read_filter and not pending:
+        raise click.UsageError("--read-filter applies to --pending only.")
     if (dry_run or include_changed) and not pending:
         raise click.UsageError("--dry-run and --include-changed apply to --pending only.")
     if pending:
@@ -1125,6 +1135,7 @@ def plan(
                 profiles_dir=profiles_dir,
                 dry_run=dry_run,
                 include_changed=include_changed,
+                read_filter=read_filter,
             )
         except _CONFIG_ERRORS as e:
             raise ConfigClickError(str(e)) from e
@@ -1431,6 +1442,11 @@ def _confirm_cost(projection: CostProjection) -> bool:
     help="Approve a reviewed guarded source-deletion snapshot (repeatable).",
 )
 @click.option(
+    "--new-only",
+    is_flag=True,
+    help="Process only keys without a state row in selected incremental embed models.",
+)
+@click.option(
     "--read-filter",
     "read_filter",
     multiple=True,
@@ -1466,6 +1482,7 @@ def run(
     source_filter: tuple[str, ...],
     deletion_approval_args: tuple[str, ...],
     read_filter: tuple[tuple[str, str, str], ...],
+    new_only: bool,
     json_output: bool,
     verbose: int,
     diagnostics_file: Path | None,
@@ -1475,6 +1492,8 @@ def run(
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
     deletion_approvals = _parse_deletion_approvals(deletion_approval_args)
+    if watch and new_only:
+        raise click.UsageError("--new-only cannot be combined with --watch.")
     if watch and deletion_approvals:
         raise click.UsageError("Source deletion approval cannot be used with --watch.")
     # `run --threads N` executes independent models concurrently, each with its
@@ -1526,6 +1545,7 @@ def run(
             state=state,
             source_filter=source_filter,
             read_filter=read_filter,
+            new_only=new_only,
             deletion_approvals=deletion_approvals,
             accept_reprocess=accept_reprocess,
             accept_cost=accept_cost,

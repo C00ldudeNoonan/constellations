@@ -302,13 +302,13 @@ def test_overlap_publishes_prior_window_when_next_preparation_fails(
     publications = 0
 
     def fail_second_reuse(
-        self: _EmbeddingReuseReader, text_hashes: Sequence[str]
+        self: _EmbeddingReuseReader, text_hashes: Sequence[str], **kwargs: Any
     ) -> dict[str, dict[str, Any]]:
         nonlocal lookups
         lookups += 1
         if lookups == 2:
             raise ValueError("reuse failed")
-        return original_rows_for(self, text_hashes)
+        return original_rows_for(self, text_hashes, **kwargs)
 
     def count_publication(self: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal publications
@@ -1179,7 +1179,9 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
 
 
 @contextmanager
-def _layout_target(tmp_path: Path) -> Iterator[Any]:
+def _layout_target(
+    tmp_path: Path, *, hashes: tuple[str, str, str] = ("ha", "hb", "hc")
+) -> Iterator[Any]:
     """A DuckDB embed target with two layout columns beside the reuse columns:
     DuckDB has no layout of its own, so the pruning is handed to the reader
     directly, and DuckDB executes the predicates for real."""
@@ -1196,7 +1198,7 @@ def _layout_target(tmp_path: Path) -> Iterator[Any]:
                     "chunk_id": ["a", "b", "c"],
                     "filing_date": [date(2026, 1, 5), date(2026, 2, 9), date(2026, 3, 1)],
                     "symbol": ["AAPL", "MSFT", "AAPL"],
-                    "embedding_input_hash": ["ha", "hb", "hc"],
+                    "embedding_input_hash": list(hashes),
                     "embedding_config_hash": ["g", "g", "g"],
                     "embedding": [[0.1], [0.2], [0.3]],
                     "embedded_at": ["t", "t", "t"],
@@ -1206,7 +1208,9 @@ def _layout_target(tmp_path: Path) -> Iterator[Any]:
         yield adapter
 
 
-def _layout_reader(adapter: Any, pruning: LayoutPruningColumns) -> Any:
+def _layout_reader(
+    adapter: Any, pruning: LayoutPruningColumns, **kwargs: Any
+) -> Any:
     from stel.config.model import EmbedConfig
     from stel.execution.embed import _EmbeddingReuseReader
     from stel.timing import PhaseTimings
@@ -1224,6 +1228,7 @@ def _layout_reader(adapter: Any, pruning: LayoutPruningColumns) -> Any:
         config_hash="g",
         pruning=pruning,
         timings=PhaseTimings(),
+        **kwargs,
     )
 
 
@@ -1276,6 +1281,61 @@ def test_a_reuse_lookup_is_scoped_to_the_layout_of_the_rows_it_fetches(
             ),
             ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL", "MSFT")),
         ]
+
+
+def test_scoped_reuse_reads_only_the_windows_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #761: an older content match must not widen the vector read."""
+    from stel.adapters import ReadPredicate, ReadPredicateOperator
+
+    cutoff = ReadPredicate(
+        "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 2, 1)
+    )
+    with _layout_target(tmp_path) as adapter:
+        captured = _capture_predicates(adapter, monkeypatch)
+        reader = _layout_reader(
+            adapter,
+            LayoutPruningColumns("filing_date", ("symbol",)),
+            read_predicates=(cutoff,),
+        )
+        found = reader.rows_for(
+            ["ha", "hb", "hc"],
+            upstream_rows=[{"filing_date": date(2026, 3, 1), "symbol": "AAPL"}],
+        )
+
+    assert set(found) == {"hc"}
+    key_scan, lookup = captured
+    assert key_scan == (cutoff,)
+    assert ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("c",)) in lookup
+    assert ReadPredicate(
+        "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 3, 1)
+    ) in lookup
+    assert ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)) in lookup
+
+
+def test_scoped_reuse_selects_a_duplicate_inside_each_window(tmp_path: Path) -> None:
+    """Issue #761: a copy in another layout must not shadow an in-window copy."""
+    from stel.adapters import ReadPredicate, ReadPredicateOperator
+
+    cutoff = ReadPredicate(
+        "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 2, 1)
+    )
+    with _layout_target(tmp_path, hashes=("ha", "shared", "shared")) as adapter:
+        reader = _layout_reader(
+            adapter,
+            LayoutPruningColumns("filing_date", ("symbol",)),
+            read_predicates=(cutoff,),
+        )
+        for expected, symbol, bounds in (
+            ("b", "MSFT", (date(2026, 2, 8), date(2026, 2, 10))),
+            ("c", "AAPL", (date(2026, 3, 1),)),
+        ):
+            found = reader.rows_for(
+                ["shared"],
+                upstream_rows=[{"filing_date": day, "symbol": symbol} for day in bounds],
+            )
+            assert found["shared"]["chunk_id"] == expected
 
 
 def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(

@@ -21,6 +21,12 @@
   <target>` once per served target, since a manifest written before this release has no
   per-target copy.
 
+- Scoped embedding runs limit warehouse vector reuse to the filtered slice
+  and the window's layout bounds (issue #761). Use `stel run --new-only`
+  to catch up incremental embed keys that have no state row, and
+  `stel plan --pending --read-filter FIELD OP VALUE` to measure the slice
+  before running it.
+
 ## v0.26.0 - 2026-11-09
 
 - A project can declare a segmented search group (ADR-0037, issue #771). `search_groups:`

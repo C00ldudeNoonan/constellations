@@ -131,6 +131,7 @@ def test_a_key_type_whose_text_differs_by_warehouse_is_unsupported(tmp_path: Pat
             adapter=adapter,
             dry_run=False,
             include_changed=False,
+            predicates=(),
         )
 
     assert result.status == "unsupported"

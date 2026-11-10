@@ -19,7 +19,9 @@ from typing import Any
 
 import duckdb
 import pytest
+from click.testing import CliRunner
 
+from stel.cli import cli
 from stel.execution.contracts import RunError
 from stel.runner import run_project
 
@@ -140,6 +142,44 @@ def test_read_filter_embeds_only_the_slice_and_deletes_nothing(
         '"db".docs.document_embeddings) AND title = \'Release 3\'',
     )
     assert revised  # still present, still the old vector's row
+
+
+def test_new_only_publishes_missing_keys_and_preserves_stale_and_removed_rows(
+    tmp_path: Path,
+) -> None:
+    """Issue #761: a backlog run must not reprocess or reconcile existing state."""
+    project = _project(tmp_path)
+    run_project(project)
+    _mutate(
+        project,
+        "UPDATE docs.document_chunks SET text = 'changed' WHERE title = 'Release 1'",
+    )
+    _mutate(project, "DELETE FROM docs.document_chunks WHERE title = 'Release 4'")
+    _mutate(
+        project,
+        "INSERT INTO docs.document_chunks SELECT * REPLACE "
+        "('new-key' AS chunk_id, 'New' AS title, 'new text' AS text) "
+        "FROM docs.document_chunks WHERE title = 'Release 2'",
+    )
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir", str(project), "run", "--select", "document_embeddings",
+            "--new-only",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert _query(
+        project, "SELECT text FROM docs.document_embeddings WHERE title = 'Release 1'"
+    ) == [("body text 1",)]
+    assert _embedded_titles(project) == {f"Release {i}" for i in range(DOCUMENTS)} | {"New"}
+
+    # The unfiltered mode still sees the deferred change and removal.
+    [normal] = run_project(project, select="document_embeddings")
+    assert normal.documents_deleted == 1
+    assert _query(
+        project, "SELECT text FROM docs.document_embeddings WHERE title = 'Release 1'"
+    ) == [("changed",)]
 
 
 def test_the_next_unfiltered_run_settles_what_the_slice_deferred(

@@ -145,6 +145,22 @@ def test_a_run_over_the_threshold_refuses_before_any_provider_call(
     assert "`--accept-cost`" in message
 
 
+def test_new_only_does_not_price_existing_state_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #761: a new-only run skips stale rows even above the cost threshold."""
+    project = _project(tmp_path)
+    _change_embedding_model(project)
+    provider = _Provider(monkeypatch)
+
+    (result,) = run_project(project, select="document_embeddings", new_only=True)
+
+    assert not result.errors
+    assert result.documents_processed == 0
+    assert result.documents_skipped == 3
+    assert provider.texts == []
+
+
 def test_the_prompt_sees_the_projection_and_its_answer_decides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from stel.adapters import create_adapter
+from stel.adapters import StateRecord, StateScope, create_adapter
 from stel.cli import cli
 from stel.config.loader import load_project
 from stel.pending import CHANGED_REASON, PENDING_SCHEMA_VERSION
@@ -128,6 +128,36 @@ def test_include_changed_counts_rows_whose_input_fingerprint_moved(
     assert code == 0
     assert report["models"][0]["changed_rows"] is None
     assert "--include-changed" in report["models"][0]["changed_reason"]
+
+
+def test_pending_read_filter_counts_only_the_slice(rag_project: Path) -> None:
+    """Issue #761: the filter applies to new and changed rows, and omits deletions."""
+    run_project(rag_project)
+    project, _, _ = load_project(rag_project)
+    resolved = resolve_profile(project, rag_project, target=None, profiles_dir=None)
+    with create_adapter(resolved.warehouse, project_dir=rag_project) as adapter:
+        state = f"{adapter.schema_ref}.{adapter.quote_ident('stel_state')}"
+        scope = f"{state} WHERE model_name = 'chunk_embeddings'"
+        [(first, last)] = adapter.rows(f"SELECT MIN(record_key), MAX(record_key) FROM {scope}")
+        assert first != last
+        adapter.execute(f"DELETE FROM {scope} AND record_key = ?", [first])
+        adapter.execute(
+            f"UPDATE {state} SET input_fingerprint = 'stale' "
+            "WHERE model_name = 'chunk_embeddings' AND record_key = ?", [last]
+        )
+        adapter.upsert_state(
+            StateScope("chunk_embeddings"), [StateRecord("missing", "fingerprint", "version")]
+        )
+
+    for key, expected in [(first, (1, 0)), (last, (0, 1))]:
+        code, report = _pending(
+            rag_project, "--select", "chunk_embeddings", "--include-changed",
+            "--read-filter", "chunk_id", "eq", key,
+        )
+        assert code == 3
+        (model,) = report["models"]
+        assert (model["new_rows"], model["changed_rows"]) == expected
+        assert model["deleted_rows"] is None
 
 
 def test_include_changed_agrees_with_the_chunk_runner_fingerprint(

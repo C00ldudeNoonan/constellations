@@ -56,6 +56,7 @@ from stel.adapters.base import (
     SERVING_LEDGER_TABLE,
     STATE_TABLE,
     TEST_FAILURES_TABLE_PREFIX,
+    PendingUpstreamRequest,
     WarehouseIdentity,
 )
 from stel.adapters.bigquery import (
@@ -6519,6 +6520,49 @@ def test_integration_ordered_snapshot_arrives_in_order() -> None:
         adapter._reset_storage_for_test()
 
 
+def test_scoped_pending_dry_run_binds_bigquery_layout_types() -> None:
+    """Issue #761: price one filtered query with the snapshot's bound parameters."""
+    from stel.adapters.pending import pending_upstream
+
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = [
+        "context_id",
+        "symbol",
+        SimpleNamespace(name="filing_date", field_type="DATE", mode="NULLABLE"),
+    ]
+    client.tables[f"proj.ds.{STATE_TABLE}"] = _STATE_V2_SCHEMA
+    client.query_results = [_FakeJob(total_bytes_processed=42)]
+    adapter = _adapter(client)
+    predicates = (
+        ReadPredicate("filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, "2026-03-01"),
+        ReadPredicate("symbol", ReadPredicateOperator.IN, ("BBB", "CCC")),
+    )
+    summary = pending_upstream(
+        adapter,
+        PendingUpstreamRequest(
+            scope=StateScope("embeddings"),
+            upstream="chunks",
+            key_column="context_id",
+        ),
+        predicates=predicates,
+        dry_run=True,
+    )
+    assert summary.estimated_bytes == 42
+    [(sql, config)] = client.queries
+    assert config.dry_run
+    assert "CAST(up." in sql and "SELECT *" not in sql
+    assert "AND " + adapter.quote_ident("filing_date") + " >= ?" in sql
+    assert "AND " + adapter.quote_ident("symbol") + " IN UNNEST(?)" in sql
+    model, stage, target, day, symbols = config.query_parameters
+    # CLI values reach the snapshot as strings. BigQuery coerces the date
+    # parameter to the type of the column it is compared with.
+    assert (day.type_, day.value) == ("STRING", "2026-03-01")
+    assert (symbols.array_type, symbols.values) == ("STRING", ["BBB", "CCC"])
+    assert [param.value for param in (model, stage, target)] == [
+        "embeddings", "materialization", "warehouse-v1",
+    ]
+
+
 @pytest.mark.skipif(
     not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
 )
@@ -6528,7 +6572,7 @@ def test_integration_pending_upstream_counts_keys_without_state() -> None:
     from datetime import date as date_type
 
     from stel.adapters import StateRecord, StateScope
-    from stel.adapters.base import PendingUpstreamRequest
+    from stel.adapters.pending import pending_upstream
 
     cfg = parse_warehouse_config(
         {
@@ -6574,5 +6618,20 @@ def test_integration_pending_upstream_counts_keys_without_state() -> None:
             assert (summary.new_rows, summary.deleted_rows) == (2, 1)
             assert summary.partition_min == date_type(2026, 2, 1)
             assert summary.cluster_distinct == 1
+            scoped = pending_upstream(
+                adapter,
+                PendingUpstreamRequest(
+                    scope=scope,
+                    upstream="chunks",
+                    key_column="context_id",
+                    partition_column="filing_date",
+                ),
+                predicates=(
+                    ReadPredicate("filing_date", ReadPredicateOperator.GREATER_THAN, "2026-02-01"),
+                ),
+                dry_run=False,
+            )
+            assert (scoped.new_rows, scoped.deleted_rows) == (1, 0)
+            assert scoped.partition_min == date_type(2026, 3, 1)
     finally:
         adapter._reset_storage_for_test()

@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from faker import Faker
+from .words import SyntheticText
 
 _CURRENCIES = ["USD", "EUR", "GBP", "CAD"]
 
@@ -15,9 +15,8 @@ def generate_invoice_texts(count: int, output_dir: Path, seed: int = 42) -> list
     These are plaintext paragraphs (not JSON) — meant to exercise an LLM
     extraction backend that needs to recover structured fields from prose.
     """
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -25,7 +24,7 @@ def generate_invoice_texts(count: int, output_dir: Path, seed: int = 42) -> list
         vendor = fake.company()
         billed_to = fake.company()
         invoice_id = f"INV-{i:05d}"
-        date = fake.date_between(start_date="-1y", end_date="today").isoformat()
+        date = fake.recent_date()
         currency = rng.choice(_CURRENCIES)
         line_items: list[dict[str, Any]] = [
             {

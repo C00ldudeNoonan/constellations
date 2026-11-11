@@ -4,9 +4,8 @@ import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from faker import Faker
-
 from ..optional_dependencies import import_optional_dependency
+from .words import SYNTHETIC_NOW, SyntheticText
 
 if TYPE_CHECKING:
     from fpdf import FPDF
@@ -21,9 +20,8 @@ def generate_invoice_pdfs(count: int, output_dir: Path, seed: int = 42) -> list[
     pypdf can extract the same text every time, which makes downstream LLM
     caching meaningful.
     """
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -36,7 +34,7 @@ def generate_invoice_pdfs(count: int, output_dir: Path, seed: int = 42) -> list[
     return paths
 
 
-def _make_invoice(fake: Faker, rng: random.Random, index: int) -> dict[str, Any]:
+def _make_invoice(fake: SyntheticText, rng: random.Random, index: int) -> dict[str, Any]:
     vendor = fake.company()
     billed_to = fake.company()
     line_items: list[dict[str, Any]] = [
@@ -52,7 +50,7 @@ def _make_invoice(fake: Faker, rng: random.Random, index: int) -> dict[str, Any]
         "vendor": vendor,
         "billed_to": billed_to,
         "invoice_id": f"INV-{index:05d}",
-        "issue_date": fake.date_between(start_date="-1y", end_date="today").isoformat(),
+        "issue_date": fake.recent_date(),
         "currency": rng.choice(_CURRENCIES),
         "tagline": fake.catch_phrase(),
         "line_items": line_items,
@@ -62,6 +60,7 @@ def _make_invoice(fake: Faker, rng: random.Random, index: int) -> dict[str, Any]
 
 def _render(inv: dict[str, Any]) -> FPDF:
     pdf = _fpdf().FPDF()
+    pdf.set_creation_date(SYNTHETIC_NOW)
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 18)

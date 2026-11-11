@@ -324,6 +324,7 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
     for package in (
         "anthropic",
         "beautifulsoup4",
+        "cryptography",
         "datasketch",
         "fpdf2",
         "ftfy",
@@ -348,6 +349,16 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "pii",
         "text",
     }
+
+
+def test_cryptography_security_floor_is_declared_on_affected_extras() -> None:
+    """Keep published extras past CVE-2026-69247 without burdening base installs (ALE-626)."""
+    pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
+    extras = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+    for extra in ("bigquery", "gcs", "gdrive", "vertex", "mcp", "pii", "all"):
+        assert "cryptography>=50.0.0" in extras[extra]
 
 
 def _requirement_key(requirement: str) -> tuple[str, frozenset[str], str]:

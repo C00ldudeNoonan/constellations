@@ -5,6 +5,10 @@
 - Anthropic inference now requires `pip install 'stel[anthropic]'`; a base
   install no longer includes the SDK (issue #786, ALE-631).
 
+- Synthetic seeds now use built-in word lists instead of Faker. The same seed
+  produces different example documents than earlier releases; dates are fixed
+  for repeatable output (issue #787, ALE-627).
+
 - BigQuery `stel run`, `build` and `adopt` handle SIGTERM and retain the writer
   claim when outstanding work cannot be confirmed terminal.
   `stel writer-claim status` shows the holder, and `stel writer-claim release` checks BigQuery job

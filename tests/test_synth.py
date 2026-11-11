@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -15,6 +16,11 @@ from stel.synth import (
     generate_support_emails,
     generate_support_tickets,
 )
+
+
+def test_utc_zone_database_is_available() -> None:
+    """Faker no longer supplies the IANA database on Windows (issue #787)."""
+    assert ZoneInfo("UTC").key == "UTC"
 
 
 def test_generate_invoices_writes_count(tmp_path: Path) -> None:

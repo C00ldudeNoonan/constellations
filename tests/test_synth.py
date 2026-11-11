@@ -3,7 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from stel.synth import generate_invoices
+import pytest
+
+from stel.synth import (
+    generate_arxiv_papers,
+    generate_invoice_pdfs,
+    generate_invoice_texts,
+    generate_invoices,
+    generate_posts,
+    generate_product_pages,
+    generate_support_emails,
+    generate_support_tickets,
+)
 
 
 def test_generate_invoices_writes_count(tmp_path: Path) -> None:
@@ -40,3 +51,25 @@ def test_generate_invoices_schema(tmp_path: Path) -> None:
         for li in data["line_items"]:
             assert {"description", "qty", "unit_price"} <= set(li)
         assert data["total"] > 0
+
+
+@pytest.mark.parametrize(
+    "generate",
+    [
+        generate_arxiv_papers,
+        generate_invoice_pdfs,
+        generate_invoice_texts,
+        generate_invoices,
+        generate_posts,
+        generate_product_pages,
+        generate_support_emails,
+        generate_support_tickets,
+    ],
+)
+def test_seed_generators_are_reproducible(tmp_path: Path, generate) -> None:
+    """Every seed type produces stable bytes for a seed (issue #787)."""
+    first = generate(2, tmp_path / "first", seed=17)
+    repeated = generate(2, tmp_path / "repeated", seed=17)
+    different = generate(2, tmp_path / "different", seed=18)
+    assert [path.read_bytes() for path in first] == [path.read_bytes() for path in repeated]
+    assert [path.read_bytes() for path in first] != [path.read_bytes() for path in different]

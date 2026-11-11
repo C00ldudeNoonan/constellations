@@ -3,16 +3,15 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-from faker import Faker
+from .words import SyntheticText
 
 _CATEGORIES = ["electronics", "books", "home", "sports", "tools"]
 
 
 def generate_product_pages(count: int, output_dir: Path, seed: int = 42) -> list[Path]:
     """Generate `count` synthetic product-listing HTML pages."""
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []

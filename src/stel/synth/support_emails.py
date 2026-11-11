@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import random
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from email.message import EmailMessage
-from email.utils import format_datetime, make_msgid
+from email.utils import format_datetime
 from pathlib import Path
 
-from faker import Faker
+from .words import SYNTHETIC_NOW, SyntheticText
 
 _SUBJECTS = [
     "Can't log in",
@@ -24,13 +24,12 @@ _SUBJECTS = [
 
 def generate_support_emails(count: int, output_dir: Path, seed: int = 42) -> list[Path]:
     """Generate `count` synthetic support emails as .eml files."""
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    now = datetime.now(UTC)
+    now = SYNTHETIC_NOW
 
     for i in range(count):
         sent_at = now - timedelta(hours=rng.uniform(0.1, 240))
@@ -39,7 +38,7 @@ def generate_support_emails(count: int, output_dir: Path, seed: int = 42) -> lis
         msg["To"] = "support@acme.example"
         msg["Subject"] = rng.choice(_SUBJECTS)
         msg["Date"] = format_datetime(sent_at)
-        msg["Message-ID"] = make_msgid(domain="acme.example")
+        msg["Message-ID"] = f"<{seed}.{i}@acme.example>"
         body = "\n\n".join(fake.paragraphs(nb=rng.randint(1, 3)))
         msg.set_content(
             f"Hi team,\n\n{body}\n\nThanks,\n{msg['From'].split('<')[0].strip()}\n"

@@ -46,7 +46,12 @@ from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .dag import ProjectDAG
 from .embedding import EmbeddingIdentity, estimate_embed_requests
-from .profile import ResolvedProfile, resolve_embedding_options, resolve_profile
+from .profile import (
+    ResolvedProfile,
+    resolve_embedding_options,
+    resolve_profile,
+    validate_inference_dependencies,
+)
 from .providers import ProviderError
 from .retrieval import StoreRole, create_store
 from .versioning import (
@@ -244,6 +249,7 @@ def plan_project(
     selected = dag.select_models(select=select, exclude=exclude)
     models_by_name = {model.name: model for model in models}
     planned = [models_by_name[name] for name in selected]
+    validate_inference_dependencies(planned, project, resolved)
     validate_warehouse_capabilities(planned, adapter)
     resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     with adapter:

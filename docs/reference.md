@@ -95,6 +95,7 @@ The core install stays lean. Add only the feature groups a project uses:
 
 | Extra | Features |
 |-------|----------|
+| `anthropic` | Anthropic inference (the default LLM provider) |
 | `pdf` | PDF extraction and synthetic PDF generation (`pypdf`, `fpdf2`) |
 | `html` | HTML extraction (`beautifulsoup4`) |
 | `text` | Token counting, encoding cleanup, language detection, and near-duplicate detection |

@@ -2636,9 +2636,7 @@ name = "stel"
 version = "0.26.0"
 source = { editable = "." }
 dependencies = [
-    { name = "anthropic" },
     { name = "anyio" },
-    { name = "certifi" },
     { name = "click" },
     { name = "cryptography" },
     { name = "duckdb" },
@@ -2653,7 +2651,9 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "anthropic" },
     { name = "beautifulsoup4" },
+    { name = "certifi" },
     { name = "datasketch" },
     { name = "fpdf2" },
     { name = "ftfy" },
@@ -2679,14 +2679,21 @@ all = [
     { name = "spacy" },
     { name = "tiktoken" },
 ]
+anthropic = [
+    { name = "anthropic" },
+    { name = "certifi" },
+]
 bigquery = [
+    { name = "certifi" },
     { name = "google-cloud-bigquery" },
     { name = "google-cloud-bigquery-storage" },
 ]
 gcs = [
+    { name = "certifi" },
     { name = "google-cloud-storage" },
 ]
 gdrive = [
+    { name = "certifi" },
     { name = "google-auth" },
     { name = "requests" },
 ]
@@ -2698,6 +2705,7 @@ lancedb = [
     { name = "lancedb" },
 ]
 mcp = [
+    { name = "certifi" },
     { name = "httpx" },
     { name = "mcp" },
     { name = "pyjwt", extra = ["crypto"] },
@@ -2707,6 +2715,7 @@ ml = [
     { name = "scikit-learn" },
 ]
 nlp = [
+    { name = "certifi" },
     { name = "spacy" },
 ]
 pdf = [
@@ -2715,6 +2724,7 @@ pdf = [
     { name = "pypdf" },
 ]
 pii = [
+    { name = "certifi" },
     { name = "presidio-analyzer" },
     { name = "presidio-anonymizer" },
 ]
@@ -2722,12 +2732,14 @@ rdf = [
     { name = "rdflib" },
 ]
 text = [
+    { name = "certifi" },
     { name = "datasketch" },
     { name = "ftfy" },
     { name = "langdetect" },
     { name = "tiktoken" },
 ]
 vertex = [
+    { name = "certifi" },
     { name = "google-genai" },
 ]
 
@@ -2747,11 +2759,21 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.103.1" },
+    { name = "anthropic", marker = "extra == 'all'", specifier = ">=0.103.1" },
+    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.103.1" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", marker = "extra == 'all'", specifier = ">=4.12" },
     { name = "beautifulsoup4", marker = "extra == 'html'", specifier = ">=4.12" },
-    { name = "certifi", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'all'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'anthropic'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'bigquery'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'gcs'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'gdrive'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'mcp'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'nlp'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'pii'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'text'", specifier = ">=2026.10.19" },
+    { name = "certifi", marker = "extra == 'vertex'", specifier = ">=2026.10.19" },
     { name = "click", specifier = ">=8.1" },
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "datasketch", marker = "extra == 'all'", specifier = ">=1.6" },
@@ -2811,7 +2833,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'text'", specifier = ">=0.7" },
     { name = "watchfiles", specifier = ">=0.21" },
 ]
-provides-extras = ["bigquery", "gcs", "gdrive", "vertex", "lancedb", "mcp", "html", "pdf", "pii", "text", "nlp", "ml", "rdf", "all"]
+provides-extras = ["anthropic", "bigquery", "gcs", "gdrive", "vertex", "lancedb", "mcp", "html", "pdf", "pii", "text", "nlp", "ml", "rdf", "all"]
 
 [package.metadata.requires-dev]
 dev = [

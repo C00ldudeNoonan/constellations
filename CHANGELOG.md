@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Anthropic inference now requires `pip install 'stel[anthropic]'`; a base
+  install no longer includes the SDK (issue #786, ALE-631).
+
 - BigQuery `stel run`, `build` and `adopt` handle SIGTERM and retain the writer
   claim when outstanding work cannot be confirmed terminal.
   `stel writer-claim status` shows the holder, and `stel writer-claim release` checks BigQuery job

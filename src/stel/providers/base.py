@@ -856,6 +856,10 @@ class BaseProvider(ABC):
         # boundary (issue #71); None when the provider publishes no model.
         self.profile_options = profile_options
 
+    def validate_installation(self) -> None:
+        """Check dependencies needed by this provider without resolving credentials."""
+        return None
+
     @classmethod
     def profile_options_model(cls) -> type[BaseModel] | None:
         """Strict Pydantic model validating profile `provider_options:`,

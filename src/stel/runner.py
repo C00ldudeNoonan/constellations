@@ -79,6 +79,7 @@ from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
     resolve_profile,
+    validate_inference_dependencies,
 )
 from .progress import get_reporter
 from .read_filters import parse_read_filters
@@ -272,6 +273,12 @@ def run_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    if "state:" not in (select or "") and "state:" not in (exclude or ""):
+        selected_for_preflight = set(dag.select_models(select=select, exclude=exclude))
+        preflight_models = [model for model in models if model.name in selected_for_preflight]
+    else:
+        preflight_models = models
+    validate_inference_dependencies(preflight_models, project, resolved)
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -517,6 +524,12 @@ def build_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    if "state:" not in (select or "") and "state:" not in (exclude or ""):
+        selected_for_preflight = set(dag.select_models(select=select, exclude=exclude))
+        preflight_models = [model for model in models if model.name in selected_for_preflight]
+    else:
+        preflight_models = models
+    validate_inference_dependencies(preflight_models, project, resolved)
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,

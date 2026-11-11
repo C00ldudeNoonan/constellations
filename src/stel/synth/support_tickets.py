@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import random
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from faker import Faker
+from .words import SYNTHETIC_NOW, SyntheticText
 
 _PRODUCTS = ["acme-cloud", "acme-mobile", "acme-cli", "acme-billing", "acme-ide"]
 _PRIORITIES = ["low", "medium", "high", "urgent"]
@@ -25,13 +25,12 @@ def generate_support_tickets(count: int, output_dir: Path, seed: int = 42) -> li
     id, product, priority, status, customer_tier, assigned_team,
     created_at / first_response_at / resolved_at timestamps, summary.
     """
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    now = datetime.now(UTC)
+    now = SYNTHETIC_NOW
 
     for i in range(count):
         ticket = _make_ticket(fake, rng, i, now)
@@ -42,7 +41,7 @@ def generate_support_tickets(count: int, output_dir: Path, seed: int = 42) -> li
 
 
 def _make_ticket(
-    fake: Faker, rng: random.Random, index: int, now: datetime
+    fake: SyntheticText, rng: random.Random, index: int, now: datetime
 ) -> dict[str, Any]:
     priority = rng.choices(_PRIORITIES, weights=[5, 10, 4, 1])[0]
     status = rng.choices(_STATUSES, weights=[3, 4, 2, 4, 7])[0]

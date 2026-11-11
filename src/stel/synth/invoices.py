@@ -5,7 +5,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from faker import Faker
+from .words import SyntheticText
 
 _CURRENCIES = ["USD", "EUR", "GBP", "CAD"]
 
@@ -15,9 +15,8 @@ def generate_invoices(count: int, output_dir: Path, seed: int = 42) -> list[Path
 
     Deterministic for a given (count, seed) pair.
     """
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -29,7 +28,7 @@ def generate_invoices(count: int, output_dir: Path, seed: int = 42) -> list[Path
     return paths
 
 
-def _make_invoice(fake: Faker, rng: random.Random, index: int) -> dict[str, Any]:
+def _make_invoice(fake: SyntheticText, rng: random.Random, index: int) -> dict[str, Any]:
     line_count = rng.randint(1, 6)
     line_items: list[dict[str, Any]] = [
         {
@@ -43,7 +42,7 @@ def _make_invoice(fake: Faker, rng: random.Random, index: int) -> dict[str, Any]
     return {
         "invoice_id": f"INV-{index:05d}",
         "vendor": fake.company(),
-        "issue_date": fake.date_between(start_date="-1y", end_date="today").isoformat(),
+        "issue_date": fake.recent_date(),
         "currency": rng.choice(_CURRENCIES),
         "line_items": line_items,
         "total": total,

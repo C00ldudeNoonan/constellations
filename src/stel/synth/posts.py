@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-from faker import Faker
+from .words import SyntheticText
 
 _TAG_POOL = [
     "python",
@@ -24,9 +24,8 @@ def generate_posts(count: int, output_dir: Path, seed: int = 42) -> list[Path]:
 
     Deterministic for a given (count, seed) pair.
     """
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     authors = [fake.name() for _ in range(max(1, min(count, 8)))]
@@ -36,7 +35,7 @@ def generate_posts(count: int, output_dir: Path, seed: int = 42) -> list[Path]:
         title = fake.sentence(nb_words=6).rstrip(".")
         author = rng.choice(authors)
         tags = sorted(rng.sample(_TAG_POOL, k=rng.randint(1, 3)))
-        date = fake.date_between(start_date="-1y", end_date="today").isoformat()
+        date = fake.recent_date()
         body = "\n\n".join(fake.paragraphs(nb=rng.randint(3, 6)))
 
         tag_list = ", ".join(tags)

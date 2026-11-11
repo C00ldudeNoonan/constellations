@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import random
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from faker import Faker
+from .words import SYNTHETIC_NOW, SyntheticText
 
 # A realistic slice of arXiv CS / stats categories.
 _CATEGORIES = [
@@ -25,13 +25,12 @@ def generate_arxiv_papers(count: int, output_dir: Path, seed: int = 42) -> list[
 
     Deterministic for a given (count, seed).
     """
-    Faker.seed(seed)
     rng = random.Random(seed)
-    fake = Faker()
+    fake = SyntheticText(rng)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    now = datetime.now(UTC)
+    now = SYNTHETIC_NOW
 
     for i in range(count):
         record = _make_paper(fake, rng, i, now)
@@ -41,7 +40,9 @@ def generate_arxiv_papers(count: int, output_dir: Path, seed: int = 42) -> list[
     return paths
 
 
-def _make_paper(fake: Faker, rng: random.Random, index: int, now: datetime) -> dict[str, Any]:
+def _make_paper(
+    fake: SyntheticText, rng: random.Random, index: int, now: datetime
+) -> dict[str, Any]:
     # arXiv id: YYMM.NNNNN
     month_offset = rng.randint(0, 23)
     published = now - timedelta(days=month_offset * 30 + rng.randint(0, 29))

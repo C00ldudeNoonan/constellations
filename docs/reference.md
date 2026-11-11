@@ -112,6 +112,11 @@ while `uv add 'stel[all]'` provides the complete development/runtime feature
 set. Invoking a feature whose extra is absent raises an error with the exact
 installation command.
 
+For `run` and `build` with a state selector and a warehouse-backed vocabulary,
+stel reads the vocabulary to determine the selection before checking the selected
+models' inference dependencies. The check still precedes source discovery and
+warehouse publication.
+
 ## What stel actually does
 
 | Concept            | What it means                                                                  |

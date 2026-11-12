@@ -567,3 +567,54 @@ def test_state_selection_checks_only_selected_inference_dependencies(
                 assert rows is not None and rows[0] == 0
     else:
         assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("command", ["build", "test"])
+def test_llm_judge_missing_anthropic_fails_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """An `llm_judge` on a non-LLM model reports the extra in preflight (ALE-631).
+
+    The model itself needs no provider, so only the judge's profile provider can
+    require the SDK; without this check `build` published the table first.
+    """
+    (tmp_path / "stel_project.yml").write_text(
+        "name: p\nprofile: p\n", encoding="utf-8"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "p:\n  target: dev\n  outputs:\n    dev:\n"
+        "      warehouse: {type: duckdb, path: warehouse.duckdb, schema: main}\n"
+        "      llm: {provider: anthropic}\n", encoding="utf-8"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data\n", encoding="utf-8"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_json\n"
+        "    source: ref('docs')\n    extraction:\n      backend: json\n"
+        "      options: {fields: [title]}\n"
+        "    tests:\n      - llm_judge: {column: title, criterion: x}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "one.json").write_text('{"title": "hello"}', encoding="utf-8")
+    real_import = importlib.import_module
+
+    def without_anthropic(name: str, package: str | None = None) -> object:
+        if name == "anthropic":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", without_anthropic)
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), command])
+    assert result.exit_code == 2, result.output
+    assert "pip install 'stel[anthropic]'" in result.output
+    warehouse = tmp_path / "warehouse.duckdb"
+    if warehouse.exists():
+        with duckdb.connect(str(warehouse), read_only=True) as con:
+            rows = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = 'raw_json'"
+            ).fetchone()
+            assert rows is not None and rows[0] == 0

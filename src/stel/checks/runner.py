@@ -8,6 +8,7 @@ from ..compiler import validate_project_contract, validate_warehouse_capabilitie
 from ..config import load_project
 from ..config.model import ModelConfig
 from ..profile import ResolvedProfile, resolve_profile
+from ..providers import get_inference_provider
 from ..test_specs import (
     declared_accepted_values,
     enum_test_specs,
@@ -21,19 +22,24 @@ def validate_test_requirements(
     models: list[ModelConfig], resolved: ResolvedProfile
 ) -> None:
     """Preflight: fail before discovery/build/materialization when a selected
-    model declares an `llm_judge` test but no `llm:` profile is configured."""
-    if resolved.llm is not None:
-        return
+    model declares an `llm_judge` test but no `llm:` profile is configured, or
+    the profile's provider is missing its optional extra."""
     offenders = sorted(
         model.name
         for model in models
         if model.tests and uses_llm_judge(model.tests)
     )
-    if offenders:
-        raise UnknownTestError(
-            f"models {offenders} declare an `llm_judge` test but no `llm:` profile "
-            "is configured; add an `llm:` block to the active profile"
-        )
+    if not offenders:
+        return
+    if resolved.llm is not None:
+        # The judge runs on the profile provider. Checking its extra here keeps
+        # a base install from publishing the model before the judge fails.
+        get_inference_provider(resolved.llm.provider).validate_installation()
+        return
+    raise UnknownTestError(
+        f"models {offenders} declare an `llm_judge` test but no `llm:` profile "
+        "is configured; add an `llm:` block to the active profile"
+    )
 
 
 def _test_run_budget(resolved: ResolvedProfile) -> BudgetLedger | None:

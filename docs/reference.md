@@ -117,6 +117,10 @@ stel reads the vocabulary to determine the selection before checking the selecte
 models' inference dependencies. The check still precedes source discovery and
 warehouse publication.
 
+`build` and `test` also check the profile provider's extra when a selected
+model declares an `llm_judge` test, so a model that runs no inference itself is
+not published before its judge fails.
+
 ## What stel actually does
 
 | Concept            | What it means                                                                  |

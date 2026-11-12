@@ -48,7 +48,7 @@ from .execution.chunk import chunk_input_hash
 from .execution.embed import embed_input_fingerprint
 from .execution.warehouse import warehouse_options
 from .plan import PlanError
-from .profile import resolve_profile
+from .profile import resolve_profile, validate_inference_dependencies
 from .read_filters import parse_read_filters
 from .transforms.runner import load_incremental_contract
 from .vocabulary_sources import resolve_warehouse_vocabularies
@@ -428,6 +428,7 @@ def pending_project(
     selected = dag.select_models(select=select, exclude=exclude)
     models_by_name = {model.name: model for model in models}
     planned = [models_by_name[name] for name in selected]
+    validate_inference_dependencies(planned, project, resolved)
     validate_warehouse_capabilities(planned, adapter)
     resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     with adapter:

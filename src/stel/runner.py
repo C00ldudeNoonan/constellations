@@ -79,6 +79,7 @@ from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
     resolve_profile,
+    validate_inference_dependencies,
 )
 from .progress import get_reporter
 from .read_filters import parse_read_filters
@@ -86,7 +87,7 @@ from .reprocess_guard import format_refusals, guard_reprocess
 from .search_groups import model_partition_predicates
 from .sources import SourceError, get_document_source
 from .versioning import compute_model_code_version
-from .vocabulary_sources import resolve_warehouse_vocabularies
+from .vocabulary_sources import has_warehouse_vocabularies, resolve_warehouse_vocabularies
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +140,28 @@ def _modified_set(
         project=project,
         resolved=resolved,
     )
+
+
+def _preflight_inference(
+    models: list[ModelConfig], dag: ProjectDAG, project: ProjectConfig,
+    project_dir: Path, resolved: ResolvedProfile, state: Path | None,
+    select: str | None, exclude: str | None,
+) -> bool:
+    """Validate selected providers, deferring only when state needs warehouse terms."""
+    uses_state = "state:" in (select or "") or "state:" in (exclude or "")
+    if uses_state and has_warehouse_vocabularies(project):
+        dag.select_models(select=select, exclude=exclude, modified=set() if state else None)
+        return False
+    modified = (
+        _modified_set(models, project_dir, state, project=project, resolved=resolved)
+        if uses_state
+        else None
+    )
+    selected = set(dag.select_models(select=select, exclude=exclude, modified=modified))
+    validate_inference_dependencies(
+        [model for model in models if model.name in selected], project, resolved
+    )
+    return True
 
 
 @dataclass
@@ -272,6 +295,9 @@ def run_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    inference_checked = _preflight_inference(
+        models, dag, project, project_dir, resolved, state, select, exclude
+    )
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -292,6 +318,10 @@ def run_project(
             resolved=resolved,
         ),
     )
+    if not inference_checked:
+        validate_inference_dependencies(
+            [model for model in models if model.name in set(selected)], project, resolved
+        )
     if new_only:
         selected_names = set(selected)
         unsupported = sorted(
@@ -517,6 +547,9 @@ def build_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    inference_checked = _preflight_inference(
+        models, dag, project, project_dir, resolved, state, select, exclude
+    )
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -537,6 +570,10 @@ def build_project(
             resolved=resolved,
         ),
     )
+    if not inference_checked:
+        validate_inference_dependencies(
+            [model for model in models if model.name in set(selected)], project, resolved
+        )
     if deletion_approvals and not set(deletion_approvals).issubset(selected):
         raise RunError("Source deletion approval names a model outside the selection.")
     validate_warehouse_capabilities(

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Anthropic inference now requires `pip install 'stel[anthropic]'`; a base
+  install no longer includes the SDK (issue #786, ALE-631).
+
 - Synthetic seeds now use built-in word lists instead of Faker. The same seed
   produces different example documents than earlier releases; dates are fixed
   for repeatable output (issue #787, ALE-627).

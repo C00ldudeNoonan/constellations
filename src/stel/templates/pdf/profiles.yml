@@ -6,6 +6,7 @@ __PROJECT_NAME__:
         type: duckdb
         path: ./target/stel.duckdb
         schema: __PROJECT_NAME__
+      # Anthropic inference requires: pip install 'stel[anthropic]'
       llm:
         provider: anthropic
         model: claude-haiku-4-5

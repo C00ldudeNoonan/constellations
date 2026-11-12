@@ -23,7 +23,7 @@ from .adapters import StateScope, create_adapter
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config.loader import load_project
 from .plan import state_scope_for
-from .profile import resolve_profile
+from .profile import resolve_profile, validate_inference_dependencies
 from .versioning import compute_model_code_identity
 from .vocabulary_sources import resolve_warehouse_vocabularies
 
@@ -65,6 +65,7 @@ def adopt_project(
     planned = [
         models_by_name[name] for name in dag.select_models(select=select, exclude=exclude)
     ]
+    validate_inference_dependencies(planned, project, resolved)
     validate_warehouse_capabilities(planned, adapter)
     resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     who = getpass.getuser()

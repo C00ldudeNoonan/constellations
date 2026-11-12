@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
+import duckdb
 import pytest
 from click.testing import CliRunner
 from packaging.requirements import Requirement
@@ -322,6 +324,7 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
     extras = project["optional-dependencies"]
 
     for package in (
+        "anthropic",
         "beautifulsoup4",
         "cryptography",
         "datasketch",
@@ -395,3 +398,223 @@ def test_the_all_extra_is_a_superset_of_every_other_extra() -> None:
         "needs, `all` needs too -- add the line rather than relying on it arriving "
         "transitively (issue #597)."
     )
+
+
+def test_anthropic_extra_and_http_security_floors() -> None:
+    """Published HTTP extras retain the CA bundle floor (ALE-631)."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    extras = project["optional-dependencies"]
+    assert "anthropic>=0.103.1" in extras["anthropic"]
+    for extra in ("anthropic", "bigquery", "gcs", "gdrive", "vertex", "mcp",
+                  "pii", "text", "nlp", "all"):
+        assert "certifi>=2026.10.19" in extras[extra]
+
+
+def test_compile_missing_anthropic_fails_before_source_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An LLM project reports the extra before touching sources (ALE-631)."""
+    (tmp_path / "stel_project.yml").write_text("name: optional_llm\n", encoding="utf-8")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data\n", encoding="utf-8"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction:\n      backend: llm\n"
+        "      options:\n        fields:\n          - {name: title, type: string}\n",
+        encoding="utf-8",
+    )
+    real_import = importlib.import_module
+
+    def without_anthropic(name: str, package: str | None = None) -> object:
+        if name == "anthropic":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", without_anthropic)
+    for command in ("compile", "run"):
+        result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), command])
+        assert result.exit_code == 2, result.output
+        assert "pip install 'stel[anthropic]'" in result.output
+        assert not (tmp_path / "target").exists()
+
+
+def test_pdf_only_profile_does_not_require_anthropic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured but unused provider does not block a PDF-only project (ALE-631)."""
+    (tmp_path / "stel_project.yml").write_text("name: p\nprofile: p\n", encoding="utf-8")
+    (tmp_path / "profiles.yml").write_text(
+        "p:\n  target: dev\n  outputs:\n    dev:\n"
+        "      warehouse: {type: duckdb, path: target/p.duckdb, schema: p}\n"
+        "      llm: {provider: anthropic}\n", encoding="utf-8"
+    )
+    real_import = importlib.import_module
+
+    def without_anthropic(name: str, package: str | None = None) -> object:
+        if name == "anthropic":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", without_anthropic)
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), "compile"])
+    assert result.exit_code == 0, result.output
+
+
+def test_unselected_anthropic_model_does_not_require_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting an offline model does not require an unused SDK (ALE-631)."""
+    (tmp_path / "stel_project.yml").write_text("name: p\n", encoding="utf-8")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data\n", encoding="utf-8"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_json\n"
+        "    source: ref('docs')\n    extraction:\n      backend: json\n"
+        "      options: {fields: [title]}\n"
+        "  - name: raw_llm\n    source: ref('docs')\n    extraction:\n      backend: llm\n"
+        "      options:\n        fields:\n          - {name: title, type: string}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "one.json").write_text('{"title": "hello"}', encoding="utf-8")
+    real_import = importlib.import_module
+
+    def without_anthropic(name: str, package: str | None = None) -> object:
+        if name == "anthropic":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", without_anthropic)
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), "run", "--select", "raw_json"]
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("command", ["run", "build"])
+@pytest.mark.parametrize("warehouse_vocabulary", [False, True])
+@pytest.mark.parametrize("modified_model", ["raw_json", "raw_llm"])
+def test_state_selection_checks_only_selected_inference_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str,
+    warehouse_vocabulary: bool, modified_model: str,
+) -> None:
+    """State selection checks the selected provider before execution (ALE-631)."""
+    project = "name: p\nduckdb: {path: warehouse.duckdb}\n"
+    if warehouse_vocabulary:
+        project += (
+            "vocabularies:\n  sector:\n    from:\n"
+            "      relation: warehouse://main.sectors\n      label_column: id\n"
+        )
+        with duckdb.connect(str(tmp_path / "warehouse.duckdb")) as con:
+            con.execute("CREATE TABLE sectors AS SELECT 'a' AS id")
+    (tmp_path / "stel_project.yml").write_text(project, encoding="utf-8")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data\n", encoding="utf-8"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_json\n"
+        "    source: ref('docs')\n    extraction:\n      backend: json\n"
+        "      options: {fields: [title]}\n"
+        "  - name: raw_llm\n    source: ref('docs')\n    extraction:\n      backend: llm\n"
+        "      options:\n        fields:\n          - {name: title, type: string}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "one.json").write_text('{"title": "hello"}', encoding="utf-8")
+    runner = CliRunner()
+    compiled = runner.invoke(cli, ["--project-dir", str(tmp_path), "compile"])
+    assert compiled.exit_code == 0, compiled.output
+    manifest = json.loads((tmp_path / "target" / "manifest.json").read_text(encoding="utf-8"))
+    for model in manifest["models"]:
+        if model["name"] == modified_model:
+            model["code_version"] = "different"
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(manifest), encoding="utf-8")
+    real_import = importlib.import_module
+
+    def without_anthropic(name: str, package: str | None = None) -> object:
+        if name == "anthropic":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", without_anthropic)
+    result = runner.invoke(
+        cli,
+        [
+            "--project-dir", str(tmp_path), command, "--select", "state:modified",
+            "--state", str(state),
+        ],
+    )
+    if modified_model == "raw_llm":
+        assert result.exit_code == 2, result.output
+        assert "pip install 'stel[anthropic]'" in result.output
+        warehouse = tmp_path / "warehouse.duckdb"
+        if warehouse.exists():
+            with duckdb.connect(str(warehouse), read_only=True) as con:
+                rows = con.execute(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_name = 'raw_llm'"
+                ).fetchone()
+                assert rows is not None and rows[0] == 0
+    else:
+        assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("command", ["build", "test"])
+def test_llm_judge_missing_anthropic_fails_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """An `llm_judge` on a non-LLM model reports the extra in preflight (ALE-631).
+
+    The model itself needs no provider, so only the judge's profile provider can
+    require the SDK; without this check `build` published the table first.
+    """
+    (tmp_path / "stel_project.yml").write_text(
+        "name: p\nprofile: p\n", encoding="utf-8"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "p:\n  target: dev\n  outputs:\n    dev:\n"
+        "      warehouse: {type: duckdb, path: warehouse.duckdb, schema: main}\n"
+        "      llm: {provider: anthropic}\n", encoding="utf-8"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data\n", encoding="utf-8"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_json\n"
+        "    source: ref('docs')\n    extraction:\n      backend: json\n"
+        "      options: {fields: [title]}\n"
+        "    tests:\n      - llm_judge: {column: title, criterion: x}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "one.json").write_text('{"title": "hello"}', encoding="utf-8")
+    real_import = importlib.import_module
+
+    def without_anthropic(name: str, package: str | None = None) -> object:
+        if name == "anthropic":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", without_anthropic)
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), command])
+    assert result.exit_code == 2, result.output
+    assert "pip install 'stel[anthropic]'" in result.output
+    warehouse = tmp_path / "warehouse.duckdb"
+    if warehouse.exists():
+        with duckdb.connect(str(warehouse), read_only=True) as con:
+            rows = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = 'raw_json'"
+            ).fetchone()
+            assert rows is not None and rows[0] == 0

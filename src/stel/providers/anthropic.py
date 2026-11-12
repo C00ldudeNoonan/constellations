@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
+from ..optional_dependencies import import_optional_dependency
 from .base import (
     BatchInferenceItem,
     BatchInferenceRequest,
@@ -47,6 +48,9 @@ class AnthropicInferenceProvider(InferenceProvider):
     batch_cost_multiplier = 0.5
     # Native JSON output preserves enum constraints in the supplied schema.
     supports_schema_enum = True
+
+    def validate_installation(self) -> None:
+        _anthropic()
 
     def complete(
         self,
@@ -196,13 +200,19 @@ class AnthropicInferenceProvider(InferenceProvider):
         return provider_batch_error(self.name(), operation, error)
 
 
+def _anthropic() -> Any:
+    return import_optional_dependency(
+        "anthropic", extra="anthropic", feature="Anthropic inference"
+    )
+
+
 def _complete_with_sdk(
     request: InferenceRequest,
     *,
     credential: ProviderCredential | None,
     runtime: ProviderRuntimeOptions,
 ) -> InferenceResult:
-    from anthropic import Anthropic
+    Anthropic = _anthropic().Anthropic
 
     api_key = _credential_value(credential)
     # Constructed per request on purpose, unlike the Vertex client (issue
@@ -233,7 +243,7 @@ def _batch_client(
     credential: ProviderCredential | None,
     runtime: ProviderRuntimeOptions,
 ) -> Any:
-    from anthropic import Anthropic
+    Anthropic = _anthropic().Anthropic
 
     api_key = _credential_value(credential)
     return Anthropic(
@@ -410,7 +420,7 @@ def _credential_value(credential: ProviderCredential | None) -> str:
 
 
 def _message_params(request: InferenceRequest) -> dict[str, Any]:
-    from anthropic import transform_schema
+    transform_schema = _anthropic().transform_schema
 
     params: dict[str, Any] = {
         "model": request.model,

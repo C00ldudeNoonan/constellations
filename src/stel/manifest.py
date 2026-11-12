@@ -31,6 +31,7 @@ from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
     resolve_profile,
+    validate_inference_dependencies,
 )
 from .retrieval import (
     StoreRole,
@@ -145,6 +146,7 @@ def _build_with_profile(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    validate_inference_dependencies(models, project, resolved)
     if has_warehouse_vocabularies(project):
         adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
         resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)

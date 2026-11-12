@@ -30,6 +30,7 @@ from .config.identifiers import (
     GLOBAL_PROFILES_DIRNAME,
     LEGACY_GLOBAL_PROFILES_DIRNAME,
 )
+from .config.model import ModelConfig
 from .config.profile import (
     DEFAULT_LLM_PROVIDER,
     EmbeddingProfileConfig,
@@ -600,6 +601,25 @@ def _load_profiles_file(
             out = {}
             raise validation_failure
     return out, document
+
+
+def validate_inference_dependencies(
+    models: list[ModelConfig], project: ProjectConfig, resolved: ResolvedProfile
+) -> None:
+    """Check only providers needed by these models before source or warehouse I/O."""
+    default_provider = resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER
+    names: set[str] = set()
+    for model in models:
+        if model.extraction is not None:
+            backend = model.extraction.backend or project.extraction.default_backend
+            if backend == "llm":
+                names.add(str(model.extraction.options.get("provider", default_provider)))
+        if model.transform is not None and model.transform.uses_llm:
+            names.add(default_provider)
+        if model.llm is not None:
+            names.add(default_provider if model.llm.provider == "default" else model.llm.provider)
+    for name in sorted(names):
+        get_inference_provider(name).validate_installation()
 
 
 def resolve_llm_options(

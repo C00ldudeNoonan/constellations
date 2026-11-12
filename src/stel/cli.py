@@ -70,6 +70,7 @@ from .profile import (
     apply_source_path_overrides,
     resolve_llm_options,
     resolve_profile,
+    validate_inference_dependencies,
 )
 from .progress import OutputLevel, configure_progress, get_reporter
 from .prompts import (
@@ -351,6 +352,7 @@ def compile(ctx: click.Context) -> None:
         resolved = resolve_profile(
             project, project_dir, target=target, profiles_dir=profiles_dir
         )
+        validate_inference_dependencies(models, project, resolved)
         adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
         validate_warehouse_capabilities(models, adapter)
         manifest_path = write_manifest(

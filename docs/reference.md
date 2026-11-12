@@ -95,6 +95,7 @@ The core install stays lean. Add only the feature groups a project uses:
 
 | Extra | Features |
 |-------|----------|
+| `anthropic` | Anthropic inference (the default LLM provider) |
 | `pdf` | PDF extraction and synthetic PDF generation (`pypdf`, `fpdf2`) |
 | `html` | HTML extraction (`beautifulsoup4`) |
 | `text` | Token counting, encoding cleanup, language detection, and near-duplicate detection |
@@ -110,6 +111,15 @@ For example, `uv add 'stel[pdf,text]'` installs PDF and text processing,
 while `uv add 'stel[all]'` provides the complete development/runtime feature
 set. Invoking a feature whose extra is absent raises an error with the exact
 installation command.
+
+For `run` and `build` with a state selector and a warehouse-backed vocabulary,
+stel reads the vocabulary to determine the selection before checking the selected
+models' inference dependencies. The check still precedes source discovery and
+warehouse publication.
+
+`build` and `test` also check the profile provider's extra when a selected
+model declares an `llm_judge` test, so a model that runs no inference itself is
+not published before its judge fails.
 
 ## What stel actually does
 

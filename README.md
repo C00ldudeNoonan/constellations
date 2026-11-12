@@ -171,6 +171,8 @@ fitting the workflow analytics engineers already use.**
 
 ```bash
 uv add stel
+# Anthropic inference (the default LLM provider):
+uv add 'stel[anthropic]'
 # Optional cloud integrations:
 uv add 'stel[bigquery,gcs,gdrive]'
 ```

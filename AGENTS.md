@@ -12,6 +12,9 @@ artifacts are not dbt-core contracts unless that compatibility is explicit.
 The Python project lives at the repository root. Run every command — Git,
 GitHub, Python, uv, test, lint, type-check, build — from there.
 
+In interactive sessions, search `research_report_search` and `session_context`
+before starting an analysis.
+
 Use these maintained references rather than copying volatile feature lists:
 
 - `README.md` (landing page) and `docs/reference.md` (full reference) —

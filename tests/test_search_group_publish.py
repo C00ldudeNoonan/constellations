@@ -9,20 +9,37 @@ way a declaration can be wrong.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 import pytest
 
+from stel.adapters.base import AdapterError, WarehouseAdapter
 from stel.cli_services.serving import serving_status
 from stel.compiler import validate_project_contract
 from stel.config import ConfigError, load_project
+from stel.config.search_partition import SearchPartitionConfig
 from stel.manifest import SERVING_MANIFEST_VERSION, build_manifest
 from stel.profile import resolve_profile
-from stel.retrieval import StoreRole, create_store
+from stel.retrieval import ServingCoordinator, StoreRole, create_store
+from stel.retrieval.coordination import QueryLease
 from stel.runner import RunError, run_project
+from stel.search import (
+    SearchError,
+    SearchFilter,
+    SearchFilterOperator,
+    SearchGroupMember,
+    SearchMode,
+    SearchRequest,
+    SearchSession,
+    _search_group,
+)
 from stel.search_groups import group_availability
+from stel.timing import PhaseTimings
 from tests.support_retrieval import materialize_upstream, write_project
 
 # Runs a whole project and opens a retrieval store, so it belongs to the `e2e`
@@ -177,6 +194,126 @@ def _publish(project: Path) -> None:
     run_project(project, select="tag:filings")
 
 
+def test_query_group_routes_and_fuses_published_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unfiltered query covers all members; a bounded query routes (#778)."""
+    _write_group(tmp_path)
+    materialize_upstream(tmp_path, _upstream(_YEARS))
+    _publish(tmp_path)
+    (group,) = build_manifest(tmp_path)["search_groups"]
+    members = tuple(
+        SearchGroupMember(
+            member["model"], member["logical_collection"], member["config_fingerprint"],
+            SearchPartitionConfig.model_validate(member["partition"]),
+        )
+        for member in group["members"]
+    )
+    session = SearchSession(tmp_path, target=None, profiles_dir=None)
+    try:
+        request = SearchRequest(model="filings", vector=(1.0, 0.0), mode=SearchMode.VECTOR)
+        outcome = _search_group(
+            session, request, members, max_fanout=4, policy_filters=(), timings=PhaseTimings()
+        )
+        assert {hit.record_id for hit in outcome.results} == set(_YEARS)
+        inaccessible = next(
+            hit.provenance.physical_collection for hit in outcome.results if hit.record_id == "c3"
+        )
+        store = session._stores["primary"]
+        inspect = store.inspect_collection
+
+        def missing_member(collection: str) -> Any:
+            return None if collection == inaccessible else inspect(collection)
+
+        with monkeypatch.context() as failure:
+            failure.setattr(store, "inspect_collection", missing_member)
+            with pytest.raises(SearchError, match="has not been published"):
+                _search_group(
+                    session, request, members, max_fanout=4, policy_filters=(),
+                    timings=PhaseTimings(),
+                )
+        bounded = SearchRequest(
+            model="filings", vector=(1.0, 0.0), mode=SearchMode.VECTOR,
+            filters=(SearchFilter("filing_year", SearchFilterOperator.EQUAL, 2024),),
+        )
+        outcome = _search_group(
+            session, bounded, members, max_fanout=1, policy_filters=(), timings=PhaseTimings()
+        )
+        assert [hit.record_id for hit in outcome.results] == ["c3"]
+
+        embedding_calls: list[str] = []
+
+        def embed_once(query: str, *args: Any, **kwargs: Any) -> tuple[float, ...]:
+            embedding_calls.append(query)
+            return (1.0, 0.0)
+
+        monkeypatch.setattr("stel.search.embed_query", embed_once)
+        monkeypatch.setattr("stel.search.resolve_search_embedding_identity", lambda *a, **kw: {})
+        _search_group(
+            session, SearchRequest(model="filings", query="example", mode=SearchMode.VECTOR),
+            members, max_fanout=4, policy_filters=(), timings=PhaseTimings(),
+        )
+        assert embedding_calls == ["example"]
+
+        seen_adapter_failure: list[bool] = []
+        warehouse = session.warehouse
+        validate = ServingCoordinator.validate_query
+
+        @contextmanager
+        def witnessed_warehouse(timings: PhaseTimings | None) -> Iterator[WarehouseAdapter]:
+            try:
+                with warehouse(timings) as adapter:
+                    yield adapter
+            except AdapterError:
+                seen_adapter_failure.append(True)
+                raise
+
+        def fail_during_read(
+            coordinator: ServingCoordinator, lease: QueryLease, *, require_active: bool = False
+        ) -> None:
+            if not require_active:
+                raise AdapterError("test warehouse failure")
+            validate(coordinator, lease, require_active=require_active)
+
+        with monkeypatch.context() as failure:
+            failure.setattr(session, "warehouse", witnessed_warehouse)
+            failure.setattr(ServingCoordinator, "validate_query", fail_during_read)
+            with pytest.raises(SearchError, match="test warehouse failure"):
+                _search_group(
+                    session, request, members, max_fanout=4, policy_filters=(),
+                    timings=PhaseTimings(),
+                )
+        assert seen_adapter_failure == [True]
+
+        def no_store(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("fan-out validation must precede opening a store")
+
+        with monkeypatch.context() as invalid:
+            invalid.setattr(session, "store", no_store)
+            with pytest.raises(SearchError, match="exceeding max_fanout"):
+                _search_group(
+                    session, request, members, max_fanout=1, policy_filters=(),
+                    timings=PhaseTimings(),
+                )
+            context = session.resolve(None)
+            model = context.models_by_name[members[0].model]
+            assert model.search is not None
+            missing_id = model.model_copy(update={
+                "search": model.search.model_copy(update={"document_id_field": None})
+            })
+            broken = replace(
+                context, models_by_name={**context.models_by_name, model.name: missing_id}
+            )
+            invalid.setattr(session, "resolve", lambda timings: broken)
+            with pytest.raises(SearchError, match="must declare document_id_field"):
+                _search_group(
+                    session, request, members, max_fanout=4, policy_filters=(),
+                    timings=PhaseTimings(),
+                )
+    finally:
+        session.close()
+
+
 def test_each_member_publishes_only_its_own_partition(tmp_path: Path) -> None:
     """Together the members hold the corpus exactly once: nothing lost to a gap,
     nothing served twice, and the null year is not dropped by a range."""
@@ -203,6 +340,27 @@ def test_a_row_re_dated_into_another_member_moves_with_it(tmp_path: Path) -> Non
 
     assert _published_ids(tmp_path, "filings_mid") == {"c2"}
     assert _published_ids(tmp_path, "filings_new") == {"c3", "c4", "c5"}
+    (group,) = build_manifest(tmp_path)["search_groups"]
+    members = tuple(
+        SearchGroupMember(
+            member["model"], member["logical_collection"], member["config_fingerprint"],
+            SearchPartitionConfig.model_validate(member["partition"]),
+        )
+        for member in group["members"]
+    )
+    session = SearchSession(tmp_path, target=None, profiles_dir=None)
+    try:
+        request = SearchRequest(
+            model="filings", vector=(1.0, 0.0), mode=SearchMode.VECTOR,
+            filters=(SearchFilter("filing_year", SearchFilterOperator.EQUAL, 2027),),
+        )
+        outcome = _search_group(
+            session, request, members, max_fanout=1, policy_filters=(), timings=PhaseTimings()
+        )
+        moved = next(hit for hit in outcome.results if hit.record_id == "c3")
+        assert moved.provenance.model == "filings_new"
+    finally:
+        session.close()
 
 
 def test_the_manifest_records_the_group_and_each_members_bounds(tmp_path: Path) -> None:

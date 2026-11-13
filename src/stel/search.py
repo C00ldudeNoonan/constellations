@@ -4,6 +4,7 @@ import logging
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
@@ -27,6 +28,7 @@ from .adapters.serialized import SerializedAdapter
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
 from .config.model import ModelConfig, SearchAttributeConfig
+from .config.search_partition import SearchPartitionConfig
 from .embedding import (
     effective_search_config,
     embed_query,
@@ -53,6 +55,8 @@ from .retrieval import (
     create_store,
 )
 from .retrieval.coordination import STATUS_DEGRADED, QueryLease, ServingCoordinationError
+from .retrieval.group_pins import GroupPinRequest, pin_group
+from .retrieval.group_routing import partition_may_match
 from .retrieval.query_pins import SessionQueryPins
 from .timing import PhaseTimings
 
@@ -281,6 +285,20 @@ class SearchOutcome:
     results: tuple[SearchResult, ...]
     degraded: bool
     safe_error_code: str | None
+    member_generations: Mapping[str, str] = dataclass_field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "member_generations", MappingProxyType(dict(self.member_generations))
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SearchGroupMember:
+    model: str
+    logical_collection: str
+    config_fingerprint: str
+    partition: SearchPartitionConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +752,139 @@ def search(
             session.close()
 
 
+def _search_group(
+    session: SearchSession,
+    request: SearchRequest,
+    members: Sequence[SearchGroupMember],
+    *,
+    max_fanout: int,
+    policy_filters: Sequence[SearchFilter],
+    timings: PhaseTimings,
+) -> SearchOutcome:
+    """Query the manifest's members under their own simultaneously held pins."""
+    if not members:
+        raise SearchError("The search group has no members; recompile the project")
+    context = session.resolve(timings)
+    resolved = context.profile
+    if resolved.retrieval is None:
+        raise SearchError("The active profile has no retrieval configuration")
+    models: list[ModelConfig] = []
+    pins: list[GroupPinRequest] = []
+    selected: list[int] = []
+    for index, member in enumerate(members):
+        model = context.models_by_name.get(member.model)
+        if model is None or model.search is None:
+            raise SearchError("A search group member is missing; recompile the project")
+        config = model.search
+        if not config.document_id_field:
+            raise SearchError(
+                f"Search group member '{model.name}' must declare document_id_field "
+                "for document-grain ranking"
+            )
+        if request.mode.value not in config.query.modes:
+            raise SearchError(f"Search index '{model.name}' does not allow {request.mode.value}")
+        if config.partition != member.partition or (config.collection or model.name) != (
+            member.logical_collection
+        ):
+            raise SearchError("A search group member differs from the manifest; recompile")
+        validate_retrieval_capabilities([model], context.project_config, resolved)
+        predicates = _resolve_predicates(model, request.filters)
+        _resolve_result_fields(model, request.fields)
+        if config.access == "governed":
+            if request.consistency != "strong" or not policy_filters:
+                raise SearchError("Governed search requires strong consistency and policy filters")
+            _resolve_policy_predicates(model, policy_filters)
+        elif policy_filters:
+            raise SearchError("Public search indexes do not accept policy filters")
+        if partition_may_match(member.partition, predicates):
+            selected.append(index)
+        models.append(model)
+    if len(selected) > max_fanout:
+        raise SearchError(
+            f"Search group selects {len(selected)} members, exceeding max_fanout "
+            f"({max_fanout}); narrow the partition filter or raise --max-group-fanout"
+        )
+    for member, model in zip(members, models, strict=True):
+        config = model.search
+        assert config is not None
+        alias = config.store or resolved.retrieval.default
+        store_config = resolved.retrieval.stores.get(alias)
+        if store_config is None:
+            raise SearchError("A search group selects an unavailable retrieval store")
+        options = _search_embedding_options(model, context.models_by_name, resolved)
+        effective = effective_search_config(
+            model, context.models_by_name,
+            profile_options=options.provider_options if options is not None else None,
+        )
+        fingerprint = collection_config_fingerprint(effective, store_type=store_config.type)
+        if fingerprint != member.config_fingerprint:
+            raise SearchError("A search group member differs from the manifest; recompile")
+    for member, model in zip(members, models, strict=True):
+        config = model.search
+        assert config is not None
+        alias = config.store or resolved.retrieval.default
+        store_config = resolved.retrieval.stores.get(alias)
+        assert store_config is not None
+        store = session.store(
+            alias,
+            lambda store_config=store_config, alias=alias: create_store(
+                store_config, project_name=context.project_config.name,
+                target_name=resolved.target_name, alias=alias, role=StoreRole.SERVE,
+            ),
+            timings,
+        )
+        _validate_capabilities(
+            model, request, store.capabilities(), store_type=store_config.type,
+            policy_filters=policy_filters,
+        )
+        descriptor = store.state_descriptor(member.logical_collection)
+        pins.append(GroupPinRequest(
+            StateScope.for_target_descriptor(
+                model.name, stage=RETRIEVAL_PUBLISH_STAGE, descriptor=descriptor.descriptor()
+            ),
+            StateScope.for_target_descriptor(
+                model.name, stage=RETRIEVAL_PUBLISH_STAGE,
+                descriptor=descriptor.legacy_descriptor(),
+            ),
+            member.config_fingerprint,
+        ))
+    try:
+        with session.warehouse(timings) as adapter:
+            ensuring = session.needs_schema_ensure()
+            coordinator = ServingCoordinator(adapter, ensure_schema=ensuring)
+            if ensuring:
+                session.mark_schema_ensured()
+            with pin_group(coordinator, pins) as leases:
+                if not selected:
+                    return SearchOutcome((), False, None)
+                with timings.phase("embed"):
+                    vector = _resolve_query_vector(
+                        models[selected[0]], context.models_by_name, request, resolved=resolved
+                    )
+                outcomes = {
+                    members[index].model: _search(
+                        session, replace(request, model=members[index].model, vector=vector),
+                        policy_filters=policy_filters, timings=timings, started=perf_counter(),
+                        pinned=(coordinator, leases[index]),
+                    )
+                    for index in selected
+                }
+                degraded = any(outcome.degraded for outcome in outcomes.values())
+                error_code = next(
+                    (outcome.safe_error_code for outcome in outcomes.values()
+                     if outcome.safe_error_code is not None), None
+                )
+                return SearchOutcome(
+                    _fuse_group_results(
+                        {name: outcome.results for name, outcome in outcomes.items()},
+                        limit=request.limit,
+                    ), degraded, error_code,
+                    {members[index].model: leases[index].pinned_generation for index in selected},
+                )
+    except (AdapterError, RetrievalError) as error:
+        raise SearchError(str(error)) from None
+
+
 def _search(
     session: SearchSession,
     request: SearchRequest,
@@ -741,6 +892,7 @@ def _search(
     policy_filters: Sequence[SearchFilter],
     timings: PhaseTimings,
     started: float,
+    pinned: tuple[ServingCoordinator, QueryLease] | None = None,
 ) -> SearchOutcome:
     context = session.resolve(timings)
     project_config = context.project_config
@@ -829,14 +981,23 @@ def _search(
     candidate_limit = request.candidate_limit or min(max(request.limit * 4, 50), 1000)
 
     try:
-        with session.warehouse(timings) as adapter:
-            ensuring_schema = session.needs_schema_ensure()
-            coordinator = ServingCoordinator(adapter, ensure_schema=ensuring_schema)
-            if ensuring_schema:
-                session.mark_schema_ensured()
-            with session.query_lease(
-                coordinator, state_scope, legacy_scope=legacy_state_scope, timings=timings
-            ) as lease:
+        warehouse = session.warehouse(timings) if pinned is None else nullcontext(None)
+        with warehouse as adapter:
+            if pinned is None:
+                assert adapter is not None
+                ensuring_schema = session.needs_schema_ensure()
+                coordinator = ServingCoordinator(adapter, ensure_schema=ensuring_schema)
+                if ensuring_schema:
+                    session.mark_schema_ensured()
+                query_lease = session.query_lease(
+                    coordinator, state_scope, legacy_scope=legacy_state_scope, timings=timings
+                )
+            else:
+                coordinator, group_lease = pinned
+                if group_lease.scope != state_scope:
+                    raise SearchError("The group pin does not match the member's serving scope")
+                query_lease = nullcontext(group_lease)
+            with query_lease as lease:
                 if lease.config_fingerprint != expected_fingerprint:
                     raise SearchError(
                         f"Search index '{model.name}' was published under a different "
@@ -894,6 +1055,9 @@ def _search(
     except SearchError:
         raise
     except (AdapterError, RetrievalError) as error:
+        if pinned is not None and isinstance(error, AdapterError):
+            # The outer group warehouse must see this to retire a held connection.
+            raise
         # A cached store that has failed stays failed, and every later query
         # on this session would inherit it -- so drop it and let the next one
         # reopen (issue #523). AdapterError is a warehouse failure, not a
@@ -1452,6 +1616,56 @@ def _rrf_by_document(
             if depth < len(members[key])
         )
     return interleaved
+
+
+def _fuse_group_results(
+    ranked: Mapping[str, Sequence[SearchResult]], *, limit: int
+) -> tuple[SearchResult, ...]:
+    """Fuse member ranks at document grain without comparing native scores."""
+    nonempty = {name: rows for name, rows in ranked.items() if rows}
+    if not nonempty:
+        return ()
+    scores: dict[tuple[str, str], float] = {}
+    documents: dict[tuple[str, str], dict[str, tuple[int, str, SearchResult]]] = {}
+    for name in sorted(nonempty):
+        seen: set[tuple[str, str]] = set()
+        for rank, result in enumerate(nonempty[name], 1):
+            if not result.document_id:
+                raise SearchError(
+                    f"Search group member '{name}' returned a hit without a document ID"
+                )
+            key = ("document", result.document_id)
+            if key not in seen:
+                seen.add(key)
+                scores[key] = scores.get(key, 0.0) + 1.0 / (60 + len(seen))
+            rows = documents.setdefault(key, {})
+            candidate = (rank, name, result)
+            previous = rows.get(result.record_id)
+            if previous is None or candidate[:2] < previous[:2]:
+                rows[result.record_id] = candidate
+    maximum = len(nonempty) / 61
+    ordered = sorted(documents, key=lambda key: (-scores[key], key[1], key[0]))
+    chunks = {
+        key: sorted(documents[key].values(), key=lambda item: (item[0], item[1], item[2].record_id))
+        for key in ordered
+    }
+    results: list[SearchResult] = []
+    for depth in range(max(len(rows) for rows in chunks.values())):
+        for key in ordered:
+            if depth >= len(chunks[key]):
+                continue
+            member_rank, member, result = chunks[key][depth]
+            results.append(replace(
+                result,
+                rank=len(results) + 1,
+                score=round(scores[key] / maximum, 12),
+                raw_score=None,
+                raw_score_kind=None,
+                contributing_ranks={member: member_rank},
+            ))
+            if len(results) == limit:
+                return tuple(results)
+    return tuple(results)
 
 
 def _to_result(

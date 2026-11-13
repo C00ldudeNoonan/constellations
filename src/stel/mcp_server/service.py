@@ -24,6 +24,7 @@ from ..adapters.base import (
     WarehouseIdentity,
 )
 from ..agent_context import (
+    FreshnessStatus,
     canonical_entity_key,
     citation_locator,
     freshness_status,
@@ -43,6 +44,7 @@ from ..search import (
     SearchRequest,
     SearchResult,
     SearchSession,
+    _search_group,
     json_value,
     search,
 )
@@ -112,6 +114,7 @@ class ContextServerSettings(BaseModel):
     # `max_results` bounds the response. The default is the portable maximum,
     # so this only ever narrows.
     max_candidates: int = Field(default=1000, ge=1, le=1000)
+    max_group_fanout: int = Field(default=16, ge=1, le=1000)
     max_document_chunks: int = Field(default=50, ge=1, le=100)
     max_entities_per_context: int = Field(default=50, ge=1, le=1000)
     max_snippet_bytes: int = Field(default=2000, ge=64, le=100_000)
@@ -261,8 +264,13 @@ class PortableContextSearch:
     repository, so the reads that follow a search use the same connection.
     """
 
-    def __init__(self, session: SearchSession) -> None:
+    def __init__(
+        self, session: SearchSession, *, catalog: ArtifactCatalog | None = None,
+        max_group_fanout: int = 16,
+    ) -> None:
         self._session = session
+        self._catalog = catalog
+        self._max_group_fanout = max_group_fanout
 
     def execute(
         self,
@@ -271,6 +279,13 @@ class PortableContextSearch:
         policy_filters: Sequence[SearchFilter],
         timings: PhaseTimings | None = None,
     ) -> SearchOutcome:
+        resource = self._catalog.get(request.model) if self._catalog is not None else None
+        if resource is not None and resource.group_members:
+            return _search_group(
+                self._session, request, resource.group_members,
+                max_fanout=self._max_group_fanout, policy_filters=policy_filters,
+                timings=timings if timings is not None else PhaseTimings(),
+            )
         return search(
             self._session.project_dir,
             request,
@@ -591,16 +606,20 @@ class ContextService:
             if enforce_warehouse_identity:
                 _refuse_unenforceable_identity(session)
                 warehouse_identity = GrantWarehouseIdentityResolver(store)
+        catalog = ArtifactCatalog.load(
+            project_dir, expected_target=session.resolve(None).profile.target_name
+        )
+        effective_settings = settings or ContextServerSettings()
         return cls(
-            catalog=ArtifactCatalog.load(
-                project_dir, expected_target=session.resolve(None).profile.target_name
-            ),
+            catalog=catalog,
             repository=repository,
-            context_search=PortableContextSearch(session),
+            context_search=PortableContextSearch(
+                session, catalog=catalog, max_group_fanout=effective_settings.max_group_fanout
+            ),
             principal_resolver=principal_resolver or EnvironmentPrincipalResolver(),
             authorization=authorization or ClaimAuthorizationProvider(),
             warehouse_identity=warehouse_identity,
-            settings=settings,
+            settings=effective_settings,
         )
 
     @property
@@ -686,6 +705,7 @@ class ContextService:
             "returned_chunk_ids": [],
             "top_score": None,
             "served_generation": None,
+            "served_generations": None,
             "served_degraded": None,
             "served_safe_error_code": None,
             "phase_ms": None,
@@ -1061,19 +1081,24 @@ class ContextService:
         # cannot know it, and `run_results.json` -- which this used to read --
         # was wrong whenever a run left the index out or a container start
         # rehydrated the store without running anything.
-        activations = read_activations(self._repository, page)
+        activation_resources = [
+            member_resource
+            for resource in page
+            for member_resource in (
+                tuple(self._catalog.get(member.model) for member in resource.group_members)
+                if resource.group_members else (resource,)
+            )
+            if member_resource is not None
+        ]
+        activations = read_activations(self._repository, activation_resources)
         now = datetime.now(UTC)
         models = tuple(
             resource.summary(
                 entity_types=self._entity_types(
                     resource, principal, identity=identities[resource.name]
                 ),
-                last_successful_materialization=activations.get(resource.name),
-                freshness=serving_freshness(
-                    activations.get(resource.name),
-                    stale_after_seconds=resource.stale_after_seconds,
-                    now=now,
-                ),
+                last_successful_materialization=self._activation(resource, activations),
+                freshness=self._freshness(resource, activations, now),
             )
             for resource in page
         )
@@ -1094,6 +1119,35 @@ class ContextService:
             models=models,
             next_cursor=next_cursor,
         )
+
+    def _activation(
+        self, resource: ContextResource, activations: Mapping[str, datetime]
+    ) -> datetime | None:
+        names = tuple(member.model for member in resource.group_members) or (resource.name,)
+        if any(name not in activations for name in names):
+            return None
+        return min(activations[name] for name in names)
+
+    def _freshness(
+        self, resource: ContextResource, activations: Mapping[str, datetime], now: datetime
+    ) -> FreshnessStatus:
+        members = (
+            tuple(self._catalog.get(member.model) for member in resource.group_members)
+            if resource.group_members else (resource,)
+        )
+        statuses = [
+            serving_freshness(
+                activations.get(member.name),
+                stale_after_seconds=member.stale_after_seconds,
+                now=now,
+            )
+            for member in members if member is not None
+        ]
+        if FreshnessStatus.PIPELINE_STALE in statuses:
+            return FreshnessStatus.PIPELINE_STALE
+        if len(statuses) != len(members) or FreshnessStatus.UNKNOWN in statuses:
+            return FreshnessStatus.UNKNOWN
+        return statuses[0]
 
     def _search_context(
         self,
@@ -1318,7 +1372,13 @@ class ContextService:
             "phase_ms": _phase_ms_json(timings),
             # Which index build answered, so latency and recall attach to a
             # generation rather than to a model name that outlives it.
-            "served_generation": hits[0].provenance.generation if hits else None,
+            "served_generation": (
+                hits[0].provenance.generation if hits and not outcome.member_generations else None
+            ),
+            "served_generations": (
+                json.dumps(dict(outcome.member_generations), sort_keys=True)
+                if outcome.member_generations else None
+            ),
             # The lease's own status, not inferred from whether any hit came
             # back: a degraded index answers "nothing matched" exactly as a
             # ready one does, and `hits[0]` above is already blind to that
@@ -1851,6 +1911,20 @@ class ContextService:
             self._settings.max_snippet_bytes,
         )
         context_id = _required_string(row, "context_id")
+        lineage_resource = resource
+        if resource.group_members:
+            if hit.provenance.model not in {member.model for member in resource.group_members}:
+                raise ContextServiceError(
+                    MCPErrorCode.CAPABILITY_UNAVAILABLE,
+                    "A search result does not belong to the requested group",
+                )
+            member_resource = self._catalog.get(hit.provenance.model)
+            if member_resource is None:
+                raise ContextServiceError(
+                    MCPErrorCode.CAPABILITY_UNAVAILABLE,
+                    "A search group member is missing from the catalog",
+                )
+            lineage_resource = member_resource
         return SearchContextResult(
             rank=hit.rank,
             score=hit.score,
@@ -1865,12 +1939,16 @@ class ContextService:
             interval=_interval(row),
             freshness=_freshness(row),
             citation=_citation(row),
-            lineage=_lineage(resource, row),
+            lineage=_lineage(lineage_resource, row).model_copy(
+                update={"search_index_unique_id": hit.provenance.unique_id}
+            ),
             # From the hit, not the warehouse row: `search()` already resolved
             # exactly the declared `returned: true` set, so this needs no
             # second read and cannot disagree with what the model declares.
             attributes=json_value(hit.metadata),
             matched_terms=matched_terms,
+            served_model=hit.provenance.model,
+            served_generation=hit.provenance.generation,
         )
 
     def _document_chunk(

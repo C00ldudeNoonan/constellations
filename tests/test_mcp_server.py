@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -22,6 +23,7 @@ from stel.adapters.base import (
 )
 from stel.agent_context import (
     AgentContextGrain,
+    FreshnessStatus,
     contract_descriptor,
     project_entity_link,
 )
@@ -35,7 +37,7 @@ from stel.mcp_server.authorization import (
     Principal,
     StaticPrincipalResolver,
 )
-from stel.mcp_server.catalog import ArtifactCatalog
+from stel.mcp_server.catalog import ArtifactCatalog, ArtifactCatalogError, _group_resources
 from stel.mcp_server.contracts import (
     BusinessFilter,
     EntityExpansion,
@@ -64,6 +66,7 @@ from stel.search import (
     SearchRequest,
     SearchResult,
 )
+from stel.search_groups import group_version
 from stel.timing import PhaseTimings
 
 DOC_ALLOWED = "a" * 32
@@ -3104,3 +3107,95 @@ def test_a_public_model_still_uses_an_identity_when_the_caller_has_one() -> None
     ]
     assert ledger_reads == [OPERATOR_IDENTITY]
     assert set(repository.identities) - {OPERATOR_IDENTITY} == {caller}
+
+
+def test_group_catalog_lists_one_resource_and_keeps_members_addressable() -> None:
+    catalog = _artifact_catalog()
+    original = catalog.get("context_search")
+    assert original is not None
+    resources = [
+        replace(
+            original, name=name, unique_id=f"search_index.context_demo.{name}",
+            lineage_resources=(f"search_index.context_demo.{name}",),
+        )
+        for name in ("old", "new", "nulls")
+    ]
+    members = [
+        {
+            "model": name, "logical_collection": name, "config_fingerprint": name,
+            "partition": {
+                "field": "year", "type": "integer", "lower": lower,
+                "upper": upper, "nulls": nulls,
+            },
+        }
+        for name, lower, upper, nulls in (
+            ("old", None, 2024, False), ("new", 2024, None, False),
+            ("nulls", None, None, True),
+        )
+    ]
+    entry = {"name": "filings", "field": "year", "type": "integer", "members": members,
+             "version": group_version(members)}
+    groups = _group_resources({"search_groups": [entry]}, resources)
+    result = ArtifactCatalog(
+        [*resources, *groups], vocabularies={}, class_hierarchy={}
+    )
+    assert [resource.name for resource in result.all()] == ["filings"]
+    assert result.get("old") is resources[0]
+    assert result.get("filings") is groups[0]
+    assert [member.model for member in groups[0].group_members] == ["old", "new", "nulls"]
+
+    service, _ = _service()
+    service._catalog = result
+    now = datetime.now(UTC)
+    activations = {"old": now - timedelta(days=3), "new": now, "nulls": now}
+    assert service._activation(groups[0], activations) == activations["old"]
+    stale_resource = replace(resources[0], stale_after_seconds=60)
+    service._catalog = ArtifactCatalog(
+        [stale_resource, *resources[1:], *groups], vocabularies={}, class_hierarchy={}
+    )
+    assert service._freshness(groups[0], activations, now) == FreshnessStatus.PIPELINE_STALE
+    assert service._activation(groups[0], {"new": now, "nulls": now}) is None
+    hit = _hit(CONTEXT_ALLOWED_1, DOC_ALLOWED, CHUNK_ALLOWED_1, rank=1)
+    hit = replace(hit, provenance=replace(
+        hit.provenance, model="new", unique_id="search_index.context_demo.new"
+    ))
+    fixture = _fixture_rows()
+    served = service._search_result(
+        groups[0], hit, fixture["document_chunks"][0], fixture["document_registry"][0], {},
+        matched_terms=(),
+    )
+    assert served.lineage.resources == ("search_index.context_demo.new",)
+    assert served.lineage.search_index_unique_id == "search_index.context_demo.new"
+    assert served.served_generation == "g-test"
+
+    class GroupSearch(FakeSearch):
+        def execute(
+            self, request: SearchRequest, *, policy_filters: Sequence[SearchFilter],
+            timings: PhaseTimings | None = None,
+        ) -> SearchOutcome:
+            outcome = super().execute(request, policy_filters=policy_filters, timings=timings)
+            hits = tuple(replace(item, provenance=replace(
+                item.provenance, model="new", unique_id="search_index.context_demo.new"
+            )) for item in outcome.results)
+            return replace(outcome, results=hits, member_generations={"new": "g-test", "old": "g0"})
+
+    group_search = GroupSearch()
+    service._search = group_search
+    response = service.search_context(SearchContextRequest(model="filings", query="inflation"))
+    assert response.error is None
+    assert len(response.results) == 1
+    assert response.results[0].served_model == "new"
+    assert {item.field for item in group_search.policy_filters} == {"tenant_id", "classification"}
+    repository = cast(FakeRepository, service._repository)
+    assert json.loads(repository.logged[-1]["served_generations"]) == {"new": "g-test", "old": "g0"}
+    service.close()
+
+    incomplete = [members[0], members[2]]
+    entry["members"] = incomplete
+    entry["version"] = group_version(incomplete)
+    with pytest.raises(ArtifactCatalogError, match="invalid"):
+        _group_resources({"search_groups": [entry]}, resources)
+    entry["members"] = members
+    entry["version"] = "wrong"
+    with pytest.raises(ArtifactCatalogError, match="invalid"):
+        _group_resources({"search_groups": [entry]}, resources)

@@ -33,6 +33,7 @@ from stel.retrieval.coordination import (
     STATUS_UNPUBLISHED,
     validate_safe_error_code,
 )
+from stel.retrieval.group_pins import GroupPinRequest, pin_group
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
 # `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
@@ -59,6 +60,89 @@ def coordinator(tmp_path: Path) -> Any:
     adapter_cm = create_adapter(_wh(tmp_path / "serving.duckdb"))
     with adapter_cm as adapter:
         yield ServingCoordinator(adapter, ensure_schema=True)
+
+
+def test_group_pins_are_all_admitted_and_released_on_failure(coordinator: Any) -> None:
+    """A missing or stale member cannot leave a partial group pinned (#778)."""
+    first, second = _scope("first"), _scope("second")
+    publish = coordinator.acquire_publish(
+        first, expected_code_version="v1", config_fingerprint="cfg"
+    )
+    coordinator.mark_ready(
+        publish, active_generation="gen1", config_fingerprint="cfg", counts=(0, 0, 0, 0)
+    )
+    requests = (
+        GroupPinRequest(first, first, "cfg"),
+        GroupPinRequest(second, second, "cfg"),
+    )
+    with pytest.raises(ServingNotReadyError), pin_group(coordinator, requests):
+        pytest.fail("an unpublished member must prevent admission")
+    assert coordinator.status(first).query_leases == 0
+
+    publish = coordinator.acquire_publish(
+        second, expected_code_version="v1", config_fingerprint="old"
+    )
+    coordinator.mark_ready(
+        publish, active_generation="gen2", config_fingerprint="old", counts=(0, 0, 0, 0)
+    )
+    with pytest.raises(ServingNotReadyError, match="different configuration"):
+        with pin_group(coordinator, requests):
+            pytest.fail("a stale member must prevent admission")
+    assert coordinator.status(first).query_leases == 0
+    assert coordinator.status(second).query_leases == 0
+
+    requests = (requests[0], GroupPinRequest(second, second, "old"))
+    with pin_group(coordinator, requests) as leases:
+        assert [lease.pinned_generation for lease in leases] == ["gen1", "gen2"]
+        assert coordinator.status(first).query_leases == 1
+        assert coordinator.status(second).query_leases == 1
+    assert coordinator.status(first).query_leases == 0
+    assert coordinator.status(second).query_leases == 0
+
+
+def test_group_pin_rechecks_earlier_members_after_admission(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery during admission invalidates the whole group before I/O (#778)."""
+    first, second = _scope("first"), _scope("second")
+    for scope in (first, second):
+        publish = coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg"
+        )
+        coordinator.mark_ready(
+            publish, active_generation="gen1", config_fingerprint="cfg", counts=(0, 0, 0, 0)
+        )
+    acquire = coordinator.acquire_query
+
+    def acquire_during_recovery(scope: StateScope, *, legacy_scope: StateScope) -> Any:
+        lease = acquire(scope, legacy_scope=legacy_scope)
+        if scope == second:
+            coordinator.recover(first, owner_terminated=True)
+        return lease
+
+    monkeypatch.setattr(coordinator, "acquire_query", acquire_during_recovery)
+    requests = (GroupPinRequest(first, first, "cfg"), GroupPinRequest(second, second, "cfg"))
+    with pytest.raises(StaleServingLeaseError), pin_group(coordinator, requests):
+        pytest.fail("a revoked pin must prevent admission")
+    assert coordinator.status(first).query_leases == 0
+    assert coordinator.status(second).query_leases == 0
+
+
+def test_group_pin_detects_recovery_during_read(coordinator: Any) -> None:
+    """A revoked member pin prevents returning the group's results (#778)."""
+    scopes = (_scope("first"), _scope("second"))
+    for scope in scopes:
+        publish = coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg"
+        )
+        coordinator.mark_ready(
+            publish, active_generation="gen1", config_fingerprint="cfg", counts=(0, 0, 0, 0)
+        )
+    requests = tuple(GroupPinRequest(scope, scope, "cfg") for scope in scopes)
+    with pytest.raises(StaleServingLeaseError):
+        with pin_group(coordinator, requests):
+            coordinator.recover(scopes[1], owner_terminated=True)
+    assert all(coordinator.status(scope).query_leases == 0 for scope in scopes)
 
 
 # ─── publish claims and fencing ─────────────────────────────────────────────

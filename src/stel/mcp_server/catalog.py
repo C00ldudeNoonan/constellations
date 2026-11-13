@@ -4,8 +4,9 @@ import json
 import logging
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,8 +16,11 @@ from ..agent_context import FreshnessStatus
 from ..config import load_project
 from ..config.class_hierarchy import class_names, class_parents
 from ..config.project import ProjectConfig
+from ..config.search_partition import SearchPartitionConfig, bound_sort_key
 from ..config.vocabulary import Vocabulary, check_declaration
 from ..manifest import MANIFEST_FILENAME, SERVING_MANIFEST_VERSION, target_manifest_path
+from ..search import SearchGroupMember
+from ..search_groups import group_version
 from .authorization import PolicyAttribute
 from .contracts import (
     ContextField,
@@ -67,6 +71,7 @@ class ContextResource:
     # declares none. Absent means the catalog reports when the index was last
     # activated without judging whether that is recent enough.
     stale_after_seconds: int | None
+    group_members: tuple[SearchGroupMember, ...] = ()
 
     def summary(
         self,
@@ -308,6 +313,7 @@ class ArtifactCatalog:
                     stale_after_seconds=_stale_after_seconds(serving),
                 )
             )
+        resources.extend(_group_resources(manifest, resources))
         return cls(resources, vocabularies=vocabularies, class_hierarchy=class_hierarchy)
 
     @property
@@ -321,10 +327,105 @@ class ArtifactCatalog:
         return self._class_hierarchy
 
     def all(self) -> tuple[ContextResource, ...]:
-        return tuple(sorted(self._resources.values(), key=lambda item: item.name))
+        grouped = {
+            member.model
+            for resource in self._resources.values()
+            for member in resource.group_members
+        }
+        return tuple(sorted(
+            (resource for resource in self._resources.values() if resource.name not in grouped),
+            key=lambda item: item.name,
+        ))
 
     def get(self, name: str) -> ContextResource | None:
         return self._resources.get(name)
+
+
+def _group_resources(
+    manifest: Mapping[str, Any], resources: Sequence[ContextResource]
+) -> list[ContextResource]:
+    raw_groups = manifest.get("search_groups", [])
+    if not isinstance(raw_groups, list):
+        raise ArtifactCatalogError("The manifest's search groups are invalid; recompile")
+    by_name = {resource.name: resource for resource in resources}
+    groups: list[ContextResource] = []
+    used: set[str] = set()
+    for raw in raw_groups:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("members"), list):
+            raise ArtifactCatalogError("A search group is invalid; recompile")
+        raw_members = raw["members"]
+        try:
+            name = raw["name"]
+            if not isinstance(name, str) or not name or name in by_name:
+                raise ValueError
+            members = tuple(
+                SearchGroupMember(
+                    model=item["model"], logical_collection=item["logical_collection"],
+                    config_fingerprint=item["config_fingerprint"],
+                    partition=SearchPartitionConfig.model_validate(item["partition"]),
+                )
+                for item in raw_members
+            )
+            if (len(members) < 2 or len({member.model for member in members}) != len(members)
+                    or raw.get("version") != group_version(raw_members)):
+                raise ValueError
+            if any(
+                not isinstance(value, str) or not value
+                for member in members
+                for value in (member.model, member.logical_collection, member.config_fingerprint)
+            ):
+                raise ValueError
+            if any(member.partition.field != raw.get("field")
+                   or member.partition.type != raw.get("type") for member in members):
+                raise ValueError
+            if not _partitions_cover_domain(members):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, ValidationError):
+            raise ArtifactCatalogError("A search group is invalid; recompile") from None
+        visible = [by_name[member.model] for member in members if member.model in by_name]
+        if not visible:
+            continue
+        if len(visible) != len(members) or used.intersection(member.model for member in members):
+            raise ArtifactCatalogError(
+                "A search group's context members are inconsistent; recompile"
+            )
+        first = visible[0]
+        for resource in visible[1:]:
+            if (resource.access, resource.policy_attributes, resource.context_relation,
+                resource.registry_relation, resource.business_filters, resource.id_field,
+                resource.entity_relations, resource.schema_fields, resource.modes,
+                resource.consistency, resource.store_type) != (
+                first.access, first.policy_attributes, first.context_relation,
+                first.registry_relation, first.business_filters, first.id_field,
+                first.entity_relations, first.schema_fields, first.modes,
+                first.consistency, first.store_type,
+            ):
+                raise ArtifactCatalogError("A search group's context contracts differ; recompile")
+        used.update(member.model for member in members)
+        group = replace(first, name=name, unique_id=f"search_group.{name}", group_members=members)
+        groups.append(group)
+        by_name[name] = group
+    return groups
+
+
+def _partitions_cover_domain(members: Sequence[SearchGroupMember]) -> bool:
+    """A damaged manifest must not turn a group into a partial corpus."""
+    partitions = [member.partition for member in members]
+    if sum(partition.nulls for partition in partitions) != 1:
+        return False
+    ranges = sorted(
+        (partition for partition in partitions if not partition.nulls),
+        key=lambda partition: (
+            partition.lower is not None,
+            bound_sort_key(partition.lower) if partition.lower is not None else (0, 0, ""),
+        ),
+    )
+    if not ranges or ranges[0].lower is not None or ranges[-1].upper is not None:
+        return False
+    return all(
+        left.upper is not None and left.upper == right.lower
+        for left, right in pairwise(ranges)
+    )
 
 
 def _declared_vocabularies(

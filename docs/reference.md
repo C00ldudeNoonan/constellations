@@ -4681,11 +4681,24 @@ carries the manifest's `config_fingerprint` for it; one still holding rows cut
 under old bounds, or none yet, keeps the whole group unavailable, because
 serving the others would answer from a partial corpus without saying so.
 
-The query side, which routes a filter to members, pins them all-or-nothing and
-fuses their rankings, is the second half of
-[ADR-0037](adr/0037-a-segmented-search-group-declares-its-partitions.md) and is
-not shipped: a group is declared, compiled and published today, and each member
-is queried as an ordinary index.
+The MCP catalog lists the group once. Its members remain individually accessible
+by name. `search_context` routes validated partition filters to the matching
+members, pins the group's members before reading, and fuses their results by
+document rank. An unfiltered query searches every member. If the selected members
+exceed `stel mcp serve --max-group-fanout` (default 16), the query fails with a
+request to narrow the filter or raise the limit; it never silently omits members.
+Every member must have a serving generation under the compiled group definition.
+Each member must declare `document_id_field`, and every returned hit must have a
+non-empty document ID; a group query fails rather than falling back to chunk-grain
+fusion when an ID is missing.
+Results include the member and generation that served them; the query log's
+`served_generations` records the selected members, including those with no hits.
+Group freshness is stale if any member is stale, and its last successful
+materialization is the oldest member activation when all have one.
+
+Before replacing a monolithic index with a group, compare recall and latency on
+held-out old, recent and unfiltered questions, as required by
+[ADR-0037](adr/0037-a-segmented-search-group-declares-its-partitions.md).
 
 ## Suggesting context improvements
 

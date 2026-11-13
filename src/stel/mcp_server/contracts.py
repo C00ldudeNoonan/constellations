@@ -356,6 +356,8 @@ class SearchContextResult(BaseModel):
     # unscoped search (issue #628). Additive and defaulted, like `attributes`
     # above and for the same reason — see ADR-0008.
     matched_terms: tuple[MatchedTerm, ...] = ()
+    served_model: str | None = None
+    served_generation: str | None = None
 
 
 class SearchContextResponse(BaseModel):

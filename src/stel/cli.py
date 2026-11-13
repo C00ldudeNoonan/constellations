@@ -2390,6 +2390,13 @@ def mcp() -> None:
     ),
 )
 @click.option(
+    "--max-group-fanout",
+    type=click.IntRange(min=1, max=1000),
+    default=16,
+    show_default=True,
+    help="Maximum selected search-group members per query.",
+)
+@click.option(
     "--enforce-warehouse-identity",
     is_flag=True,
     default=False,
@@ -2427,6 +2434,7 @@ def mcp_serve(
     grants_relation: str | None,
     grant_ttl_seconds: float | None,
     enforce_warehouse_identity: bool,
+    max_group_fanout: int,
 ) -> None:
     """Run the read-only stel MCP server.
 
@@ -2469,6 +2477,7 @@ def mcp_serve(
             max_requests_per_minute_per_principal=max_requests_per_minute_per_principal,
             max_response_bytes=max_response_bytes,
             max_scan_rows=max_scan_rows,
+            max_group_fanout=max_group_fanout,
         )
         if enforce_warehouse_identity and grants_relation is None:
             # Checked here as well as in `from_project` so the operator gets

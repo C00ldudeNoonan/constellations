@@ -136,6 +136,7 @@ QUERY_LOG_SCHEMA: dict[str, Any] = {
     "filters": pl.String,
     "phase_ms": pl.String,
     "served_generation": pl.String,
+    "served_generations": pl.String,
     # Whether the pinned generation was the ready one or the last good one
     # kept alive after a failed republish, and why, when it was the latter
     # (issue #617, ask 3). Null for a refused call: there is no lease to ask.

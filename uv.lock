@@ -2733,6 +2733,7 @@ text = [
     { name = "tiktoken" },
 ]
 vertex = [
+    { name = "anyio" },
     { name = "certifi" },
     { name = "cryptography" },
     { name = "google-genai" },
@@ -2759,6 +2760,7 @@ requires-dist = [
     { name = "anyio", marker = "extra == 'all'", specifier = ">=4.14.2" },
     { name = "anyio", marker = "extra == 'anthropic'", specifier = ">=4.14.2" },
     { name = "anyio", marker = "extra == 'mcp'", specifier = ">=4.14.2" },
+    { name = "anyio", marker = "extra == 'vertex'", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", marker = "extra == 'all'", specifier = ">=4.12" },
     { name = "beautifulsoup4", marker = "extra == 'html'", specifier = ">=4.12" },
     { name = "certifi", marker = "extra == 'all'", specifier = ">=2026.10.19" },

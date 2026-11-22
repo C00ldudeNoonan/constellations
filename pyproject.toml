@@ -19,8 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # HTTP clients accept older CA bundles; floor certifi past PYSEC-2026-4320.
-# anyio is not imported by stel. Declared for its floor (here and in `mcp`):
-# `anthropic` and `mcp` pull it and do not require a version past the IDNA 2003
+# anyio is not imported by stel. Declared for its floor (here, in `mcp` and in
+# `vertex`): `anthropic`, `mcp` and `google-genai` pull it and do not require a version past the IDNA 2003
 # TLS certificate-spoofing advisory (CVE-2026-63374). uv.lock fixes that for
 # this repo and for CI; it has no effect on a published wheel, whose
 # Requires-Dist comes from here (Codex review, #593).
@@ -38,7 +38,7 @@ gcs = ["google-cloud-storage>=2.16", "cryptography>=50.0.0", "certifi>=2026.10.1
 # Drive and Slides are four REST endpoints over an authorized session, so no
 # discovery client: google-auth for ADC and the session, requests underneath.
 gdrive = ["google-auth>=2.23", "requests>=2.31", "cryptography>=50.0.0", "certifi>=2026.10.19"]
-vertex = ["google-genai>=1.28", "cryptography>=50.0.0", "certifi>=2026.10.19"]
+vertex = ["google-genai>=1.28", "anyio>=4.14.2", "cryptography>=50.0.0", "certifi>=2026.10.19"]
 lancedb = ["lancedb>=0.34,<0.35"]
 # pyjwt[crypto] is for the network transport's JWT/JWKS token verifier
 # (issue #392), httpx for the RFC 7662 introspection verifier beside it

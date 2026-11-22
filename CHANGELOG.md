@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Near-duplicate detection (`find_duplicates`, `near_duplicates`) uses a
+  first-party MinHash and LSH instead of `datasketch`, so the `text` extra no
+  longer installs numpy or scipy (issue #797, ALE-630). `minhash_signature`
+  now returns a tuple of ints. The hash family differs, so rows whose Jaccard
+  similarity sits near `threshold` can change cluster. Stored `duplicate_group`
+  values are untouched until the model reruns; cluster ids were always
+  positional within a run, so rerun the model rather than comparing across
+  versions.
 - `stel run --watch` polls source paths once a second instead of using
   `watchfiles`, which is no longer a dependency (issue #798, ALE-628). A change
   is noticed within about a second, symlinks inside a watched path are not

@@ -578,8 +578,10 @@ for recovery.
 
 ### Useful flags
 
-- `--watch` on `run` listens to source paths and re-runs on file changes
-  (debounced 500ms). Ctrl-C to stop.
+- `--watch` on `run` polls the source paths once a second and re-runs when a
+  file under them is created, modified or deleted, once the tree has been quiet
+  for one interval. Symlinks inside a watched path are not followed. Ctrl-C to
+  stop.
 - `--threads N` parallelizes per-document extraction within an extraction
   model. Most useful for PDF / LLM / HTML (I/O- or API-bound). The LLM cache
   is lock-serialized so threading is safe.

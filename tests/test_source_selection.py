@@ -162,15 +162,15 @@ def test_watch_observes_only_selected_graph_source_paths(
     forbidden_gcs_client: list[str | None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import watchfiles
+    from stel.cli_services import watch as watch_service
 
     watched: list[tuple[Path, ...]] = []
 
-    def _watch(*paths: Path, **kwargs: object) -> tuple[()]:
-        watched.append(paths)
+    def _watch(paths: Sequence[Path], **kwargs: object) -> tuple[()]:
+        watched.append(tuple(paths))
         return ()
 
-    monkeypatch.setattr(watchfiles, "watch", _watch)
+    monkeypatch.setattr(watch_service, "watch_changes", _watch)
     result = CliRunner().invoke(
         cli,
         [
@@ -193,16 +193,16 @@ def test_watch_with_empty_tag_selection_is_a_successful_noop(
     forbidden_gcs_client: list[str | None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import watchfiles
+    from stel.cli_services import watch as watch_service
 
     watch_called = False
 
-    def _watch(*paths: Path, **kwargs: object) -> tuple[()]:
+    def _watch(paths: Sequence[Path], **kwargs: object) -> tuple[()]:
         nonlocal watch_called
         watch_called = True
         return ()
 
-    monkeypatch.setattr(watchfiles, "watch", _watch)
+    monkeypatch.setattr(watch_service, "watch_changes", _watch)
     result = CliRunner().invoke(
         cli,
         [

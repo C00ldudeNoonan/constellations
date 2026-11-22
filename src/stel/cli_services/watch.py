@@ -7,7 +7,8 @@ loop is inherently interactive), but owns no command declaration.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import click
@@ -21,6 +22,64 @@ from ..paths import resolve_within_project
 from ..profile import apply_source_path_overrides, resolve_profile
 from ..runner import RunError, run_project
 from .context import CONFIG_ERRORS, ConfigClickError, load_project_or_click
+
+# One directory walk per interval: a created, modified or deleted file is
+# noticed within about this long, then the walk repeats until the tree is quiet.
+POLL_INTERVAL_SECONDS = 1.0
+
+Snapshot = dict[str, tuple[int, int]]
+
+
+def snapshot_paths(paths: Sequence[Path]) -> Snapshot:
+    """Map every file under `paths` to its (mtime_ns, size).
+
+    Symlinks are neither followed nor recorded, matching the no-follow rule for
+    local source discovery in `sources/local.py`: a link inside a watched tree
+    must not make stel observe (or re-run for) files outside it.
+    """
+    state: Snapshot = {}
+    pending = list(paths)
+    while pending:
+        current = pending.pop()
+        try:
+            if current.is_symlink():
+                continue
+            info = current.lstat()
+            if not current.is_dir():
+                state[str(current)] = (info.st_mtime_ns, info.st_size)
+                continue
+            pending.extend(current.iterdir())
+        except OSError:
+            continue  # vanished or unreadable mid-walk
+    return state
+
+
+def watch_changes(
+    paths: Sequence[Path],
+    *,
+    interval: float,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Iterator[None]:
+    """Yield once each time the files under `paths` change, forever.
+
+    A change is held until the tree is unchanged for one full interval, so a
+    burst of writes (a copy in progress) yields once. KeyboardInterrupt raised
+    by `sleep` propagates to the caller.
+    """
+    previous = snapshot_paths(paths)
+    while True:
+        sleep(interval)
+        current = snapshot_paths(paths)
+        if current == previous:
+            continue
+        while True:
+            sleep(interval)
+            settled = snapshot_paths(paths)
+            if settled == current:
+                break
+            current = settled
+        previous = current
+        yield
 
 
 def run_watch(
@@ -39,8 +98,6 @@ def run_watch(
     confirm_cost: CostConfirmation | None = None,
 ) -> None:
     """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
-    from watchfiles import watch
-
     project, sources, models = load_project_or_click(project_dir)
     try:
         dag = validate_project_contract(project, sources, models, project_dir)
@@ -117,7 +174,7 @@ def run_watch(
 
     _do_run()
     try:
-        for _ in watch(*watch_paths, debounce=500, recursive=True):
+        for _ in watch_changes(watch_paths, interval=POLL_INTERVAL_SECONDS):
             click.echo("change detected, re-running...")
             _do_run()
     except KeyboardInterrupt:

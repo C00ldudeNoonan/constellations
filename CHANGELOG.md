@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `stel run --watch` polls source paths once a second instead of using
+  `watchfiles`, which is no longer a dependency (issue #798, ALE-628). A change
+  is noticed within about a second, symlinks inside a watched path are not
+  followed, and the `anyio` floor moved from the base install to the
+  `anthropic` and `mcp` extras that pull it.
+
 - Anthropic inference now requires `pip install 'stel[anthropic]'`; a base
   install no longer includes the SDK (issue #786, ALE-631).
 

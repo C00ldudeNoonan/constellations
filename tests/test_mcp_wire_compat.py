@@ -26,6 +26,7 @@ whose public half is the only thing the verifier is told about.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import socket
 import subprocess
@@ -369,8 +370,6 @@ def _spawn(
     pipes: bool,
     stderr: Any,
 ) -> subprocess.Popen[str]:
-    import os
-
     return subprocess.Popen(
         [
             sys.executable,
@@ -411,12 +410,23 @@ class Served:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def logged(self, request_id: int, *, tool: str) -> dict[str, Any]:
-        """The query-log row for a call, waiting for the writer's batch to land."""
+    def mark(self) -> int:
+        """How many log rows exist now, so a later `logged` reads only newer ones."""
+        if not self.query_log.exists():
+            return 0
+        return len(self.query_log.read_text(encoding="utf-8").splitlines())
+
+    def logged(self, request_id: int, *, tool: str, since: int) -> dict[str, Any]:
+        """The row a call wrote after `since`, waiting for the writer's batch to land.
+
+        Request ids restart at each client, and the server keeps every earlier
+        session's rows, so matching on id alone can return a previous test's row.
+        """
         deadline = time.monotonic() + REPLY_SECONDS
         while time.monotonic() < deadline:
             if self.query_log.exists():
-                for line in self.query_log.read_text(encoding="utf-8").splitlines():
+                lines = self.query_log.read_text(encoding="utf-8").splitlines()
+                for line in lines[since:]:
                     row = json.loads(line)
                     if row.get("request_id") == str(request_id) and row.get("tool") == tool:
                         return dict(row)
@@ -834,10 +844,11 @@ def test_a_served_call_logs_the_request_and_the_client_that_made_it(
 ) -> None:
     """Issue #528: the handshake's `clientInfo` and the JSON-RPC id are what the
     protocol supplies, and they are what the query log records."""
+    since = server.mark()
     _call(client, "search_context", {"model": "context_search", "query": "inflation"})
     request_id = client.last_request_id
 
-    row = server.logged(request_id, tool="search_context")
+    row = server.logged(request_id, tool="search_context", since=since)
 
     assert row["request_id"] == str(request_id)
     assert row["client_name"] == CLIENT_NAME
@@ -849,14 +860,17 @@ def test_a_served_call_logs_the_request_and_the_client_that_made_it(
 def test_every_call_in_a_session_logs_its_own_request_id(
     server: Served, client: WireClient
 ) -> None:
+    since = server.mark()
     _call(client, "list_context_models", {})
     first = client.last_request_id
     _call(client, "list_context_models", {})
     second = client.last_request_id
 
     assert first != second
-    assert server.logged(first, tool="list_context_models")["request_id"] == str(first)
-    assert server.logged(second, tool="list_context_models")["request_id"] == str(second)
+    logged_first = server.logged(first, tool="list_context_models", since=since)
+    logged_second = server.logged(second, tool="list_context_models", since=since)
+    assert logged_first["request_id"] == str(first)
+    assert logged_second["request_id"] == str(second)
 
 
 # ─── the HTTP boundary: proxy-supplied identity ────────────────────────────
@@ -1095,10 +1109,11 @@ def test_a_verified_subject_with_no_grants_is_refused_not_defaulted(
 def test_the_log_row_for_a_token_call_names_the_verified_subject(
     at_jwt: Served, rsa_key: Any
 ) -> None:
+    since = at_jwt.mark()
     session = at_jwt.connect(_bearer(_mint(rsa_key, sub="bob")))
     _call(session, "list_context_models", {})
 
-    row = at_jwt.logged(session.last_request_id, tool="list_context_models")
+    row = at_jwt.logged(session.last_request_id, tool="list_context_models", since=since)
 
     assert row["principal_id"] == "bob"
     assert row["client_name"] == CLIENT_NAME

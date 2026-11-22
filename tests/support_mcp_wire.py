@@ -26,6 +26,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from stel.cli import cli
+from stel.mcp_server.authorization import (
+    ClaimAuthorizationProvider,
+    EnvironmentPrincipalResolver,
+)
+from stel.mcp_server.grants import Grant, GrantAuthorizationProvider, StaticGrantStore
+from stel.mcp_server.service import ContextService
+
 # The fixture ids are re-exported for `test_mcp_wire_compat.py`: test modules
 # do not import each other (`test_test_tiers.py`), support modules are the seam.
 from tests.test_mcp_server import (
@@ -75,13 +83,6 @@ class _LoggingRepository(FakeRepository):
 
 
 def _authorization() -> Any:
-    from stel.mcp_server.authorization import ClaimAuthorizationProvider
-    from stel.mcp_server.grants import (
-        Grant,
-        GrantAuthorizationProvider,
-        StaticGrantStore,
-    )
-
     if os.environ.get(AUTHORIZATION_ENV) != "grants":
         return ClaimAuthorizationProvider()
     grants = [
@@ -95,9 +96,6 @@ def _authorization() -> Any:
 def _from_project(
     project_dir: Path, *, principal_resolver: Any = None, settings: Any = None, **_: Any
 ) -> Any:
-    from stel.mcp_server.authorization import EnvironmentPrincipalResolver
-    from stel.mcp_server.service import ContextService
-
     log_path = os.environ.get(QUERY_LOG_ENV)
     return ContextService(
         catalog=_artifact_catalog(),
@@ -120,9 +118,6 @@ def _publish_local_jwks(path: Path) -> None:
 
 
 def main() -> None:
-    from stel.cli import cli
-    from stel.mcp_server.service import ContextService
-
     ContextService.from_project = staticmethod(_from_project)  # ty: ignore[invalid-assignment]
     jwks = os.environ.get(JWKS_ENV)
     if jwks:

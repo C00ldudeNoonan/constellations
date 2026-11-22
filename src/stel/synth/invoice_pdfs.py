@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
-from ..optional_dependencies import import_optional_dependency
+from .pdf_writer import Line, write_pdf
 from .words import SYNTHETIC_NOW, SyntheticText
-
-if TYPE_CHECKING:
-    from fpdf import FPDF
 
 _CURRENCIES = ["USD", "EUR", "GBP", "CAD"]
 
@@ -27,9 +24,8 @@ def generate_invoice_pdfs(count: int, output_dir: Path, seed: int = 42) -> list[
     paths: list[Path] = []
     for i in range(count):
         invoice = _make_invoice(fake, rng, i)
-        pdf = _render(invoice)
         path = output_dir / f"invoice_{i:05d}.pdf"
-        pdf.output(str(path))
+        write_pdf(path, [_render(invoice)], SYNTHETIC_NOW)
         paths.append(path)
     return paths
 
@@ -58,19 +54,12 @@ def _make_invoice(fake: SyntheticText, rng: random.Random, index: int) -> dict[s
     }
 
 
-def _render(inv: dict[str, Any]) -> FPDF:
-    pdf = _fpdf().FPDF()
-    pdf.set_creation_date(SYNTHETIC_NOW)
-    pdf.add_page()
-
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 12, "INVOICE", new_x="LMARGIN", new_y="NEXT")
-
-    pdf.set_font("Helvetica", "I", 10)
-    pdf.cell(0, 7, inv["tagline"], new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", size=11)
+def _render(inv: dict[str, Any]) -> list[Line]:
+    lines = [
+        Line("INVOICE", size=18, leading=12, style="B"),
+        Line(inv["tagline"], size=10, leading=7, style="I"),
+        Line("", leading=4),
+    ]
     for label, key in [
         ("From", "vendor"),
         ("To", "billed_to"),
@@ -78,40 +67,21 @@ def _render(inv: dict[str, Any]) -> FPDF:
         ("Issue date", "issue_date"),
         ("Currency", "currency"),
     ]:
-        pdf.cell(0, 7, f"{label}: {inv[key]}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, "Line items:", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", size=10)
+        lines.append(Line(f"{label}: {inv[key]}", size=11, leading=7))
+    lines += [Line("", leading=4), Line("Line items:", size=11, leading=7, style="B")]
     for li in inv["line_items"]:
         line_total = li["qty"] * li["unit_price"]
-        pdf.cell(
-            0,
-            6,
-            f"  - {li['description']}: {li['qty']} x {inv['currency']} "
-            f"{li['unit_price']:.2f} = {inv['currency']} {line_total:.2f}",
-            new_x="LMARGIN",
-            new_y="NEXT",
+        lines.append(
+            Line(
+                f"  - {li['description']}: {li['qty']} x {inv['currency']} "
+                f"{li['unit_price']:.2f} = {inv['currency']} {line_total:.2f}",
+                size=10,
+                leading=6,
+            )
         )
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(
-        0,
-        8,
-        f"Total due: {inv['currency']} {inv['total']:.2f}",
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-
-    pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, "Payment terms: Net 30 days.", new_x="LMARGIN", new_y="NEXT")
-
-    return cast("FPDF", pdf)
-
-
-def _fpdf() -> Any:
-    return import_optional_dependency(
-        "fpdf", extra="pdf", feature="Synthetic PDF generation"
-    )
+    lines += [
+        Line("", leading=4),
+        Line(f"Total due: {inv['currency']} {inv['total']:.2f}", size=12, leading=8, style="B"),
+        Line("Payment terms: Net 30 days.", size=10, leading=6),
+    ]
+    return lines

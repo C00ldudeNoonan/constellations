@@ -16,6 +16,8 @@ import duckdb
 import pytest
 
 from stel.backends import get_backend
+from stel.synth.pdf_writer import Line, write_pdf
+from stel.synth.words import SYNTHETIC_NOW
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
 # `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
@@ -241,22 +243,16 @@ def test_semantic_heading_sections_carry_source_tag() -> None:
 
 @pytest.fixture
 def transcript_pdf(tmp_path: Path) -> Path:
-    from fpdf import FPDF
-
-    pdf = FPDF()
-    pdf.set_font("Helvetica", size=11)
-    pdf.add_page()
-    pdf.multi_cell(0, 8, "Quarterly Planning Meeting\nJanuary 28-29, 2026")
-    pdf.add_page()
-    pdf.multi_cell(
-        0, 8,
-        "CHAIR THOMPSON. Good morning, everybody.\n"
-        "MR. GARCIA. Thank you, Madam Chair.",
-    )
-    pdf.add_page()
-    pdf.multi_cell(0, 8, "CHAIR THOMPSON. We are adjourned.")
+    pages = [
+        ["Quarterly Planning Meeting", "January 28-29, 2026"],
+        [
+            "CHAIR THOMPSON. Good morning, everybody.",
+            "MR. GARCIA. Thank you, Madam Chair.",
+        ],
+        ["CHAIR THOMPSON. We are adjourned."],
+    ]
     out = tmp_path / "transcript.pdf"
-    pdf.output(str(out))
+    write_pdf(out, [[Line(t, leading=8) for t in page] for page in pages], SYNTHETIC_NOW)
     return out
 
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Synthetic invoice PDFs (`stel seed --type invoice_pdfs`) come from a
+  first-party text-only writer instead of `fpdf2`, so the `pdf` extra is
+  `pypdf` alone and no longer installs `fpdf2`, `fonttools` or `pillow`
+  (issue #801, ALE-629). The files are not byte-identical to earlier releases;
+  they extract the same text, and `stel seed` no longer needs the `pdf` extra.
 - Near-duplicate detection (`find_duplicates`, `near_duplicates`) uses a
   first-party MinHash and LSH instead of `datasketch`, so the `text` extra no
   longer installs numpy or scipy (issue #797, ALE-630). `minhash_signature`

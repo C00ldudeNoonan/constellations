@@ -223,7 +223,9 @@ def test_cli_manifest_keeps_the_published_vocabulary_snapshot(
     monkeypatch.setattr(DuckDBAdapter, "read_relation", read_relation)
     monkeypatch.setattr("stel.runner._run_extraction_model", publish_then_change)
     if invocation == "watch":
-        monkeypatch.setattr("watchfiles.watch", lambda *args, **kwargs: iter(()))
+        monkeypatch.setattr(
+            "stel.cli_services.watch.watch_changes", lambda *args, **kwargs: iter(())
+        )
     command = "run" if invocation == "watch" else invocation
     args = [command, "--project-dir", str(tmp_path), "--select", "classified"]
     if invocation == "watch":

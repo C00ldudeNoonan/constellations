@@ -78,7 +78,7 @@ def test_watch_reports_no_source_paths(
         ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
     )
     # No source files exist on disk yet, so the watch service refuses to start
-    # its loop — reachable now without invoking the CLI or watchfiles.
+    # its loop — reachable now without invoking the CLI or the watch loop.
     with pytest.raises(ClickException, match="No source paths exist on disk"):
         run_watch(
             project,

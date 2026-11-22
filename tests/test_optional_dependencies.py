@@ -18,7 +18,6 @@ from stel import chunking, optional_dependencies
 from stel.backends import html_backend, options, pdf_backend
 from stel.cli import cli
 from stel.optional_dependencies import OptionalDependencyError
-from stel.synth import invoice_pdfs
 from stel.text import encoding, language, nlp, pii, tokens
 
 
@@ -34,7 +33,6 @@ def _reset_optional_caches() -> None:
     ("blocked", "extra", "use_feature"),
     [
         ("pypdf", "pdf", pdf_backend._pypdf),
-        ("fpdf", "pdf", invoice_pdfs._fpdf),
         ("bs4", "html", html_backend._bs4),
         ("soupsieve", "html", lambda: options._validate_css_selector("p.title")),
         ("tiktoken", "text", lambda: tokens.count_tokens("hello")),
@@ -86,7 +84,7 @@ def test_core_cli_imports_without_optional_packages() -> None:
 import builtins
 
 blocked = {
-    'bs4', 'fpdf', 'ftfy', 'langdetect', 'presidio_analyzer',
+    'bs4', 'ftfy', 'langdetect', 'presidio_analyzer',
     'presidio_anonymizer', 'pypdf', 'spacy', 'tiktoken', 'mcp',
 }
 real_import = builtins.__import__
@@ -171,7 +169,7 @@ def test_run_reports_missing_optional_dependency_without_traceback(
     assert "Traceback" not in result.output
 
 
-def test_seed_reports_missing_pdf_extra_without_traceback(
+def test_seed_invoice_pdfs_needs_no_optional_extra(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -189,12 +187,12 @@ def test_seed_reports_missing_pdf_extra_without_traceback(
     )
     real_import = importlib.import_module
 
-    def import_without_fpdf(name: str, package: str | None = None) -> object:
-        if name == "fpdf":
+    def import_without_pdf_extra(name: str, package: str | None = None) -> object:
+        if name == "pypdf" or name.startswith("pypdf."):
             raise ModuleNotFoundError(name=name)
         return real_import(name, package)
 
-    monkeypatch.setattr(importlib, "import_module", import_without_fpdf)
+    monkeypatch.setattr(importlib, "import_module", import_without_pdf_extra)
 
     result = CliRunner().invoke(
         cli,
@@ -209,9 +207,11 @@ def test_seed_reports_missing_pdf_extra_without_traceback(
         ],
     )
 
-    assert result.exit_code == 2, result.output
-    assert "pip install 'stel[pdf]'" in result.output
-    assert "Traceback" not in result.output
+    # Synthetic PDFs come from stel's own writer (ALE-629), not the `pdf` extra.
+    assert result.exit_code == 0, result.output
+    written = list(tmp_path.rglob("invoice_*.pdf"))
+    assert len(written) == 1
+    assert written[0].read_bytes().startswith(b"%PDF-")
 
 
 def test_unselected_pdf_model_does_not_import_pdf_extra_during_manifest(
@@ -326,7 +326,6 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "anthropic",
         "beautifulsoup4",
         "cryptography",
-        "fpdf2",
         "ftfy",
         "langdetect",
         "mcp",

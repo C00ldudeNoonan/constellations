@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Near-duplicate detection (`find_duplicates`, `near_duplicates`) uses a
+  first-party MinHash and LSH instead of `datasketch`, so the `text` extra no
+  longer installs numpy or scipy (issue #797, ALE-630). `minhash_signature`
+  now returns a tuple of ints. The hash family differs, so rows whose Jaccard
+  similarity sits near `threshold` can change cluster. Stored `duplicate_group`
+  values are untouched until the model reruns; cluster ids were always
+  positional within a run, so rerun the model rather than comparing across
+  versions.
+
 - Anthropic inference now requires `pip install 'stel[anthropic]'`; a base
   install no longer includes the SDK (issue #786, ALE-631).
 

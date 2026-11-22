@@ -19,7 +19,7 @@ from stel.backends import html_backend, options, pdf_backend
 from stel.cli import cli
 from stel.optional_dependencies import OptionalDependencyError
 from stel.synth import invoice_pdfs
-from stel.text import dedup, encoding, language, nlp, pii, tokens
+from stel.text import encoding, language, nlp, pii, tokens
 
 
 def _reset_optional_caches() -> None:
@@ -44,7 +44,6 @@ def _reset_optional_caches() -> None:
             "text",
             lambda: language.detect_language("This input is long enough to detect."),
         ),
-        ("datasketch", "text", lambda: dedup.minhash_signature("hello world")),
         (
             "presidio_analyzer",
             "pii",
@@ -87,7 +86,7 @@ def test_core_cli_imports_without_optional_packages() -> None:
 import builtins
 
 blocked = {
-    'bs4', 'datasketch', 'fpdf', 'ftfy', 'langdetect', 'presidio_analyzer',
+    'bs4', 'fpdf', 'ftfy', 'langdetect', 'presidio_analyzer',
     'presidio_anonymizer', 'pypdf', 'spacy', 'tiktoken', 'mcp',
 }
 real_import = builtins.__import__
@@ -327,7 +326,6 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "anthropic",
         "beautifulsoup4",
         "cryptography",
-        "datasketch",
         "fpdf2",
         "ftfy",
         "langdetect",

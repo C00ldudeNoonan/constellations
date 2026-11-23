@@ -717,7 +717,7 @@ before anything else sees the request, so `list_context_models` advertises, and
 the query log records, only `ge` and `le`.
 
 A search hit carries the attributes the model declares `returned: true`, in
-an `attributes` object beside `citation` and `lineage`:
+an `attributes` object beside `citation`:
 
 ```json
 {
@@ -730,8 +730,7 @@ an `attributes` object beside `citation` and `lineage`:
     "filing_date_dt": "2018-02-01",
     "section": "Risk Factors"
   },
-  "citation": {"…": "…"},
-  "lineage": {"…": "…"}
+  "citation": {"…": "…"}
 }
 ```
 
@@ -743,6 +742,31 @@ arrive JSON-shaped: a `date` or `timestamp` attribute is an ISO string.
 `returned: false` withholds an attribute from both this response and
 `stel search`. It is the only control over what leaves the governed boundary,
 so an attribute declared for filtering alone should say so.
+
+## Lean and full results
+
+`search_context` takes `detail`, `lean` (the default) or `full`. A lean result
+carries the passage and what an agent needs to cite and label it: `rank`,
+`score`, the document, version, context and chunk ids, `snippet`,
+`source_version`, `entities`, `citation`, `attributes` and `matched_terms`.
+`interval`, `freshness` and `lineage` are `null`, and the response's own
+`detail` field says so, so a `null` there means "not requested", never
+"unknown".
+
+`detail: "full"` adds those three blocks to every result. `lineage.resources`
+is the same list of upstream resources on every chunk of a response, which is
+why it is opt-in; to trace one chunk, pass its `chunk_id` to
+`get_context_lineage` instead of paying for the block on all of them.
+
+```json
+{"model": "sec_chunk_search", "query": "capital expenditure guidance", "detail": "full"}
+```
+
+Making `lean` the default removed fields a caller used to receive, which
+[ADR-0008](adr/0008-mcp-hits-carry-declared-attributes.md) reserves a version
+bump for, so the schema is now `mcp_context/v2` (issue #812). A caller that
+read `interval`, `freshness` or `lineage` off search results passes
+`"detail": "full"` and sees the v1 content under the v2 marker.
 
 ## How current an index is
 
@@ -793,7 +817,7 @@ or republishes a row, so it can be tightened on a large corpus for free.
 publish claim, which generation is active, and why a degraded scope is
 degraded.
 
-Every response uses the `mcp_context/v1` schema and returns a structured error
+Every response uses the `mcp_context/v2` schema and returns a structured error
 with a stable code. Unauthorized and nonexistent models or records both return
 `not_found_or_denied`; the server does not reveal which condition occurred.
 Timeout, request-rate, and concurrency errors are retryable. Response and scan

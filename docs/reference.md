@@ -6927,7 +6927,7 @@ would corrupt the zero-result rate this corpus exists to measure. The result bod
 the fingerprint uses the same function and domain as the MCP query log, so a
 transcript row joins directly to a served-side log row.
 
-Recognition keys on the response's own `mcp_context/v1` marker rather than on
+Recognition keys on the response's own `mcp_context/v2` marker rather than on
 the MCP server's name, which is operator-chosen in client configuration: a
 tool named like stel's that answers something else is not treated as one.
 Query *text* stays out unless `--capture-context-queries` is passed, the same

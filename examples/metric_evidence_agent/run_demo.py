@@ -45,6 +45,8 @@ _SEARCH_ARGUMENTS = {
     "query": "enterprise refund policy",
     "mode": "text",
     "limit": 10,
+    # The demo orders hits by `interval.valid_from`, which only a full result carries.
+    "detail": "full",
     "filters": [
         {"field": "customer_segment", "operator": "eq", "value": "enterprise"},
         {"field": "effective_date", "operator": "ge", "value": "2026-04-01"},

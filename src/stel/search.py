@@ -1728,7 +1728,7 @@ def json_value(value: Any) -> Any:
     """Coerce a search value into something JSON and Pydantic will take.
 
     Public because two surfaces need the *same* coercion: the CLI's
-    `--output json` and the MCP `mcp_context/v1` contract, whose value
+    `--output json` and the MCP `mcp_context/v2` contract, whose value
     type admits no `date` (issue #524). Two implementations of this would
     drift, and the drift would show up as one surface rendering a filing
     date the other rejects.

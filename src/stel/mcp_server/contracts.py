@@ -14,7 +14,7 @@ from pydantic import (
     model_validator,
 )
 
-MCP_CONTEXT_SCHEMA_VERSION: Final = "mcp_context/v1"
+MCP_CONTEXT_SCHEMA_VERSION: Final = "mcp_context/v2"
 _STABLE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _STRICT_CONFIG = ConfigDict(extra="forbid", frozen=True)
 
@@ -223,7 +223,7 @@ class ContextModelSummary(BaseModel):
 class ListContextModelsRequest(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     limit: int = Field(default=20, ge=1, le=100)
     cursor: str | None = Field(default=None, max_length=4096)
 
@@ -231,16 +231,19 @@ class ListContextModelsRequest(BaseModel):
 class ListContextModelsResponse(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     models: tuple[ContextModelSummary, ...] = ()
     next_cursor: str | None = None
     error: ToolError | None = None
 
 
+type SearchDetail = Literal["lean", "full"]
+
+
 class SearchContextRequest(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     model: str = Field(min_length=1, max_length=128)
     query: str = Field(min_length=1, max_length=32_768)
     mode: Literal["vector", "text", "hybrid"] = "hybrid"
@@ -258,6 +261,12 @@ class SearchContextRequest(BaseModel):
     # carries; ADR-0025 records why, and `AppliedEntityScope.results_excluded`
     # is how a caller sees the consequence.
     entity_scope: EntityScope | None = None
+    # How much provenance each result carries (issue #812). `lean` is the
+    # default because most reads want the passage and where it came from, not
+    # the per-chunk lineage block, whose `resources` list repeats verbatim on
+    # every result. `get_context_lineage` answers the deep question for one
+    # chunk; `full` inlines the block on every result.
+    detail: SearchDetail = "lean"
 
 
 class ContextEntity(BaseModel):
@@ -338,16 +347,19 @@ class SearchContextResult(BaseModel):
     snippet_truncated: bool
     source_version: str
     entities: tuple[ContextEntity, ...]
-    interval: ContextInterval
-    freshness: FreshnessDescriptor
     citation: CitationDescriptor
-    lineage: CompactLineage
+    # Present only under `detail: full`, null under `lean` (mcp_context/v2,
+    # issue #812). Null means "not requested", never "unknown": the response's
+    # own `detail` says which.
+    interval: ContextInterval | None = None
+    freshness: FreshnessDescriptor | None = None
+    lineage: CompactLineage | None = None
     # The attributes the model declares `returned: true`, which the catalog
     # already advertises and callers already filter on (issue #524). Without
     # them a hit cannot say which symbol, form or section it came from, so an
     # agent can scope a search to one ticker and be unable to label the answer.
     #
-    # Additive within `mcp_context/v1`, and defaulted: a model that declares
+    # Additive within `mcp_context/v2`, and defaulted: a model that declares
     # none produces the response it produced before. See
     # `docs/adr/0008-mcp-hits-carry-declared-attributes.md` for why this is not
     # a v2.
@@ -363,13 +375,16 @@ class SearchContextResult(BaseModel):
 class SearchContextResponse(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     results: tuple[SearchContextResult, ...] = ()
+    # The detail level the results were built at, echoed so a reader of a
+    # stored response can tell a lean `null` from a missing one.
+    detail: SearchDetail = "lean"
     # The pinned generation's own status, not inferred from `results`: a
     # degraded index can answer "nothing matched" exactly as a ready one
     # does, and without this field that reader has no way to tell a stale
     # answer from a healthy one (issue #617, ask 3). False/None on an error
-    # response, where there is no lease to ask. Additive to `mcp_context/v1`
+    # response, where there is no lease to ask. Additive to `mcp_context/v2`
     # rather than a v2, per the precedent ADR-0008 set for `attributes`.
     degraded: bool = False
     # What the request's `entity_scope` resolved to, None when unscoped
@@ -382,7 +397,7 @@ class SearchContextResponse(BaseModel):
 class GetDocumentRequest(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     model: str = Field(min_length=1, max_length=128)
     document_id: str
     document_version_id: str
@@ -422,7 +437,7 @@ class DocumentChunk(BaseModel):
 class GetDocumentResponse(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     document_id: str | None = None
     document_version_id: str | None = None
     source: DocumentSource | None = None
@@ -445,7 +460,7 @@ class LineageReferenceType(StrEnum):
 class GetContextLineageRequest(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     model: str = Field(min_length=1, max_length=128)
     reference_type: LineageReferenceType
     reference_id: str
@@ -474,6 +489,6 @@ class ContextLineageRecord(BaseModel):
 class GetContextLineageResponse(BaseModel):
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     record: ContextLineageRecord | None = None
     error: ToolError | None = None

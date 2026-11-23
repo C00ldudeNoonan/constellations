@@ -11,8 +11,8 @@ fingerprint, never result bodies and never — unless separately opted in — th
 query text, mirroring `QueryLogConfig.capture_query_text`.
 
 Recognition keys on the **response's own contract marker**
-(`schema_version: mcp_context/v1`), not on the MCP server's name: the server
-name is operator-chosen in client configuration, so matching it would
+(`schema_version: mcp_context/v2`; v1 in older transcripts), not on the MCP
+server's name: the server name is operator-chosen in client configuration, so matching it would
 privilege one deployment's spelling and miss every other.
 """
 from __future__ import annotations
@@ -29,6 +29,11 @@ from .events import ContextCall
 # rather than a retrieval to judge, so it is not captured here.
 SEARCH_TOOL = "search_context"
 
+# A transcript is a record of calls already made, so one captured before the
+# v2 bump still parses: the fields this module reads (ids, results, error) are
+# the same in both versions (issue #812).
+_RECOGNISED_SCHEMA_VERSIONS = frozenset({MCP_CONTEXT_SCHEMA_VERSION, "mcp_context/v1"})
+
 
 def parse_context_call(
     tool_name: str,
@@ -39,7 +44,7 @@ def parse_context_call(
 ) -> ContextCall | None:
     """The reduced record of one stel `search_context` call, or None when this
     is not one. `result` is the raw tool-result payload; anything that does not
-    parse as an `mcp_context/v1` response is treated as an unrelated tool."""
+    parse as an `mcp_context/v2` response is treated as an unrelated tool."""
     if not _is_search_tool(tool_name):
         return None
     payload = _as_context_payload(result)
@@ -98,7 +103,7 @@ def cited_ids(prose: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
 def _error_code(payload: dict[str, Any]) -> str | None:
     """The MCP error code of a failed context response, else None.
 
-    An error response still declares `mcp_context/v1` and carries empty
+    An error response still declares `mcp_context/v2` and carries empty
     `results`, so without this a denied or timed-out call would be recorded as
     a genuine zero-result retrieval.
     """
@@ -119,7 +124,7 @@ def _is_search_tool(tool_name: str) -> bool:
 
 
 def _as_context_payload(result: Any) -> dict[str, Any] | None:
-    """`result` parsed as an mcp_context/v1 response, or None.
+    """`result` parsed as an mcp_context/v2 response, or None.
 
     Handles the three shapes a tool result travels in: a JSON string, an
     already-decoded object, and the list of `{"type": "text"}` blocks MCP
@@ -145,6 +150,8 @@ def _as_context_payload(result: Any) -> dict[str, Any] | None:
         parsed = result
     if not isinstance(parsed, dict):
         return None
-    if parsed.get("schema_version") != MCP_CONTEXT_SCHEMA_VERSION:
+    marker = parsed.get("schema_version")
+    # A list or dict marker is unhashable, so test the type before membership.
+    if not isinstance(marker, str) or marker not in _RECOGNISED_SCHEMA_VERSIONS:
         return None
     return parsed

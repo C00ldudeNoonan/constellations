@@ -38,10 +38,13 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Any, Protocol, Self, TextIO
 
 import click
+
+from .table_layout import LEDGER_NAME_MINIMUM, column_width
 
 
 class OutputLevel(enum.IntEnum):
@@ -66,7 +69,13 @@ class ProgressTask(Protocol):
 
 class ProgressReporter(Protocol):
     def run_started(
-        self, total: int, *, target: str, warehouse: str, project_total: int
+        self,
+        total: int,
+        *,
+        target: str,
+        warehouse: str,
+        project_total: int,
+        model_names: Sequence[str],
     ) -> None: ...
     def source_discovered(self, source_name: str, count: int) -> None: ...
     def model_task(self, model_name: str, kind: str, total: int) -> ProgressTask: ...
@@ -104,7 +113,13 @@ class _NullTask:
 
 class _NullReporter:
     def run_started(
-        self, total: int, *, target: str, warehouse: str, project_total: int
+        self,
+        total: int,
+        *,
+        target: str,
+        warehouse: str,
+        project_total: int,
+        model_names: Sequence[str],
     ) -> None:
         return
 
@@ -213,6 +228,7 @@ class _TerminalReporter:
         self._bars = bars
         self._total = 0
         self._completed = 0
+        self._name_width = LEDGER_NAME_MINIMUM
         self._started_at: float | None = None
         # A live per-model bar defers detail lines; >0 while one is active. Only
         # one bar is ever active on this channel — verbose over multiple
@@ -262,10 +278,17 @@ class _TerminalReporter:
             self._echo(message)
 
     def run_started(
-        self, total: int, *, target: str, warehouse: str, project_total: int
+        self,
+        total: int,
+        *,
+        target: str,
+        warehouse: str,
+        project_total: int,
+        model_names: Sequence[str],
     ) -> None:
         self._total = total
         self._completed = 0
+        self._name_width = column_width(model_names, minimum=LEDGER_NAME_MINIMUM)
         self._started_at = now_monotonic()
         noun = "model" if total == 1 else "models"
         # "3 of 12" only when a selector actually narrowed the run; otherwise
@@ -310,14 +333,14 @@ class _TerminalReporter:
         self._completed += 1
         outcome = status.upper() if status else ("ERROR" if failed else "OK")
         self._echo(
-            f"{self._counter()} {model_name:<24}{kind:<12}"
+            f"{self._counter()} {model_name:<{self._name_width}}{kind:<12}"
             f"{rows:>9,} rows{_format_duration(duration):>9}  {outcome}"
         )
 
     def model_skipped(self, model_name: str, reason: str) -> None:
         self._completed += 1
         self._echo(
-            f"{self._counter()} {model_name:<24}{'-':<12}"
+            f"{self._counter()} {model_name:<{self._name_width}}{'-':<12}"
             f"{'-':>9}     {'-':>8}  SKIPPED ({reason})"
         )
 

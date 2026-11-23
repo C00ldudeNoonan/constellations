@@ -395,6 +395,7 @@ def run_project(
         target=resolved.target_name,
         warehouse=resolved.warehouse.type,
         project_total=len(models),
+        model_names=list(selected),
     )
     log.info(
         "selected %d of %d model(s)",
@@ -633,6 +634,7 @@ def build_project(
         target=resolved.target_name,
         warehouse=resolved.warehouse.type,
         project_total=len(models),
+        model_names=list(selected),
     )
     log.info(
         "selected %d of %d model(s)",

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The run ledger and the summary tables no longer fuse columns when a model
+  name reaches the fixed width. The live ledger, the `run` and `build`
+  summaries, the test and eval tables, `stel ls` and source freshness size their
+  name columns from the names being printed and keep a space between every pair
+  of columns; a longer name is never truncated. Ordinary names print exactly as
+  before (issue #819, ALE-795).
 - `stel --version`, `stel --help` and every command's `--help` no longer load
   the runner, compiler, warehouse adapters or a dataframe library: `cli.py`
   imports each command's dependencies inside the command body, and a Click

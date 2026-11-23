@@ -189,7 +189,13 @@ def test_ledger_renders_header_counter_outcomes_and_footer() -> None:
     model with its outcome, and a footer that agrees with them."""
     stream = io.StringIO()
     reporter = _TerminalReporter(stream, level=OutputLevel.NORMAL, bars=False)
-    reporter.run_started(3, target="dev", warehouse="duckdb", project_total=7)
+    reporter.run_started(
+        3,
+        target="dev",
+        warehouse="duckdb",
+        project_total=7,
+        model_names=["raw", "summary", "totals"],
+    )
     reporter.model_finished("raw", "extraction", 1204, 12.4, None, failed=False)
     reporter.model_finished("summary", "transform", 0, 0.2, None, failed=True)
     reporter.model_skipped("totals", "upstream failed")
@@ -212,7 +218,9 @@ def test_ledger_header_omits_the_total_when_nothing_was_narrowed() -> None:
     dropped."""
     stream = io.StringIO()
     reporter = _TerminalReporter(stream, level=OutputLevel.NORMAL, bars=False)
-    reporter.run_started(7, target="prod", warehouse="bigquery", project_total=7)
+    reporter.run_started(
+        7, target="prod", warehouse="bigquery", project_total=7, model_names=[]
+    )
     assert stream.getvalue().startswith("Running 7 models (target: prod, bigquery)")
 
 
@@ -221,7 +229,9 @@ def test_ledger_status_beats_the_failed_flag() -> None:
     the runner set is what the operator needs to see."""
     stream = io.StringIO()
     reporter = _TerminalReporter(stream, level=OutputLevel.NORMAL, bars=False)
-    reporter.run_started(1, target="dev", warehouse="duckdb", project_total=1)
+    reporter.run_started(
+        1, target="dev", warehouse="duckdb", project_total=1, model_names=["m"]
+    )
     reporter.model_finished(
         "m", "llm", 0, 1.0, "budget_exceeded", failed=True
     )

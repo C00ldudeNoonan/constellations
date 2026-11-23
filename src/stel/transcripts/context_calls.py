@@ -150,6 +150,8 @@ def _as_context_payload(result: Any) -> dict[str, Any] | None:
         parsed = result
     if not isinstance(parsed, dict):
         return None
-    if parsed.get("schema_version") not in _RECOGNISED_SCHEMA_VERSIONS:
+    marker = parsed.get("schema_version")
+    # A list or dict marker is unhashable, so test the type before membership.
+    if not isinstance(marker, str) or marker not in _RECOGNISED_SCHEMA_VERSIONS:
         return None
     return parsed

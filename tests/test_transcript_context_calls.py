@@ -360,3 +360,16 @@ def test_a_v1_transcript_is_still_recognized(tmp_path: Path) -> None:
     v1 = _context_response(_CTX_A).replace("mcp_context/v2", "mcp_context/v1")
     call, _ = _only_call(tmp_path, _session(result=v1))
     assert call.returned_context_ids == (_CTX_A,)
+
+
+def test_an_unhashable_schema_marker_is_not_a_context_call(tmp_path: Path) -> None:
+    """A tool result whose `schema_version` is a list or object is some other
+    tool's payload; it must be ignored, not abort the conversion (review of
+    PR #813: set membership raises TypeError on an unhashable value)."""
+    for marker in (["mcp_context/v2"], {"v": "mcp_context/v2"}, 2):
+        payload = json.dumps({"schema_version": marker, "results": []})
+        session = parse_transcript(_write(tmp_path, _session(result=payload)))
+        assert session is not None
+        document = build_document(session)
+        assert document is not None
+        assert document.exchanges[0].context_calls == ()

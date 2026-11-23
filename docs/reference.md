@@ -442,7 +442,7 @@ stel providers list [--output {table,json}]              # built-in + entry-poin
 stel source freshness                                    # mtime vs warn_after/error_after
 stel docs generate [--output DIR]                        # static HTML site from manifest.json
 stel docs serve [--port N]                               # local http.server over target/docs/
-stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR]  # nodes.jsonl + edges.jsonl a graph store can load
+stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR]  # per-document nodes/ + edges/ shards a graph store can load; incremental
 stel emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
 stel codegen --output DIR                                # generate dbt Python-model shims + schema.yml (embedded path)
 stel clean                                               # remove known target artifacts; preserve warehouses
@@ -6275,12 +6275,18 @@ stel graph-export --linking-model entity_links --relation-model entity_relations
   --entity-name system -o target/graph
 ```
 
-It reads only the two models' output tables and writes three files:
+It reads only the two models' output tables and writes one *shard* per
+document, plus a manifest. A document's shard is two files, named by a hash of
+its id (`nodes/<xx>/<shard>.jsonl` and `edges/<xx>/<shard>.jsonl`, where `<xx>`
+is the first two hex characters of the hash; a document with no nodes or no
+edges has no file of that kind):
 
-- `nodes.jsonl` — one row per entity a matched link resolved to: `entity_id`,
+- `nodes/` — one row per entity a matched link in that document resolved to: `entity_id`,
   `entity_namespace`, `entity_name`, `canonical_id`, `class` (from the
   vocabulary term, or null) and `class_ancestors` (nearest parent first).
-- `edges.jsonl` — one row per extracted fact, not an aggregate:
+  An entity linked in several documents is one row in each, identical every
+  time: load nodes with a merge on `entity_id`, or deduplicate by it.
+- `edges/` — one row per extracted fact, not an aggregate:
   `relation_id`, `subject_entity_id`, `object_entity_id`, `relation_type`,
   `directed`, `method`, `confidence`, `document_id`, `sentence_index`,
   `extractor`, `extractor_version`, the `*_resolver` / `*_resolver_version`
@@ -6290,9 +6296,11 @@ It reads only the two models' output tables and writes three files:
   Every edge therefore names the document and extractor version it came from.
   Point `--relation-model` at the `supersede_relations` model to export closed
   intervals.
-- `graph_manifest.json` — `stel.graph_export/v2`, the models read, row counts, a
-  SHA-256 per file and a count of relations left out by reason. It is written
-  last, so a directory that has one is complete.
+- `graph_manifest.json` — `stel.graph_export/v3`, the models read, totals, a
+  count of relations left out by reason, and for each document that has a
+  shard its `shard` name, node and edge row counts, and a `sha256`
+  fingerprint of its two files' content. It is written last, so a directory
+  that has one is complete.
 
 **Node ids join to governed metrics.** `entity_id` is the agent-context
 `make_entity_id(entity_namespace, entity_name, canonical_id)`, the same id
@@ -6315,24 +6323,57 @@ timestamp, so two exports of unchanged tables are byte-identical. No mention
 text is read, so nothing withheld upstream (`include_mention_text`) reaches the
 files.
 
-**Not in v1.** The export is a full rewrite each time (no incremental export),
-JSON Lines only (no JSON-LD, Turtle or Graphiti format), and carries no `iri`
-or validity interval, because neither exists in stel yet. The manifest schema
-is versioned so adding them is a version bump, not a column of nulls.
+**Incremental.** Exporting again into the same directory rewrites only what
+moved (issue #807, [ADR-0061](adr/0061-graph-export-is-incremental-by-document-shards.md)).
+Both tables are streamed in batches, ordered by `document_id`, and joined one
+document at a time, so memory follows one document and the manifest's
+per-document entries rather than the corpus. A document whose fingerprint is
+unchanged is not rewritten; one that changed has its shard and the manifest
+rewritten; one that is no longer in either table (or has nothing left to
+export) has its shards and manifest entry removed, so its edges leave the
+export. Removal happens only after the whole read succeeded, and an export
+that fails to read, or whose tables changed under the read, leaves the
+previous export as it was; a failure while committing is recovered by the next
+run, which rewrites every shard. An export of two empty tables removes every shard. The
+command prints how many shards it wrote, left alone and removed, and a
+re-export of unchanged tables writes nothing at all.
+
+Both tables must carry `entity_link_id` and `relation_id` (unique and not
+null, which is what orders the stream) and `document_id`. A relation's
+mentions are resolved against the links of its own document. Rows must sort
+the way a plain string comparison of `document_id` does; the export checks
+this and fails rather than pair the wrong documents. Stale-shard removal
+is bounded by what the manifest names, so after a crash that left no
+manifest the next export removes files shaped like shards that nothing
+names, and touches nothing else in the directory.
+
+**An earlier export is protected.** A directory holding a v1 or v2 export
+(`nodes.jsonl`, `edges.jsonl`) is left untouched until the v3 export has
+committed, then those two files are removed. A manifest that is unreadable,
+malformed, or from a newer stel is refused, and nothing in the directory is
+changed.
+
+**Not yet.** JSON Lines only (no JSON-LD, Turtle or Graphiti format), and
+no `iri`. The manifest schema is versioned so adding them is a version bump,
+not a column of nulls. v3 changed the layout from two whole files to shards:
+a loader written for v1 or v2 reads `nodes/` and `edges/` instead.
 
 **Loading into Neo4j.** With the APOC plugin and the files under Neo4j's
-import directory, nothing needs hand-transforming. This snippet is not
+import directory, nothing needs hand-transforming. Run each statement once per
+shard file (list them from `nodes/` and `edges/`); the merges are idempotent,
+so a shard loaded twice, or an entity that appears in several, is harmless.
+Load every `nodes/` file before any `edges/` file. This snippet is not
 exercised by stel's tests (they need no database); treat it as a starting point:
 
 ```cypher
 CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.entity_id IS UNIQUE;
 
-CALL apoc.load.json('file:///graph/nodes.jsonl') YIELD value
+CALL apoc.load.json('file:///graph/nodes/ab/<shard>.jsonl') YIELD value
 MERGE (n:Entity {entity_id: value.entity_id})
 SET n.canonical_id = value.canonical_id, n.entity_namespace = value.entity_namespace,
     n.class = value.class, n.class_ancestors = value.class_ancestors;
 
-CALL apoc.load.json('file:///graph/edges.jsonl') YIELD value
+CALL apoc.load.json('file:///graph/edges/ab/<shard>.jsonl') YIELD value
 MATCH (s:Entity {entity_id: value.subject_entity_id}),
       (o:Entity {entity_id: value.object_entity_id})
 CALL apoc.merge.relationship(s, toUpper(value.relation_type),

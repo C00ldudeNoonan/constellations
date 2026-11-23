@@ -12,6 +12,15 @@
   `Host` check on every bind is kept as it was, see [Protocol and SDK compatibility](docs/mcp.md#protocol-and-sdk-compatibility).
   The SDK no longer reads `MCP_*` environment variables or `.env` files.
 
+- `stel graph-export` is incremental by document, and its output layout
+  changed: `nodes.jsonl` and `edges.jsonl` are replaced by a shard per
+  document under `nodes/` and `edges/`, and the manifest is
+  `stel.graph_export/v3` with a fingerprint per document. A re-export rewrites
+  only the documents that changed, removes the shards of documents that left
+  the source, and reads both tables in bounded batches instead of whole. An
+  entity linked in several documents is a node row in each. A v1/v2 export in
+  the directory is replaced once the new one commits; point a loader at
+  `nodes/` and `edges/` (issue #807, ALE-601, ADR-0061).
 - Synthetic invoice PDFs (`stel seed --type invoice_pdfs`) come from a
   first-party text-only writer instead of `fpdf2`, so the `pdf` extra is
   `pypdf` alone and no longer installs `fpdf2`, `fonttools` or `pillow`

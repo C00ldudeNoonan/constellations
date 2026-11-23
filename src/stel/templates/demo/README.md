@@ -155,9 +155,10 @@ stel graph-export --linking-model entity_links --relation-model entity_relations
   --entity-name system -o target/graph
 ```
 
-`target/graph/nodes.jsonl` has one row per system, keyed by the `entity_id`
-the agent-context tables carry, and `edges.jsonl` one row per relation, each
-naming the passage and extractor version it came from.
+`target/graph/nodes/` has one row per system in each document that links it,
+keyed by the `entity_id` the agent-context tables carry, and `edges/` one row
+per relation, each naming the passage and extractor version it came from. Run
+it again after a change and only the documents that moved are rewritten.
 
 ## 6. Give it to an agent
 

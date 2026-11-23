@@ -39,8 +39,6 @@ from stel.profile import resolve_profile
 from stel.retrieval import (
     CollectionSpec,
     IndexedRow,
-    LanceDBConfig,
-    LanceDBStore,
     RetrievalError,
     RetrievalFeature,
     RetrievalPredicate,
@@ -51,6 +49,7 @@ from stel.retrieval import (
     collection_config_fingerprint,
     create_store,
 )
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 from stel.retrieval.retention import (
     resumable_generation,
     retire_superseded_generations,

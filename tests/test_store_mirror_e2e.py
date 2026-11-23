@@ -22,7 +22,6 @@ from stel.cli_services.serving import resolve_serving_scope
 from stel.config import load_project
 from stel.profile import resolve_profile
 from stel.retrieval import (
-    LanceDBStore,
     RetrievalError,
     ServingBusyError,
     ServingCoordinator,
@@ -30,6 +29,7 @@ from stel.retrieval import (
     create_store,
 )
 from stel.retrieval.base import mirror_fingerprint
+from stel.retrieval.lancedb import LanceDBStore
 from stel.runner import RunError, run_project
 from tests.support_retrieval import materialize_upstream, sample_rows, write_project
 

@@ -22,17 +22,21 @@ from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import uuid4
 
-import polars as pl
-import pyarrow as pa
 from pydantic import BaseModel, ValidationError
 
 from ..config.identifiers import DEFAULT_SCHEMA_NAME, LEGACY_SCHEMA_NAME
 from ..config.profile import WarehouseConfig
 from ..hashing import canonical_fingerprint
 from ..timing import PhaseTimings
+
+if TYPE_CHECKING:
+    # Annotations only: validating a project must not import a dataframe
+    # library (issue #823, ALE-791).
+    import polars as pl
+    import pyarrow as pa
 
 
 class AdapterError(Exception):
@@ -1047,6 +1051,8 @@ class ReadOrdering(StrEnum):
 
 
 def _empty_record_batch(schema: pa.Schema) -> pa.RecordBatch:
+    import pyarrow as pa
+
     return pa.RecordBatch.from_arrays(
         [pa.array([], type=field.type) for field in schema],
         schema=schema,

@@ -27,8 +27,7 @@ from .config.class_hierarchy import class_ancestors, class_parents
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .paths import resolve_module_file
-from .relation_validity import SUPERSEDE_TRANSFORM_MODULE
-from .text.relations import (
+from .relation_options import (
     CoOccurrenceExtractorOptions,
     ModelAssertionExtractorOptions,
     RelationRule,
@@ -37,6 +36,9 @@ from .text.relations import (
 )
 
 RELATION_TRANSFORM_MODULE = "stel.text.transforms.extract_relations"
+# Named here rather than in `relation_validity`, which imports polars: the
+# compiler checks for this module on every project (issue #823, ALE-791).
+SUPERSEDE_TRANSFORM_MODULE = "stel.text.transforms.supersede_relations"
 
 # relation_type -> the (subject_class, object_class) pairings declared for it.
 _AllowedPairs = dict[str, set[tuple[str, str]]]

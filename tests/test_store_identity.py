@@ -23,15 +23,10 @@ import pytest
 from stel.adapters import StateScope
 from stel.cli_services.serving import _ServingScopes, _sources_to_rekey
 from stel.hashing import canonical_fingerprint
-from stel.retrieval import (
-    DuckDBStore,
-    LanceDBStore,
-    StoreRole,
-    parse_store_config,
-)
+from stel.retrieval import StoreRole, parse_store_config
 from stel.retrieval.base import RetrievalConfigError
-from stel.retrieval.duckdb import DuckDBConfig
-from stel.retrieval.lancedb import LanceDBConfig
+from stel.retrieval.duckdb import DuckDBConfig, DuckDBStore
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 
 # The digests v0.21.x shipped, read off an unmodified tree. Every published
 # collection's state scope, serving-ledger row and publisher lock is keyed on

@@ -13,12 +13,12 @@ from pathlib import Path
 
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
-from .paths import resolve_module_file
-from .text.linking import (
+from .entity_link_options import (
     AliasTableResolverOptions,
     parse_entity_link_options,
     parse_vocabulary_alias_source,
 )
+from .paths import resolve_module_file
 
 LINK_TRANSFORM_MODULE = "stel.text.transforms.link_entities"
 

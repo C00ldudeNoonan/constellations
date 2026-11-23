@@ -7,6 +7,26 @@
   fixed width (32 characters for the first two). They size the name column from
   the names printed, like the run ledger, and never truncate. Ordinary names
   print exactly as before (issue #822, ALE-802, theme ALE-54).
+- Loading and validating a project no longer imports polars, pyarrow, numpy or
+  the inactive warehouse adapter. `stel ls` and `stel compile` resolve the
+  warehouse adapter and the retrieval store by type on first use, so a DuckDB
+  project never imports `stel.adapters.bigquery` and a BigQuery project never
+  imports `stel.adapters.duckdb`; the `AgentContextGrain` enum, the
+  `link_entities` options and the relation options moved to modules that import
+  no dataframe library or resolver, so `import stel.config` and `import
+  stel.compiler` load none of polars, pyarrow or numpy, and the compiler no
+  longer loads `stel.text` or `stel.retrieval.lancedb`. Behavior and error
+  messages are unchanged. Import paths changed: `AgentContextGrain` is
+  `stel.agent_context_grain.AgentContextGrain`, the entity-link options are in
+  `stel.entity_link_options`, the relation options in `stel.relation_options`,
+  and `stel.adapters` and `stel.retrieval` no longer import the DuckDB, BigQuery
+  or LanceDB implementation modules (use `stel.retrieval.duckdb` and
+  `stel.retrieval.lancedb`). The import-budget contract test gained rows for
+  `ls`, `compile` against a DuckDB and a BigQuery project, and the `stel.config`
+  and `stel.compiler` imports. On the Windows dev machine (best of five fresh
+  processes) `stel ls` drops from about 3.8 s to 2.1 s and `stel compile` from
+  about 4.1 s to 3.6 s, the active adapter's own imports being unchanged
+  (issue #823, ALE-791, ADR-0066, theme ALE-789).
 - The run ledger and the summary tables no longer fuse columns when a model
   name reaches the fixed width. The live ledger, the `run` and `build`
   summaries, the test and eval tables, `stel ls` and source freshness size their

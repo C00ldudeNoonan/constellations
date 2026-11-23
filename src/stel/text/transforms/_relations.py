@@ -25,18 +25,17 @@ from ...config.relation_characteristics import (
 )
 from ...execution.cost import estimate_cost
 from ...providers import get_inference_provider, resolve_provider_model
+from ...relation_options import ModelAssertionExtractorOptions, parse_relation_options
 from ...relation_validity import INSTANT_DTYPE, is_temporal, to_utc_instant
 from ...transforms import IncrementalContract, TransformContext
 from ..relations import (
     Mention,
-    ModelAssertionExtractorOptions,
     Relation,
     RelationAssertion,
     RelationExtractor,
     RelationInference,
     _order_key,
     get_relation_extractor,
-    parse_relation_options,
     relation_id,
 )
 

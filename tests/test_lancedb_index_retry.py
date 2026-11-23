@@ -19,15 +19,9 @@ import pyarrow as pa
 import pytest
 from pydantic import ValidationError
 
-from stel.retrieval import (
-    CollectionSpec,
-    IndexedRow,
-    LanceDBConfig,
-    LanceDBStore,
-    RetrievalError,
-    StoreRole,
-)
+from stel.retrieval import CollectionSpec, IndexedRow, RetrievalError, StoreRole
 from stel.retrieval import lancedb as lancedb_store
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 
 SENTINEL = "gs://distinctive-bucket/prefix?token=distinctive-native-secret"
 PHYSICAL = "demo__dev__context"

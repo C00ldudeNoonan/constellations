@@ -234,7 +234,7 @@ def test_load_project_populates_sql_depends_on_for_artifact_dag() -> None:
 
 
 def test_sql_transform_rejects_agent_context(tmp_path: Path) -> None:
-    from stel.agent_context import AgentContextGrain
+    from stel.agent_context_grain import AgentContextGrain
     from stel.compiler import _prepare_sql_transform
     from stel.config.loader import ConfigError
     from stel.config.model import AgentContextConfig, ModelConfig, TransformConfig

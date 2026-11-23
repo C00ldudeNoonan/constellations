@@ -7,20 +7,19 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import polars as pl
-
+from .agent_context_grain import AgentContextGrain
 from .hashing import HASH_DIGEST_SIZE, canonical_fingerprint, canonical_json
+
+if TYPE_CHECKING:
+    # The contract's descriptors are read by the manifest on every project load,
+    # which must not import polars (issue #823, ALE-791); only the frame
+    # builders below need it.
+    import polars as pl
 
 AGENT_CONTEXT_CONTRACT = "agent_context/v1"
 _ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
-
-
-class AgentContextGrain(StrEnum):
-    DOCUMENT_REGISTRY = "document_registry"
-    DOCUMENT_CHUNKS = "document_chunks"
-    CONTEXT_ENTITY_LINKS = "context_entity_links"
 
 
 class FreshnessStatus(StrEnum):
@@ -503,11 +502,15 @@ def contract_descriptor(grain: AgentContextGrain | str) -> dict[str, Any]:
 def empty_agent_context_frame(
     grain: AgentContextGrain | str,
 ) -> pl.DataFrame:
+    import polars as pl
+
     relation = contract_relation(grain)
     return pl.DataFrame([_empty_series(field) for field in relation.fields])
 
 
 def _empty_series(field: ContractField) -> pl.Series:
+    import polars as pl
+
     if field.data_type in {"string", "json"}:
         return pl.Series(field.name, [], dtype=pl.String)
     if field.data_type == "integer":

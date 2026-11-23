@@ -17,9 +17,9 @@ from typing import Any
 
 import pytest
 
-from stel.retrieval import LanceDBConfig, LanceDBStore, StoreRole
+from stel.retrieval import StoreRole
 from stel.retrieval import lancedb as lancedb_store
-from stel.retrieval.lancedb import session_cache_budget
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore, session_cache_budget
 
 _MB = 1024 * 1024
 _GB = 1024 * _MB

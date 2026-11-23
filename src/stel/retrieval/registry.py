@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,17 @@ from .evolution import semantic_search_config, without_query_knobs
 
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
 
+# The stores that ship with stel, as type -> (module, class). A project names
+# one store, so only its module is imported, on first use: the other costs
+# seconds of pyarrow, numpy and a vector-database client that validating a
+# project never needs (issue #823, ALE-791). The class is read from the module
+# rather than left to `@register` as a side effect, so a registry cleared after
+# the module was imported still resolves.
+_BUILTIN_STORES: dict[str, tuple[str, str]] = {
+    "duckdb": (".duckdb", "DuckDBStore"),
+    "lancedb": (".lancedb", "LanceDBStore"),
+}
+
 # Top-level `search:` fields introduced after descriptors (#344, 2026-08-22),
 # which the legacy pre-#344 digest must not hash. `freshness` (#682) dumps
 # even when unset, as `None`, so hashing it moved the digest of every legacy
@@ -28,12 +40,23 @@ def register[StoreT: RetrievalStore](cls: type[StoreT]) -> type[StoreT]:
     return cls
 
 
+def _lookup_store_class(store_type: str) -> type[RetrievalStore] | None:
+    """The store class for `store_type`, importing a built-in on first use."""
+    cls = _REGISTRY.get(store_type)
+    if cls is None and store_type in _BUILTIN_STORES:
+        module_name, class_name = _BUILTIN_STORES[store_type]
+        module = importlib.import_module(module_name, __package__)
+        cls = getattr(module, class_name)
+        _REGISTRY[store_type] = cls
+    return cls
+
+
 def parse_store_config(raw: dict[str, Any]) -> RetrievalStoreConfig:
     store_type = str(raw.get("type", ""))
-    cls = _REGISTRY.get(store_type)
+    cls = _lookup_store_class(store_type)
     if cls is None:
         raise RetrievalConfigError(
-            f"No retrieval store registered for type='{store_type}'. Known: {sorted(_REGISTRY)}"
+            f"No retrieval store registered for type='{store_type}'. Known: {list_store_types()}"
         )
     try:
         return cls.config_model().model_validate(raw)
@@ -59,10 +82,10 @@ def create_store(
     alias: str,
     role: StoreRole,
 ) -> RetrievalStore:
-    cls = _REGISTRY.get(config.type)
+    cls = _lookup_store_class(config.type)
     if cls is None:
         raise RetrievalConfigError(
-            f"No retrieval store registered for type='{config.type}'. Known: {sorted(_REGISTRY)}"
+            f"No retrieval store registered for type='{config.type}'. Known: {list_store_types()}"
         )
     return cls(
         config,
@@ -80,16 +103,16 @@ def absolutize_store_config(
 
 
 def store_class(store_type: str) -> type[RetrievalStore]:
-    cls = _REGISTRY.get(store_type)
+    cls = _lookup_store_class(store_type)
     if cls is None:
         raise RetrievalConfigError(
-            f"No retrieval store registered for type='{store_type}'. Known: {sorted(_REGISTRY)}"
+            f"No retrieval store registered for type='{store_type}'. Known: {list_store_types()}"
         )
     return cls
 
 
 def list_store_types() -> list[str]:
-    return sorted(_REGISTRY)
+    return sorted({*_REGISTRY, *_BUILTIN_STORES})
 
 
 def collection_descriptor(

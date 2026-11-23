@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,17 @@ class UnknownAdapterError(AdapterError):
 
 
 _REGISTRY: dict[str, type[WarehouseAdapter]] = {}
+
+# The adapters that ship with stel, as warehouse type -> (module, class). A
+# project names exactly one warehouse, so only that adapter's module is imported,
+# on first use: the other costs seconds of pyarrow, numpy and a cloud SDK that a
+# DuckDB project never needs (issue #823, ALE-791). The class is read from the
+# module rather than left to `@register` as a side effect, so a registry that was
+# cleared after the module was imported still resolves.
+_BUILTIN_ADAPTERS: dict[str, tuple[str, str]] = {
+    "duckdb": (".duckdb", "DuckDBAdapter"),
+    "bigquery": (".bigquery", "BigQueryAdapter"),
+}
 _GENERIC_SECRET_REFERENCE_FIELDS = (
     "client_secret",
     "keyfile_json",
@@ -71,6 +83,24 @@ def _protect_unregistered_adapter_input(
     return prepared
 
 
+def _adapter_class(adapter_type: str) -> type[WarehouseAdapter] | None:
+    """The adapter class for `adapter_type`, importing a built-in on first use."""
+    cls = _REGISTRY.get(adapter_type)
+    if cls is None and adapter_type in _BUILTIN_ADAPTERS:
+        module_name, class_name = _BUILTIN_ADAPTERS[adapter_type]
+        module = importlib.import_module(module_name, __package__)
+        cls = getattr(module, class_name)
+        _REGISTRY[adapter_type] = cls
+    return cls
+
+
+def _unknown_adapter_message(adapter_type: str) -> str:
+    return (
+        f"No adapter registered for warehouse.type='{adapter_type}'. "
+        f"Known: {list_adapter_types()}"
+    )
+
+
 def register[T: WarehouseAdapter](cls: type[T]) -> type[T]:
     _REGISTRY[cls.adapter_type()] = cls
     return cls
@@ -80,7 +110,7 @@ def prepare_warehouse_profile_input(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Let an adapter protect credentials before generic interpolation."""
     prepared = dict(raw)
     wtype = str(prepared.get("type", "duckdb"))
-    adapter = _REGISTRY.get(wtype)
+    adapter = _adapter_class(wtype)
     result: dict[str, Any] | None = None
     failure: AdapterError | None = None
     try:
@@ -144,12 +174,9 @@ def parse_warehouse_config(raw: dict[str, Any] | WarehouseConfig) -> WarehouseCo
     if isinstance(raw, WarehouseConfig):
         return raw
     wtype = str(raw.get("type", "duckdb"))
-    cls = _REGISTRY.get(wtype)
+    cls = _adapter_class(wtype)
     if cls is None:
-        unknown_error = UnknownAdapterError(
-            f"No adapter registered for warehouse.type='{wtype}'. "
-            f"Known: {sorted(_REGISTRY)}"
-        )
+        unknown_error = UnknownAdapterError(_unknown_adapter_message(wtype))
         raw = {}
         raise unknown_error
     preparation_error: AdapterError | None = None
@@ -184,12 +211,9 @@ def create_adapter(
     adapter that cannot narrow its principal raises rather than quietly
     connecting as the operator (ADR-0010).
     """
-    cls = _REGISTRY.get(config.type)
+    cls = _adapter_class(config.type)
     if cls is None:
-        raise UnknownAdapterError(
-            f"No adapter registered for warehouse.type='{config.type}'. "
-            f"Known: {sorted(_REGISTRY)}"
-        )
+        raise UnknownAdapterError(_unknown_adapter_message(config.type))
     return cls(cls.config_for_identity(config, identity), project_dir=project_dir)
 
 
@@ -200,24 +224,18 @@ def adapter_supports_identity_scoped_connection(adapter_type: str) -> bool:
     configured identity-scoped serving against an adapter that cannot do it
     fails loudly instead of serving with the operator's credentials.
     """
-    cls = _REGISTRY.get(adapter_type)
+    cls = _adapter_class(adapter_type)
     if cls is None:
-        raise UnknownAdapterError(
-            f"No adapter registered for warehouse.type='{adapter_type}'. "
-            f"Known: {sorted(_REGISTRY)}"
-        )
+        raise UnknownAdapterError(_unknown_adapter_message(adapter_type))
     return cls.supports_identity_scoped_connection()
 
 
 def list_adapter_types() -> list[str]:
-    return sorted(_REGISTRY)
+    return sorted({*_REGISTRY, *_BUILTIN_ADAPTERS})
 
 
 def adapter_capabilities(adapter_type: str) -> frozenset[WarehouseCapability]:
-    cls = _REGISTRY.get(adapter_type)
+    cls = _adapter_class(adapter_type)
     if cls is None:
-        raise UnknownAdapterError(
-            f"No adapter registered for warehouse.type='{adapter_type}'. "
-            f"Known: {sorted(_REGISTRY)}"
-        )
+        raise UnknownAdapterError(_unknown_adapter_message(adapter_type))
     return cls.capabilities()

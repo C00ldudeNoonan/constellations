@@ -27,7 +27,8 @@ from stel.adapters.duckdb import DuckDBAdapter
 from stel.config import load_project
 from stel.execution import search as search_execution
 from stel.profile import resolve_profile
-from stel.retrieval import LanceDBStore, RetrievalError, StoreRole, create_store
+from stel.retrieval import RetrievalError, StoreRole, create_store
+from stel.retrieval.lancedb import LanceDBStore
 from stel.runner import RunError, run_project
 from tests.support_retrieval import materialize_upstream, write_project
 

@@ -28,11 +28,11 @@ from lancedb.index import BTree
 
 from stel.cli_services.serving import describe_identity, describe_mirror
 from stel.execution.mirror import mirror_restore_refusal
-from stel.retrieval import LanceDBStore, RetrievalError, StoreRole, lance_mirror, parse_store_config
+from stel.retrieval import RetrievalError, StoreRole, lance_mirror, parse_store_config
 from stel.retrieval.base import RetrievalConfigError, mirror_fingerprint
 from stel.retrieval.coordination import STATUS_READY, ServingLedgerEntry
 from stel.retrieval.lance_mirror import PARTIAL_SUFFIX, copy_table, local_tree
-from stel.retrieval.lancedb import LanceDBConfig
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 
 _NAME = "econ__prod__chunks"
 

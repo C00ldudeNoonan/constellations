@@ -366,7 +366,7 @@ def test_compile_validates_effective_warehouse_options_before_manifest_write(
     def unexpected_manifest(*_args: Any, **_kwargs: Any) -> Path:
         pytest.fail("invalid effective warehouse options must fail before manifest write")
 
-    monkeypatch.setattr("stel.cli.write_manifest", unexpected_manifest)
+    monkeypatch.setattr("stel.manifest.write_manifest", unexpected_manifest)
 
     result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), "compile"])
 

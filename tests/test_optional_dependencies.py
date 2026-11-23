@@ -160,7 +160,7 @@ def test_run_reports_missing_optional_dependency_without_traceback(
             "Install it with: pip install 'stel[pdf]'"
         )
 
-    monkeypatch.setattr("stel.cli.run_project", fail_run)
+    monkeypatch.setattr("stel.runner.run_project", fail_run)
 
     result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), "run"])
 

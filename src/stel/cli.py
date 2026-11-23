@@ -1,3 +1,28 @@
+"""The ``stel`` command line: Click commands and their error boundary.
+
+Imports are deferred into command bodies by design (issue #818, ALE-790). A
+command pays for what it uses: ``stel --version``, ``stel --help`` and shell
+completion load only Click and the few light modules imported below, never the
+runner, compiler, warehouse adapters or a dataframe library, which cost
+seconds. Keep it that way:
+
+* A new command imports its dependencies inside its own body, or inside a
+  helper that only that command calls. Do not add a module-level
+  ``from .runner import ...`` (or any import that reaches polars, pyarrow,
+  duckdb, numpy, jinja2, the compiler or the adapters) to this file.
+* A name used only in a signature is imported under ``TYPE_CHECKING``;
+  ``from __future__ import annotations`` keeps it from being evaluated.
+* A Click option declaration runs at import, so a constant it needs (a choice
+  list, a default) is duplicated below as a literal rather than imported from
+  a module that loads the heavy stack. ``tests/test_cli_literals.py`` pins each
+  literal to its source of truth.
+* ``tests/test_cli_import_budget.py`` runs each entry point in a subprocess and
+  fails when a forbidden module is in ``sys.modules`` afterwards.
+
+An import error in one command's dependencies therefore surfaces when that
+command runs, not at startup.
+"""
+
 from __future__ import annotations
 
 import json
@@ -6,48 +31,11 @@ import shutil
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import click
 
 from ._distribution import distribution_version
-from .adapters import (
-    AdapterError,
-    apply_name_migration,
-    create_adapter,
-    plan_name_migration,
-)
-from .adapters.bigquery import BigQueryAdapter
-from .adopt import adopt_project
-from .checks import TestResult, run_project_tests
-from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
-from .cli_services.context import ConfigClickError
-from .cli_services.context import build_dag_or_click as _build_dag
-from .cli_services.context import load_project_or_click as _load
-from .cli_services.watch import run_watch as _run_watch
-from .compiler import validate_project_contract, validate_warehouse_capabilities
-from .concept_cloud import (
-    ConceptCloudExport,
-    ConceptCloudExportError,
-    TimeGrain,
-    demo_export,
-    export_concept_cloud,
-    placeholder_export,
-    write_concept_cloud,
-)
-from .config import ConfigError
-from .config.model import ModelConfig
-from .config.project import ProjectConfig
-from .config.source import SourceConfig
-from .cost_guard import CostConfirmation, CostProjection, project_cost
-from .credentials import CredentialReference, CredentialReferenceError
-from .dag import SelectionError, parse_ref
-from .dbt_export import write_dbt_sources
-from .docs import DocsError, generate_docs, serve_docs
-from .execution.deletion_guard import is_valid_approval
-from .freshness import check_freshness
-from .graph_export import GRAPH_FORMATS, GraphExportError, export_graph
-from .graph_load import GraphLoadError, load_into_neo4j
 from .interrupts import interrupt_on_termination
 from .logging_setup import (
     configure_diagnostics_file,
@@ -56,70 +44,8 @@ from .logging_setup import (
     resolve_diagnostics_file,
     resolve_verbosity,
 )
-from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
-from .orphans import find_orphans, format_orphans
-from .paths import resolve_within_project
-from .pending import (
-    format_pending_table,
-    pending_project,
-    write_pending_artifact,
-)
-from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
-from .profile import (
-    ProfileError,
-    apply_source_path_overrides,
-    resolve_llm_options,
-    resolve_profile,
-    validate_inference_dependencies,
-)
 from .progress import OutputLevel, configure_progress, get_reporter
-from .prompts import (
-    PromptLockError,
-    check_lock,
-    lock_path,
-    read_lock,
-    write_lock,
-)
-from .providers import (
-    get_inference_provider,
-)
-from .reprocess_guard import guard_reprocess
-from .retrieval.servability import (
-    DEFAULT_CONTEXT_TIMEOUT_SECONDS,
-    MAX_CONTEXT_TIMEOUT_SECONDS,
-)
-from .retrieval_compare import (
-    compare_retrieval_variants,
-    format_comparison,
-    write_retrieval_compare_artifact,
-)
-from .retrieval_eval import (
-    RetrievalEvalError,
-    run_retrieval_evaluation,
-    write_retrieval_eval_artifact,
-)
-from .runner import (
-    BuildResult,
-    ModelRunResult,
-    RunError,
-    build_project,
-    clean_project,
-    run_project,
-)
-from .search import (
-    SearchError,
-    SearchFilter,
-    SearchFilterOperator,
-    SearchMode,
-    SearchRequest,
-    SearchResult,
-)
-from .search import (
-    search as run_search,
-)
-from .sources import SourceError
-from .suggest import DEFAULT_MIN_EVIDENCE
 from .synth import (
     generate_arxiv_papers,
     generate_invoice_pdfs,
@@ -131,6 +57,38 @@ from .synth import (
     generate_support_tickets,
 )
 from .table_layout import column_width
+
+if TYPE_CHECKING:
+    from .adapters import AdapterError
+    from .adapters.bigquery import BigQueryAdapter
+    from .checks import TestResult
+    from .concept_cloud import ConceptCloudExport
+    from .config.model import ModelConfig
+    from .config.project import ProjectConfig
+    from .config.source import SourceConfig
+    from .cost_guard import CostConfirmation, CostProjection
+    from .runner import BuildResult, ModelRunResult, RunError
+    from .search import SearchFilter, SearchResult
+
+# Click declarations run at import, so these constants are literals here rather
+# than imports from modules that load the heavy stack. Each is pinned to its
+# source of truth in tests/test_cli_literals.py.
+_SEARCH_MODES = ["vector", "text", "hybrid"]
+_DEFAULT_SEARCH_MODE = "hybrid"
+_SEARCH_FILTER_OPERATORS = [
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "in",
+    "array_contains_any",
+]
+_GRAPH_FORMATS = ("jsonl", "jsonld", "turtle", "graphiti")
+_DEFAULT_MIN_EVIDENCE = 3
+_MAX_CONTEXT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_CONTEXT_TIMEOUT_SECONDS = 30.0
 
 
 def _context_override(
@@ -345,6 +303,19 @@ def cli(
 @click.pass_context
 def compile(ctx: click.Context) -> None:
     """Parse YAML, validate DAG, write target/manifest.json."""
+    from .adapters import create_adapter
+    from .cli_services.context import (
+        CONFIG_ERRORS as _CONFIG_ERRORS,
+    )
+    from .cli_services.context import (
+        ConfigClickError,
+    )
+    from .cli_services.context import (
+        load_project_or_click as _load,
+    )
+    from .compiler import validate_project_contract, validate_warehouse_capabilities
+    from .manifest import write_manifest
+    from .profile import resolve_profile, validate_inference_dependencies
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -385,6 +356,9 @@ def _compile_warnings(
     target: str | None,
     profiles_dir: Path | None,
 ) -> list[str]:
+    from .credentials import CredentialReference, CredentialReferenceError
+    from .profile import ProfileError, resolve_llm_options, resolve_profile
+    from .providers import get_inference_provider
     out: list[str] = []
     uses_llm = any(
         (
@@ -549,6 +523,10 @@ def init(name: str, template: str) -> None:
 @click.pass_context
 def show(ctx: click.Context, model_name: str, limit: int) -> None:
     """Pretty-print rows from a materialized model table."""
+    from .adapters import AdapterError, create_adapter
+    from .cli_services.context import ConfigClickError
+    from .cli_services.context import load_project_or_click as _load
+    from .profile import ProfileError, resolve_profile
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -589,8 +567,8 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
 @click.option("--query", default=None, help="Query text for text or embedded search.")
 @click.option(
     "--mode",
-    type=click.Choice([mode.value for mode in SearchMode], case_sensitive=False),
-    default=SearchMode.HYBRID.value,
+    type=click.Choice(_SEARCH_MODES, case_sensitive=False),
+    default=_DEFAULT_SEARCH_MODE,
     show_default=True,
 )
 @click.option("--limit", type=click.IntRange(1, 1000), default=10, show_default=True)
@@ -605,7 +583,7 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
     "filter_values",
     type=(
         str,
-        click.Choice([operator.value for operator in SearchFilterOperator]),
+        click.Choice(_SEARCH_FILTER_OPERATORS),
         str,
     ),
     multiple=True,
@@ -658,6 +636,10 @@ def search_command(
     connect, lease, embed, store open, inspect, the searches themselves --
     on stderr, so it composes with `--output json` on stdout (issue #519).
     """
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .search import SearchError, SearchMode, SearchRequest
+    from .search import search as run_search
     _configure_output(
         verbose, diagnostics_file=diagnostics_file, json_output=output_format == "json"
     )
@@ -726,14 +708,13 @@ def _parse_search_vector(value: str | None) -> tuple[float, ...] | None:
         raise ValueError("--vector must be a non-empty JSON array of numbers") from None
 
 
-_JSON_ARRAY_FILTER_OPERATORS = frozenset(
-    {SearchFilterOperator.IN, SearchFilterOperator.ARRAY_CONTAINS_ANY}
-)
+_JSON_ARRAY_FILTER_OPERATORS = frozenset({"in", "array_contains_any"})
 
 
 def _parse_search_filter(field: str, operator: str, value: str) -> SearchFilter:
+    from .search import SearchFilter, SearchFilterOperator
     resolved_operator = SearchFilterOperator(operator)
-    if resolved_operator not in _JSON_ARRAY_FILTER_OPERATORS:
+    if resolved_operator.value not in _JSON_ARRAY_FILTER_OPERATORS:
         return SearchFilter(field, resolved_operator, value)
     name = resolved_operator.value
     try:
@@ -838,6 +819,11 @@ def seed(
     consuming the source: json → invoices, markdown → posts, pdf → invoice_pdfs,
     html → product_pages, llm → invoice_texts.
     """
+    from .cli_services.context import ConfigClickError
+    from .cli_services.context import load_project_or_click as _load
+    from .config import ConfigError
+    from .paths import resolve_within_project
+    from .profile import ProfileError, apply_source_path_overrides, resolve_profile
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -894,6 +880,12 @@ def seed(
 @click.pass_context
 def graph(ctx: click.Context) -> None:
     """Print a Mermaid diagram of the project DAG."""
+    from .cli_services.context import (
+        build_dag_or_click as _build_dag,
+    )
+    from .cli_services.context import (
+        load_project_or_click as _load,
+    )
     project_dir: Path = ctx.obj["project_dir"]
     _, sources, models = _load(project_dir)
     dag = _build_dag(sources, models)
@@ -955,6 +947,13 @@ def ls(
     orphans: bool,
 ) -> None:
     """List project resources (models/sources) matching a selector."""
+    from .cli_services.context import (
+        build_dag_or_click as _build_dag,
+    )
+    from .cli_services.context import (
+        load_project_or_click as _load,
+    )
+    from .dag import SelectionError
     project_dir: Path = ctx.obj["project_dir"]
     if orphans:
         if select is not None or exclude is not None:
@@ -1015,6 +1014,9 @@ def ls(
 
 
 def _ls_orphans(ctx: click.Context, project_dir: Path, *, output: str) -> None:
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .orphans import find_orphans, format_orphans
     try:
         report = find_orphans(
             project_dir,
@@ -1122,6 +1124,13 @@ def plan(
     target keeps a run log, what they cost. Reads only stel's own state table
     and run log: no source discovery, no provider call, no model table.
     """
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .cost_guard import project_cost
+    from .dag import SelectionError
+    from .pending import format_pending_table, pending_project, write_pending_artifact
+    from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
+    from .reprocess_guard import guard_reprocess
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -1246,6 +1255,12 @@ def adopt(
     versions. A model's own `code_version` output column keeps its old value
     until that row is next rewritten.
     """
+    from .adapters import AdapterError
+    from .adopt import adopt_project
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .dag import SelectionError
+    from .plan import PlanError
     project_dir: Path = ctx.obj["project_dir"]
     _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=False)
     try:
@@ -1287,6 +1302,18 @@ def writer_claim() -> None:
 
 
 def _writer_claim_adapter(ctx: click.Context) -> BigQueryAdapter:
+    from .adapters import create_adapter
+    from .adapters.bigquery import BigQueryAdapter
+    from .cli_services.context import (
+        CONFIG_ERRORS as _CONFIG_ERRORS,
+    )
+    from .cli_services.context import (
+        ConfigClickError,
+    )
+    from .cli_services.context import (
+        load_project_or_click as _load,
+    )
+    from .profile import resolve_profile
     project_dir: Path = ctx.obj["project_dir"]
     project, _, _ = _load(project_dir)
     try:
@@ -1306,6 +1333,7 @@ def _writer_claim_adapter(ctx: click.Context) -> BigQueryAdapter:
 @click.pass_context
 def writer_claim_status(ctx: click.Context) -> None:
     """Show the dataset's current writer claim as JSON."""
+    from .adapters import AdapterError
     try:
         status = _writer_claim_adapter(ctx).writer_claim_status()
     except AdapterError as error:
@@ -1324,6 +1352,7 @@ def writer_claim_status(ctx: click.Context) -> None:
 @click.pass_context
 def writer_claim_release(ctx: click.Context, run_id: str, confirm_quiescent: bool) -> None:
     """Release the specified claim after verifying its BigQuery jobs are terminal."""
+    from .adapters import AdapterError
     if not confirm_quiescent:
         raise click.UsageError(
             "Stop the old writer and account for every outstanding API request before "
@@ -1337,6 +1366,7 @@ def writer_claim_release(ctx: click.Context, run_id: str, confirm_quiescent: boo
 
 
 def _parse_deletion_approvals(values: Sequence[str]) -> dict[str, str]:
+    from .execution.deletion_guard import is_valid_approval
     approvals: dict[str, str] = {}
     for value in values:
         name, separator, token = value.partition("=")
@@ -1495,6 +1525,12 @@ def run(
     diagnostics_file: Path | None,
 ) -> None:
     """Extract and materialize selected models into the configured warehouse."""
+    from .adapters import AdapterError
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .cli_services.watch import run_watch as _run_watch
+    from .manifest import write_run_results
+    from .runner import RunError, run_project
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -1788,6 +1824,11 @@ def build(
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
     when an upstream model errors or fails a test."""
+    from .adapters import AdapterError
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .manifest import write_run_results
+    from .runner import RunError, build_project
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -1926,6 +1967,9 @@ def test(
     state: Path | None,
 ) -> None:
     """Run schema tests against materialized tables."""
+    from .checks import run_project_tests
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -2018,6 +2062,20 @@ def eval_(
     search models (issue #137): recall/precision/hit-rate/MRR/NDCG@k against
     labeled queries, plus hard policy-filter assertions. Writes
     target-path/retrieval_eval.json."""
+    from .cli_services.context import (
+        CONFIG_ERRORS as _CONFIG_ERRORS,
+    )
+    from .cli_services.context import (
+        ConfigClickError,
+    )
+    from .cli_services.context import (
+        load_project_or_click as _load,
+    )
+    from .retrieval_eval import (
+        RetrievalEvalError,
+        run_retrieval_evaluation,
+        write_retrieval_eval_artifact,
+    )
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -2112,6 +2170,21 @@ def _eval_compare(
     """`stel eval --compare` (issue #532): the per-model evaluation for every
     selected variant, then one comparison against the baseline. Exits 1 when
     any side fails, exactly as the plain form does for that side alone."""
+    from .cli_services.context import (
+        CONFIG_ERRORS as _CONFIG_ERRORS,
+    )
+    from .cli_services.context import (
+        ConfigClickError,
+    )
+    from .cli_services.context import (
+        load_project_or_click as _load,
+    )
+    from .retrieval_compare import (
+        compare_retrieval_variants,
+        format_comparison,
+        write_retrieval_compare_artifact,
+    )
+    from .retrieval_eval import RetrievalEvalError, write_retrieval_eval_artifact
     try:
         comparison = compare_retrieval_variants(
             project_dir,
@@ -2182,6 +2255,9 @@ def emit_dbt_sources(
     --dagster-meta, each table also carries a Dagster asset key for the
     dagster-dbt integration.
     """
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .dbt_export import write_dbt_sources
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -2230,6 +2306,8 @@ def codegen(
     your dbt project's model-paths so `dbt build` runs stel as native dbt
     nodes. Set STEL_PROJECT_DIR to this project when running dbt.
     """
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
     from .dbt_embed.codegen import generate_dbt_models
 
     project_dir: Path = ctx.obj["project_dir"]
@@ -2253,8 +2331,8 @@ def mcp() -> None:
     # Bounded here as well as in the settings model so an operator raising the
     # deadline learns the ceiling from the CLI, instead of from a validation
     # error after the server has been told to start (issue #461).
-    type=click.FloatRange(min=0.1, max=MAX_CONTEXT_TIMEOUT_SECONDS),
-    default=DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+    type=click.FloatRange(min=0.1, max=_MAX_CONTEXT_TIMEOUT_SECONDS),
+    default=_DEFAULT_CONTEXT_TIMEOUT_SECONDS,
     show_default=True,
 )
 @click.option(
@@ -2464,6 +2542,8 @@ def mcp_serve(
     """
     from pydantic import ValidationError
 
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
     from .mcp_server.authorization import (
         AuthorizationError,
         TrustedHeaderPrincipalResolver,
@@ -2911,6 +2991,17 @@ def concept_cloud(
     (#678): the card fetches one sentence per concept from the project's
     governed context service while the server runs.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .concept_cloud import (
+        ConceptCloudExportError,
+        TimeGrain,
+        demo_export,
+        export_concept_cloud,
+        placeholder_export,
+        write_concept_cloud,
+    )
     _configure_output(verbose, diagnostics_file=diagnostics_file)
     # Checked before the export, which reads the warehouse and can run for
     # hours: being told the flags do not combine is worth nothing afterwards.
@@ -2985,6 +3076,9 @@ def _serve_concept_cloud(
     Imported here rather than at module scope: it pulls in the context
     service and the catalog, which no other `stel` invocation needs.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
     from .concept_cloud.serve import ConceptCloudServeError, serve_concept_cloud
     from .mcp_server.catalog import ArtifactCatalogError
 
@@ -3018,7 +3112,7 @@ def _serve_concept_cloud(
 @click.option(
     "--format",
     "graph_format",
-    type=click.Choice(GRAPH_FORMATS),
+    type=click.Choice(_GRAPH_FORMATS),
     default="jsonl",
     show_default=True,
     help=(
@@ -3071,6 +3165,10 @@ def graph_export(
     re-export rewrites only the documents that changed and removes those that
     left the source. Reads only the two models' output tables.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+    from .cli_services.context import ConfigClickError
+    from .graph_export import GraphExportError, export_graph
     _configure_output(verbose, diagnostics_file=diagnostics_file)
     try:
         result = export_graph(
@@ -3118,6 +3216,8 @@ def graph_load(
     Neo4j credentials are read from the NEO4J_USER and NEO4J_PASSWORD
     environment variables, never from a flag. Loading twice leaves one copy.
     """
+    from .cli_services.context import ConfigClickError
+    from .graph_load import GraphLoadError, load_into_neo4j
     _configure_output(verbose, diagnostics_file=diagnostics_file)
     user = os.environ.get("NEO4J_USER")
     password = os.environ.get("NEO4J_PASSWORD")
@@ -3163,6 +3263,10 @@ def docs() -> None:
 @click.pass_context
 def docs_generate(ctx: click.Context, output: Path | None) -> None:
     """Render target/docs/*.html driven by manifest.json + run_results.json."""
+    from .cli_services.context import ConfigClickError
+    from .config import ConfigError
+    from .docs import DocsError, generate_docs
+    from .profile import ProfileError
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -3186,6 +3290,9 @@ def docs_generate(ctx: click.Context, output: Path | None) -> None:
 @click.pass_context
 def docs_serve(ctx: click.Context, port: int) -> None:
     """Serve the generated docs over http.server. Ctrl-C to stop."""
+    from .cli_services.context import ConfigClickError
+    from .config import ConfigError
+    from .docs import DocsError, serve_docs
     project_dir: Path = ctx.obj["project_dir"]
     try:
         serve_docs(project_dir, port=port)
@@ -3206,6 +3313,11 @@ def source() -> None:
 @click.pass_context
 def source_freshness(ctx: click.Context) -> None:
     """Check source freshness against configured warn/error thresholds."""
+    from .cli_services.context import ConfigClickError
+    from .config import ConfigError
+    from .freshness import check_freshness
+    from .profile import ProfileError
+    from .sources import SourceError
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -3287,10 +3399,14 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
     import time
 
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.serving import describe_mirror as _describe_mirror
     from .cli_services.serving import describe_publisher_claim as _describe_publisher
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
+    from .config import ConfigError
+    from .profile import ProfileError
     from .retrieval import ServingCoordinationError
 
     try:
@@ -3369,8 +3485,12 @@ def serving_recover(
     knows about the owner -- host, PID, label, last heartbeat -- so the
     confirmation is informed.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_recover as _serving_recover
+    from .config import ConfigError
+    from .profile import ProfileError
     from .retrieval import ServingCoordinationError
 
     try:
@@ -3446,9 +3566,13 @@ def serving_activate(
     check: that the rows are what the current code would publish, which is
     true after a release that changed only what the code_version hash reads.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_activate as _serving_activate
+    from .config import ConfigError
     from .execution.contracts import RunError
+    from .profile import ProfileError
     from .retrieval import ServingCoordinationError
 
     try:
@@ -3532,7 +3656,11 @@ def serving_migrate_scope(
     Run this once per affected index. It is idempotent: a second run reports
     zero rows moved.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.serving import serving_migrate_scope as _migrate
+    from .config import ConfigError
+    from .profile import ProfileError
     from .retrieval import ServingCoordinationError
 
     try:
@@ -3572,8 +3700,12 @@ def serving_sync(ctx: click.Context, model_name: str) -> None:
     The sync holds a query lease for its duration, so an in-place publish of
     the same index waits for it, as it would for any reader.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.serving import describe_mirror as _describe_mirror
     from .cli_services.serving import serving_sync as _serving_sync
+    from .config import ConfigError
+    from .profile import ProfileError
     from .retrieval import RetrievalError
 
     try:
@@ -3624,7 +3756,11 @@ def serving_restore(ctx: click.Context, model_name: str) -> None:
 
     Requires --target.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.serving import serving_restore as _serving_restore
+    from .config import ConfigError
+    from .profile import ProfileError
     from .retrieval import RetrievalError
 
     try:
@@ -3715,6 +3851,10 @@ def _echo_grant_rows(report: Any) -> None:
 
 
 def _run_grants(operation: Callable[[], Any]) -> Any:
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
+    from .config import ConfigError
+    from .profile import ProfileError
     try:
         return operation()
     except (ConfigError, ProfileError) as e:
@@ -4069,7 +4209,11 @@ def promote(
     without naming it, so that is absence of evidence, not evidence of
     irrelevance.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.promote import promote_from_candidates
+    from .config import ConfigError
+    from .profile import ProfileError
 
     try:
         rendered, draft = promote_from_candidates(
@@ -4137,7 +4281,7 @@ def suggest() -> None:
 )
 @click.option(
     "--min-evidence",
-    default=DEFAULT_MIN_EVIDENCE,
+    default=_DEFAULT_MIN_EVIDENCE,
     show_default=True,
     help="Distinct sessions required before a gap is worth proposing a change for.",
 )
@@ -4161,7 +4305,11 @@ def suggest_dbt(
     a suggestion can add context but never overwrite it. Review the diff and
     merge it like any other change; stel does not commit.
     """
+    from .adapters import AdapterError
+    from .cli_services.context import ConfigClickError
     from .cli_services.suggest import suggest_dbt as _suggest_dbt
+    from .config import ConfigError
+    from .profile import ProfileError
 
     try:
         diff, outcomes = _suggest_dbt(
@@ -4213,6 +4361,8 @@ def prompts_lock(ctx: click.Context, force: bool) -> None:
     Commit the lock: its diff is what makes a changed prompt visible in review,
     and `stel prompts check` is what makes it fail a build.
     """
+    from .cli_services.context import ConfigClickError
+    from .prompts import PromptLockError, lock_path, read_lock, write_lock
     project_dir: Path = ctx.obj["project_dir"]
     try:
         added, rewritten = write_lock(project_dir, force=force)
@@ -4237,6 +4387,8 @@ def prompts_check(ctx: click.Context) -> None:
     The CI gate for prompt immutability: editing a released version should be
     a failed build, not a silent reprocess. The fix is to add the next version.
     """
+    from .cli_services.context import ConfigClickError
+    from .prompts import PromptLockError, check_lock, read_lock
     project_dir: Path = ctx.obj["project_dir"]
     try:
         drift = check_lock(project_dir)
@@ -4425,6 +4577,9 @@ def clean(ctx: click.Context) -> None:
     Known local artifacts are removed without invoking a warehouse-level reset.
     Configured databases and unknown files under target-path are preserved.
     """
+    from .cli_services.context import ConfigClickError
+    from .config import ConfigError
+    from .runner import RunError, clean_project
     project_dir: Path = ctx.obj["project_dir"]
     try:
         path = clean_project(project_dir)
@@ -4454,6 +4609,10 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     already points at. Moving a whole schema is not done here: pin `schema:`
     in the profile to keep using a pre-rename one.
     """
+    from .adapters import AdapterError, apply_name_migration, create_adapter, plan_name_migration
+    from .cli_services.context import ConfigClickError
+    from .cli_services.context import load_project_or_click as _load
+    from .profile import ProfileError, resolve_profile
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -4492,6 +4651,7 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
 
 def _backend_for_source(source: SourceConfig, models: list[ModelConfig]) -> str:
     """Find the backend name of the (first) extraction model consuming this source."""
+    from .dag import parse_ref
     for model in models:
         if (
             model.extraction is not None

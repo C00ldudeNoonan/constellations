@@ -633,12 +633,15 @@ on every revision.
 
 Operator-visible differences from the SDK 1.x server:
 
-- **Loopback binds check the `Host` header.** With `--host` set to `127.0.0.1`,
-  `localhost` or `::1`, the SDK refuses a request whose `Host` is not one of
-  those names with a port (and whose `Origin`, when sent, is not a loopback
-  origin), with `421 Invalid Host header`. A reverse proxy in front of a
-  loopback bind must forward such a `Host`, or the process should bind a
-  non-loopback address the proxy reaches. Other bind addresses are not checked.
+- **Every bind checks the `Host` header, as before.** The SDK refuses a request
+  whose `Host` is not `127.0.0.1`, `localhost` or `[::1]` with a port (and whose
+  `Origin`, when sent, is not a loopback origin), with `421 Invalid Host header`,
+  on `--host 0.0.0.0` and LAN binds too. SDK 1.x did this by accident of its
+  default host; SDK 2 would apply it only to a loopback bind, which would let a
+  browser reach a wider bind through a name that resolves to loopback (DNS
+  rebinding), so stel passes the settings explicitly. A reverse proxy in front
+  must forward a loopback `Host`, or terminate DNS rebinding itself and be the
+  only route in.
 - **Request bodies over 4 MiB are refused** on `streamable-http` with HTTP 413.
   Tool arguments are far smaller than that.
 - **The discovery metadata names the issuer exactly as configured.** A

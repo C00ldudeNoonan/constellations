@@ -7,9 +7,9 @@
   #808, ALE-752). The four tools and their `mcp_context/v1` responses are
   unchanged and the server also answers the 2026-07-28 protocol revision. Two
   operator-visible changes: the protected-resource metadata publishes a
-  path-less issuer exactly as configured (no added trailing slash), and a
-  loopback `--host` bind rejects a `Host` header that is not a loopback name
-  with a port (`421`), see [Protocol and SDK compatibility](docs/mcp.md#protocol-and-sdk-compatibility).
+  path-less issuer exactly as configured (no added trailing slash), and
+  `streamable-http` bodies over 4 MiB are refused (`413`). The
+  `Host` check on every bind is kept as it was, see [Protocol and SDK compatibility](docs/mcp.md#protocol-and-sdk-compatibility).
   The SDK no longer reads `MCP_*` environment variables or `.env` files.
 
 - Synthetic invoice PDFs (`stel seed --type invoice_pdfs`) come from a

@@ -385,6 +385,27 @@ def _auth_settings(
     )
 
 
+def loopback_host_security() -> Any:
+    """Refuse a request whose `Host` or `Origin` is not a loopback name.
+
+    SDK 1.x built its server with the default host `127.0.0.1`, which turned
+    this protection on whatever `--host` later said, so every bind refused a
+    foreign `Host` (421). SDK 2 turns it on only for a loopback bind. Passing
+    it explicitly keeps the 1.x behaviour on `0.0.0.0` and LAN binds, which
+    DNS rebinding would otherwise reach through a name that resolves to
+    loopback. A proxy in front must forward a loopback `Host`.
+    """
+    settings = import_optional_dependency(
+        "mcp.server.transport_security", extra="mcp", feature="The MCP server"
+    )
+    names = ("127.0.0.1", "localhost", "[::1]")
+    return settings.TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"{name}:*" for name in names],
+        allowed_origins=[f"http://{name}:*" for name in names],
+    )
+
+
 def _run(
     service: ContextService,
     *,
@@ -413,6 +434,8 @@ def _run(
             public_url=public_url,
             transport=transport,
         )
+        if network:
+            network["transport_security"] = loopback_host_security()
         if transport == "streamable-http":
             # Plain JSON replies rather than an SSE stream per call: every
             # tool returns one result, and clients that do not read SSE

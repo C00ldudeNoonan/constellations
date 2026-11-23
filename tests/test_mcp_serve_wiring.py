@@ -168,6 +168,10 @@ def test_a_valid_configuration_reaches_its_transport(
     assert started, f"{name} exited cleanly without ever running a transport"
 
 
+def _without_security(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in arguments.items() if key != "transport_security"}
+
+
 def test_the_listen_address_reaches_the_transport_as_run_arguments(
     started: list[str], tmp_path: Path
 ) -> None:
@@ -180,7 +184,14 @@ def test_the_listen_address_reaches_the_transport_as_run_arguments(
     result = _serve(args, tmp_path)
 
     assert result.exit_code == 0, result.output
-    assert RUN_ARGUMENTS == [{"host": "0.0.0.0", "port": 9123, "json_response": True}]
+    assert len(RUN_ARGUMENTS) == 1
+    assert _without_security(RUN_ARGUMENTS[0]) == {
+        "host": "0.0.0.0",
+        "port": 9123,
+        "json_response": True,
+    }
+    # A wide bind still refuses a foreign Host (review of PR #810).
+    assert RUN_ARGUMENTS[0]["transport_security"].enable_dns_rebinding_protection
 
 
 def test_a_stdio_server_is_given_no_network_arguments(
@@ -202,7 +213,8 @@ def test_the_sse_transport_is_not_given_a_json_response_argument(
     result = _serve(args, tmp_path)
 
     assert result.exit_code == 0, result.output
-    assert RUN_ARGUMENTS == [{"host": "0.0.0.0", "port": 9124}]
+    assert len(RUN_ARGUMENTS) == 1
+    assert _without_security(RUN_ARGUMENTS[0]) == {"host": "0.0.0.0", "port": 9124}
 
 
 def test_every_transport_choice_is_represented() -> None:

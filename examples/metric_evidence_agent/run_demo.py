@@ -12,9 +12,9 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared.memory import create_connected_server_and_client_session
+import httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 from metric_mcp_fixture import create_metric_mcp_server
 
 from stel.agent_context import canonical_entity_key, make_entity_id
@@ -54,16 +54,16 @@ _SEARCH_ARGUMENTS = {
 
 
 def _tool_json(result: Any) -> dict[str, Any]:
-    if result.isError:
+    if result.is_error:
         message = result.content[0].text if result.content else "unknown MCP error"
         raise RuntimeError(message)
-    if result.structuredContent is None:
+    if result.structured_content is None:
         raise RuntimeError("MCP tool returned no structured content")
-    return dict(result.structuredContent)
+    return dict(result.structured_content)
 
 
 def _tool_text(result: Any) -> str:
-    if result.isError:
+    if result.is_error:
         message = result.content[0].text if result.content else "unknown MCP error"
         raise RuntimeError(message)
     for content in result.content:
@@ -81,16 +81,13 @@ async def _query_metric() -> tuple[dict[str, Any], dict[str, Any]]:
     if dbt_mcp_url:
         token = os.environ.get("DBT_MCP_ACCESS_TOKEN")
         headers = {"Authorization": f"Bearer {token}"} if token else None
-        async with streamablehttp_client(dbt_mcp_url, headers=headers) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
+        async with httpx2.AsyncClient(headers=headers) as http:
+            transport = streamable_http_client(dbt_mcp_url, http_client=http)
+            async with Client(transport) as session:
                 result = await session.call_tool("query_metrics", _METRIC_ARGUMENTS)
     else:
         app = create_metric_mcp_server()
-        async with create_connected_server_and_client_session(
-            app,
-            raise_exceptions=True,
-        ) as session:
+        async with Client(app, raise_exceptions=True) as session:
             result = await session.call_tool("query_metrics", _METRIC_ARGUMENTS)
     rows = sorted(
         csv.DictReader(io.StringIO(_tool_text(result))),
@@ -156,10 +153,7 @@ async def _query_context(
     evidence: list[dict[str, Any]] = []
     try:
         app = create_mcp_server(service)
-        async with create_connected_server_and_client_session(
-            app,
-            raise_exceptions=True,
-        ) as session:
+        async with Client(app, raise_exceptions=True) as session:
             listed = _tool_json(await session.call_tool("list_context_models", {}))
             trace.append(
                 {

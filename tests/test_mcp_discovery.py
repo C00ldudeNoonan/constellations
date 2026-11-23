@@ -99,7 +99,8 @@ def test_the_protected_resource_metadata_is_served() -> None:
     assert response.status_code == 200
     document = response.json()
     assert document["resource"] == PUBLIC_URL
-    assert document["authorization_servers"] == [f"{ISSUER}/"]
+    # SDK v2 publishes the configured issuer verbatim (ALE-752); v1 added a "/".
+    assert document["authorization_servers"] == [ISSUER]
 
 
 def test_an_unauthenticated_server_publishes_no_metadata() -> None:
@@ -121,6 +122,21 @@ def test_a_verifier_without_urls_is_refused() -> None:
 
     with pytest.raises(ValueError, match="issuer"):
         _auth_settings(_Verifier(), issuer_url=None, public_url=PUBLIC_URL)
+
+
+def test_the_token_resource_rule_is_stated_so_the_sdk_does_not_warn() -> None:
+    """`AuthSettings.validate_token_resource` unset makes the SDK warn on every
+    boot that its default flips to True in 3.0 (ALE-752). Flipped, it would
+    refuse every token, because stel's verifiers check the audience they were
+    configured with and never fill in `AccessToken.resource`. So it is stated
+    False, which is both the quiet and the correct setting."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        settings = _auth_settings(_Verifier(), issuer_url=ISSUER, public_url=PUBLIC_URL)
+
+    assert settings.validate_token_resource is False
 
 
 def test_no_verifier_means_no_settings() -> None:

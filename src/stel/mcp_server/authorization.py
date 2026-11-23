@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -175,17 +177,40 @@ def _verified_access_token() -> Any:
     return get_access_token()
 
 
+# The request the server is answering, handed over by the tool that received it.
+# SDK v2 removed its ambient request contextvar (v1's `request_ctx`): a handler
+# now gets its request only through an injected `Context`. A resolver is called
+# deep in the service, which has no request parameter and should not grow one --
+# the `PrincipalResolver` Protocol exists so transports can differ without the
+# service knowing -- so the tool binds the request here, once, and resolvers
+# read it back. Unset outside a tool call, which is what makes a resolver
+# answer None (unauthenticated) there.
+_request_context: ContextVar[Any] = ContextVar("stel_mcp_request_context", default=None)
+
+
+@contextmanager
+def serving_request(request_context: Any) -> Iterator[None]:
+    """Bind the SDK's per-request context for the duration of one tool call."""
+    token = _request_context.set(request_context)
+    try:
+        yield
+    finally:
+        _request_context.reset(token)
+
+
+def current_request_context() -> Any:
+    """The SDK request context of the call in flight, or None outside one."""
+    return _request_context.get()
+
+
 def _current_http_request() -> Any:
     """The Starlette request for the call in flight, or None.
 
     The resolver is invoked deep in the service, which has no request
-    parameter, so identity comes from the SDK's contextvar rather than from a
-    changed `PrincipalResolver` signature — the whole point of the Protocol is
-    that transports differ and the service does not care.
+    parameter, so identity comes from `serving_request` rather than from a
+    changed `PrincipalResolver` signature.
     """
-    from mcp.server.lowlevel.server import request_ctx
-
-    context = request_ctx.get(None)
+    context = current_request_context()
     return getattr(context, "request", None) if context is not None else None
 
 

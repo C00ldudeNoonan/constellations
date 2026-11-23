@@ -1646,12 +1646,13 @@ def test_lineage_is_authorized_and_uses_safe_artifact_identities() -> None:
 
 @pytest.mark.anyio
 async def test_mcp_protocol_discovers_exactly_four_read_only_tools() -> None:
-    from mcp.shared.memory import create_connected_server_and_client_session
+    from mcp import Client
 
+    
     service, _ = _service()
     app = create_mcp_server(service)
     try:
-        async with create_connected_server_and_client_session(
+        async with Client(
             app,
             raise_exceptions=True,
         ) as session:
@@ -1665,13 +1666,13 @@ async def test_mcp_protocol_discovers_exactly_four_read_only_tools() -> None:
             search_tool = next(
                 tool for tool in tools.tools if tool.name == "search_context"
             )
-            input_properties = search_tool.inputSchema["properties"]
+            input_properties = search_tool.input_schema["properties"]
             assert "tenant_id" not in input_properties
             assert "access_groups" not in input_properties
             result = await session.call_tool("list_context_models", {})
-            assert result.isError is False
-            assert result.structuredContent is not None
-            assert result.structuredContent["models"][0]["name"] == "context_search"
+            assert result.is_error is False
+            assert result.structured_content is not None
+            assert result.structured_content["models"][0]["name"] == "context_search"
     finally:
         service.close()
 
@@ -1992,17 +1993,13 @@ def test_an_unidentified_request_yields_no_principal() -> None:
 
 @contextlib.contextmanager
 def _request_in_flight(request: Any) -> Any:
-    """Stand in for the SDK's per-request contextvar."""
+    """Stand in for the request a tool binds before calling the service."""
     from types import SimpleNamespace
-    from typing import cast
 
-    from mcp.server.lowlevel.server import request_ctx
+    from stel.mcp_server.authorization import serving_request
 
-    token = request_ctx.set(cast(Any, SimpleNamespace(request=request)))
-    try:
+    with serving_request(SimpleNamespace(request=request)):
         yield
-    finally:
-        request_ctx.reset(token)
 
 
 def test_the_cli_refuses_a_network_transport_without_a_per_request_identity(
@@ -2273,21 +2270,22 @@ def test_the_operator_can_cap_how_many_candidates_a_caller_may_request() -> None
 
 @pytest.mark.anyio
 async def test_the_tool_schema_offers_candidate_limit_to_callers() -> None:
+    from mcp import Client
+
     """An argument the service honors but the tool does not advertise is
     unreachable for every MCP client, which is the shape of the original gap."""
-    from mcp.shared.memory import create_connected_server_and_client_session
-
+    
     service, _ = _service()
     app = create_mcp_server(service)
     try:
-        async with create_connected_server_and_client_session(
+        async with Client(
             app, raise_exceptions=True
         ) as session:
             tools = await session.list_tools()
             search_tool = next(
                 tool for tool in tools.tools if tool.name == "search_context"
             )
-            assert "candidate_limit" in search_tool.inputSchema["properties"]
+            assert "candidate_limit" in search_tool.input_schema["properties"]
     finally:
         service.close()
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `stel mcp serve` runs on the MCP Python SDK v2 (`MCPServer`); the `mcp`
+  extra now requires `mcp>=2.3,<3` and `mcp<2` is no longer supported (issue
+  #808, ALE-752). The four tools and their `mcp_context/v1` responses are
+  unchanged and the server also answers the 2026-07-28 protocol revision. Two
+  operator-visible changes: the protected-resource metadata publishes a
+  path-less issuer exactly as configured (no added trailing slash), and
+  `streamable-http` bodies over 4 MiB are refused (`413`). The
+  `Host` check on every bind is kept as it was, see [Protocol and SDK compatibility](docs/mcp.md#protocol-and-sdk-compatibility).
+  The SDK no longer reads `MCP_*` environment variables or `.env` files.
+
 - `stel graph-export` is incremental by document, and its output layout
   changed: `nodes.jsonl` and `edges.jsonl` are replaced by a shard per
   document under `nodes/` and `edges/`, and the manifest is

@@ -21,7 +21,7 @@ import duckdb
 import polars as pl
 import pytest
 from click.testing import CliRunner
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import Client
 
 import stel
 from stel.checks import run_project_tests
@@ -353,12 +353,12 @@ def _call(project: Path, tool: str, arguments: dict[str, Any]) -> dict[str, Any]
             authorization=ClaimAuthorizationProvider(),
         )
         app = create_mcp_server(service)
-        async with create_connected_server_and_client_session(
+        async with Client(
             app, raise_exceptions=True
         ) as session:
             result = await session.call_tool(tool, arguments)
-            assert result.structuredContent is not None
-            return result.structuredContent
+            assert result.structured_content is not None
+            return result.structured_content
 
     return asyncio.run(go())
 

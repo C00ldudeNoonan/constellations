@@ -1,12 +1,12 @@
-from __future__ import annotations
-
-import warnings
-from collections.abc import Iterator
-from contextlib import contextmanager
+# No `from __future__ import annotations`: the SDK reads a tool's type hints to
+# find its injected `Context`, and `Context` is imported inside
+# `create_mcp_server` (the `mcp` extra is optional), so the annotations have to
+# be evaluated where it is in scope rather than looked up later by name.
 from pathlib import Path
 from typing import Any, Literal
 
 from ..optional_dependencies import import_optional_dependency
+from .authorization import serving_request
 from .contracts import (
     MCP_CONTEXT_SCHEMA_VERSION,
     BusinessFilter,
@@ -25,58 +25,31 @@ from .grants import DEFAULT_GRANT_TTL_SECONDS
 from .service import CallerInfo, ContextServerSettings, ContextService
 
 
-def _caller_info(transport: str | None) -> CallerInfo:
+def _caller_info(context: Any, transport: str | None) -> CallerInfo:
     """Identify the caller of the request being served (issue #528).
 
-    Read from the SDK's request contextvar rather than through an injected
-    `Context` parameter: FastMCP derives a tool's input schema from its
-    signature, and a parameter added for telemetry would either appear in
-    that schema or depend on the SDK recognising its annotation. The
-    contextvar leaves the tool contract untouched.
+    Read from the `Context` the SDK injects into the tool: in SDK v2 that is
+    the only route to the request, the ambient contextvar v1 offered being
+    gone. `Context` parameters are excluded from a tool's input schema, so the
+    tool contract is untouched.
 
-    Best-effort by construction. The handshake's `clientInfo` is optional in
-    the protocol, the contextvar is unset outside a request, and every field
-    here is nullable -- a log row that cannot say who called is still worth
-    more than a failed query.
+    Best-effort by construction, and absent stays absent. The client's identity
+    is optional in the protocol -- the handshake's `clientInfo` on older
+    protocol versions, nothing at all from a client that does not send it --
+    and every field here is nullable. A log row that cannot say who called is
+    still worth more than a failed query, and inventing a name for a client
+    that gave none would poison the one column #528 exists to measure.
     """
-    try:
-        from mcp.server.lowlevel.server import request_ctx
-    except ImportError:  # pragma: no cover - mcp is an optional extra
-        return CallerInfo(transport=transport)
-    try:
-        context = request_ctx.get()
-    except LookupError:
-        return CallerInfo(transport=transport)
-    client = getattr(getattr(context, "session", None), "client_params", None)
-    info = getattr(client, "clientInfo", None)
-    request_id = getattr(context, "request_id", None)
+    request_context = context.request_context
+    params = request_context.session.client_params
+    info = None if params is None else params.client_info
+    request_id = request_context.request_id
     return CallerInfo(
         request_id=None if request_id is None else str(request_id),
-        client_name=getattr(info, "name", None),
-        client_version=getattr(info, "version", None),
+        client_name=None if info is None else info.name,
+        client_version=None if info is None else info.version,
         transport=transport,
     )
-
-# The SDK's `Settings.lifespan` is annotated with a forward reference to
-# `FastMCP`, which that module defines *after* `Settings`, so the annotation is
-# never resolved and pydantic-settings 2.15+ warns about it while building the
-# model. Cosmetic here — stel passes no lifespan and reads none from a settings
-# source, and the field resolves to None — but on a stdio transport stderr *is*
-# the client's log, and this is the only line a healthy server writes there. It
-# then sits directly above the connection lines in Claude Desktop's log, where
-# it reads like the cause of an unrelated failure (issue #526).
-#
-# Narrow on purpose: one message, around one construction. Anything else the
-# SDK warns about still reaches the operator. Removable once the SDK resolves
-# the annotation.
-_UPSTREAM_LIFESPAN_WARNING = r".*'lifespan'.*unresolved forward reference.*"
-
-
-@contextmanager
-def _without_the_upstream_lifespan_warning() -> Iterator[None]:
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=_UPSTREAM_LIFESPAN_WARNING)
-        yield
 
 
 def create_mcp_server(
@@ -87,51 +60,55 @@ def create_mcp_server(
     public_url: str | None = None,
     transport: str | None = None,
 ) -> Any:
-    fastmcp = import_optional_dependency(
-        "mcp.server.fastmcp",
+    mcpserver = import_optional_dependency(
+        "mcp.server.mcpserver",
         extra="mcp",
         feature="stel MCP serving",
     )
+    # Local on purpose, and named `Context` so the tool signatures below read
+    # as the SDK documents them; see the note at the top of this module.
+    Context = mcpserver.Context
     auth = _auth_settings(
         token_verifier, issuer_url=issuer_url, public_url=public_url
     )
-    with _without_the_upstream_lifespan_warning():
-        app = fastmcp.FastMCP(
-            "stel",
-            instructions=(
-                "Read-only governed document context. Use dbt MCP, not this server, "
-                "for semantic-layer metrics."
-            ),
-            json_response=True,
-            # When present, the SDK verifies the bearer token before any tool
-            # runs and exposes the result to `AccessTokenPrincipalResolver`
-            # (issue #392). Absent, the server is unauthenticated and only a
-            # trusted proxy in front can supply identity.
-            token_verifier=token_verifier,
-            # Required by the SDK whenever a verifier is present, and the
-            # source of the discovery metadata (issue #464). See
-            # `_auth_settings`.
-            auth=auth,
-        )
+    app = mcpserver.MCPServer(
+        "stel",
+        instructions=(
+            "Read-only governed document context. Use dbt MCP, not this server, "
+            "for semantic-layer metrics."
+        ),
+        # When present, the SDK verifies the bearer token before any tool
+        # runs and exposes the result to `AccessTokenPrincipalResolver`
+        # (issue #392). Absent, the server is unauthenticated and only a
+        # trusted proxy in front can supply identity.
+        token_verifier=token_verifier,
+        # Required by the SDK whenever a verifier is present, and the
+        # source of the discovery metadata (issue #464). See
+        # `_auth_settings`.
+        auth=auth,
+    )
 
-    @app.tool()  # type: ignore[untyped-decorator]
+    @app.tool()
     def list_context_models(
+        ctx: Context,
         limit: int = 20,
         cursor: str | None = None,
         schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> ListContextModelsResponse:
         """List only the governed context models available to the caller."""
-        return service.list_context_models(
-            ListContextModelsRequest(
-                schema_version=schema_version,
-                limit=limit,
-                cursor=cursor,
-            ),
-            caller=_caller_info(transport),
-        )
+        with serving_request(ctx.request_context):
+            return service.list_context_models(
+                ListContextModelsRequest(
+                    schema_version=schema_version,
+                    limit=limit,
+                    cursor=cursor,
+                ),
+                caller=_caller_info(ctx, transport),
+            )
 
-    @app.tool()  # type: ignore[untyped-decorator]
+    @app.tool()
     def search_context(
+        ctx: Context,
         model: str,
         query: str,
         mode: Literal["vector", "text", "hybrid"] = "hybrid",
@@ -161,22 +138,24 @@ def create_mcp_server(
         term it actually matched — so a hit reached through the hierarchy is
         never indistinguishable from an exact one.
         """
-        return service.search_context(
-            SearchContextRequest(
-                schema_version=schema_version,
-                model=model,
-                query=query,
-                mode=mode,
-                limit=limit,
-                candidate_limit=candidate_limit,
-                filters=tuple(filters or ()),
-                entity_scope=entity_scope,
-            ),
-            caller=_caller_info(transport),
-        )
+        with serving_request(ctx.request_context):
+            return service.search_context(
+                SearchContextRequest(
+                    schema_version=schema_version,
+                    model=model,
+                    query=query,
+                    mode=mode,
+                    limit=limit,
+                    candidate_limit=candidate_limit,
+                    filters=tuple(filters or ()),
+                    entity_scope=entity_scope,
+                ),
+                caller=_caller_info(ctx, transport),
+            )
 
-    @app.tool()  # type: ignore[untyped-decorator]
+    @app.tool()
     def get_document(
+        ctx: Context,
         model: str,
         document_id: str,
         document_version_id: str,
@@ -185,35 +164,38 @@ def create_mcp_server(
         schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> GetDocumentResponse:
         """Fetch one authorized document version as bounded, paginated chunks."""
-        return service.get_document(
-            GetDocumentRequest(
-                schema_version=schema_version,
-                model=model,
-                document_id=document_id,
-                document_version_id=document_version_id,
-                limit=limit,
-                cursor=cursor,
-            ),
-            caller=_caller_info(transport),
-        )
+        with serving_request(ctx.request_context):
+            return service.get_document(
+                GetDocumentRequest(
+                    schema_version=schema_version,
+                    model=model,
+                    document_id=document_id,
+                    document_version_id=document_version_id,
+                    limit=limit,
+                    cursor=cursor,
+                ),
+                caller=_caller_info(ctx, transport),
+            )
 
-    @app.tool()  # type: ignore[untyped-decorator]
+    @app.tool()
     def get_context_lineage(
+        ctx: Context,
         model: str,
         reference_type: LineageReferenceType,
         reference_id: str,
         schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> GetContextLineageResponse:
         """Trace one authorized document, context, chunk, or search result."""
-        return service.get_context_lineage(
-            GetContextLineageRequest(
-                schema_version=schema_version,
-                model=model,
-                reference_type=reference_type,
-                reference_id=reference_id,
-            ),
-            caller=_caller_info(transport),
-        )
+        with serving_request(ctx.request_context):
+            return service.get_context_lineage(
+                GetContextLineageRequest(
+                    schema_version=schema_version,
+                    model=model,
+                    reference_type=reference_type,
+                    reference_id=reference_id,
+                ),
+                caller=_caller_info(ctx, transport),
+            )
 
     return app
 
@@ -391,6 +373,36 @@ def _auth_settings(
     return settings_module.AuthSettings(
         issuer_url=issuer_url,
         resource_server_url=public_url,
+        # Stated rather than defaulted: the SDK warns when it is unset and
+        # will make True the default in 3.0. True makes the SDK refuse a token
+        # whose `AccessToken.resource` is not `resource_server_url`, and stel's
+        # verifiers do not set that field -- they check the token's audience
+        # against the operator's `--*-audience` themselves, and the audience
+        # is configured separately from the public URL, so the two need not
+        # be equal. Both verifiers fail closed on a missing or mismatched
+        # audience (`tokens.py`, `introspection.py`).
+        validate_token_resource=False,
+    )
+
+
+def loopback_host_security() -> Any:
+    """Refuse a request whose `Host` or `Origin` is not a loopback name.
+
+    SDK 1.x built its server with the default host `127.0.0.1`, which turned
+    this protection on whatever `--host` later said, so every bind refused a
+    foreign `Host` (421). SDK 2 turns it on only for a loopback bind. Passing
+    it explicitly keeps the 1.x behaviour on `0.0.0.0` and LAN binds, which
+    DNS rebinding would otherwise reach through a name that resolves to
+    loopback. A proxy in front must forward a loopback `Host`.
+    """
+    settings = import_optional_dependency(
+        "mcp.server.transport_security", extra="mcp", feature="The MCP server"
+    )
+    names = ("127.0.0.1", "localhost", "[::1]")
+    return settings.TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"{name}:*" for name in names],
+        allowed_origins=[f"http://{name}:*" for name in names],
     )
 
 
@@ -401,8 +413,15 @@ def _run(
     token_verifier: Any = None,
     issuer_url: str | None = None,
     public_url: str | None = None,
-    **settings: Any,
+    **network: Any,
 ) -> None:
+    """Warm the service, build the server and run its transport.
+
+    `network` is `host` and `port` for a network transport and empty for stdio.
+    SDK v2 takes them as arguments to `run`, not as settings on the server
+    (v1 assigned `app.settings.host`), and a transport rejects a keyword it
+    does not know, so they are passed only where they exist.
+    """
     try:
         # Resolve credentials and open the warehouse once before the transport
         # starts, so auth problems fail loudly at boot rather than as per-call
@@ -415,8 +434,13 @@ def _run(
             public_url=public_url,
             transport=transport,
         )
-        for name, value in settings.items():
-            setattr(app.settings, name, value)
-        app.run(transport=transport)
+        if network:
+            network["transport_security"] = loopback_host_security()
+        if transport == "streamable-http":
+            # Plain JSON replies rather than an SSE stream per call: every
+            # tool returns one result, and clients that do not read SSE
+            # still work. This was a constructor argument on v1.
+            network["json_response"] = True
+        app.run(transport=transport, **network)
     finally:
         service.close()

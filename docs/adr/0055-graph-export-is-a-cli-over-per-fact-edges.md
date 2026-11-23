@@ -1,6 +1,6 @@
 # ADR-0055: Graph export is a CLI over per-fact edges, keyed by the agent-context `entity_id`
 
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-0061](0061-graph-export-is-incremental-by-document-shards.md)
 - **Date:** 2026-11-07
 - **Prompted by:** #762 (ALE-423)
 

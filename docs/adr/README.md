@@ -73,6 +73,7 @@ history (issue #311).
 | [0061](0061-graph-export-is-incremental-by-document-shards.md) | Graph export is incremental by per-document shards with a manifest fingerprint; both reads stream ordered by document, and a vanished document is swept after a successful read, the way a stale key is | accepted, amends 0055 |
 | [0062](0062-search-results-are-lean-by-default-and-that-is-a-v2.md) | Lean search results are the default, and that is `mcp_context/v2` | accepted |
 | [0063](0063-graph-export-rdf-is-a-shard-format-behind-the-rdf-extra.md) | Graph export RDF (JSON-LD, Turtle) is a shard format behind the `rdf` extra with `urn:` identifiers, one format per directory, rdflib imported only when serializing | accepted, amends 0055 and 0061 |
+| [0065](0065-graph-export-graphiti-is-a-record-format-with-a-loader-behind-the-graphiti-extra.md) | Graph export for Graphiti is a record format with a loader (`graph-load`) behind the `graphiti` extra; valid time in the file, transaction time stamped at load | accepted, amends 0055, 0061 and 0063 |
 
 ## When to write one
 

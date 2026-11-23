@@ -65,6 +65,9 @@ ml = ["scikit-learn>=1.3", "numpy>=1.26"]
 # already validated inside the project. `stel graph-export --format jsonld|turtle`
 # (ALE-602) serializes with it too.
 rdf = ["rdflib>=7.1"]
+# Graphiti graph export and load (`stel graph-export --format graphiti`, `stel graph-load`,
+# ALE-603). graphiti-core 0.31 imports httpx without declaring it, so it is named here.
+graphiti = ["graphiti-core>=0.31.2", "httpx>=0.27", "certifi>=2026.10.19"]
 all = [
     "anthropic>=0.103.1",
     "anyio>=4.14.2",
@@ -92,6 +95,8 @@ all = [
     "scikit-learn>=1.3",
     "numpy>=1.26",
     "rdflib>=7.1",
+    "graphiti-core>=0.31.2",
+    "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -124,6 +129,8 @@ dev = [
     "google-cloud-bigquery>=3.25",
     "google-cloud-storage>=2.16",
     "ty>=0.0.63",
+    # an embedded graph database for the Graphiti load test: a file target, no server or credentials
+    "kuzu>=0.11.3",
 ]
 
 [tool.ruff]

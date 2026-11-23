@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `stel graph-export --format graphiti` writes the records graphiti-core's own
+  models take (an episode per document, entity nodes, `mentions` edges, and one
+  fact per edge with its validity interval), and the new `stel graph-load`
+  saves them into a Neo4j-backed Graphiti store with no hand transformation.
+  Behind a new `graphiti` extra (`pip install 'stel[graphiti]'`): without it both
+  commands exit 2 naming the install before reading anything. The file carries
+  valid time only; the loader stamps `created_at`, `expired_at` and a missing
+  episode time, so shards stay byte-identical. Credentials come from
+  `NEO4J_USER` and `NEO4J_PASSWORD`. A credential-free test loads the demo
+  export into an embedded Kuzu file; a Neo4j test is gated on
+  `STEL_NEO4J_TEST_*` (issue #815, ALE-603, ADR-0065).
 - `stel graph-export --format jsonld|turtle` writes the same graph as RDF, one
   standalone file per shard (`.jsonld`, `.ttl`), behind the existing `rdf`
   extra; `jsonl` stays the default. Entities are `urn:stel:entity:<entity_id>`,

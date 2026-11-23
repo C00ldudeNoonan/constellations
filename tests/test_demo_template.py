@@ -22,6 +22,7 @@ import polars as pl
 import pytest
 import rdflib
 from click.testing import CliRunner
+from graphiti_core.driver.kuzu_driver import KuzuDriver
 from mcp import Client
 
 import stel
@@ -29,6 +30,7 @@ from stel.checks import run_project_tests
 from stel.cli import cli
 from stel.concept_cloud import export_concept_cloud
 from stel.config.vocabulary import Vocabulary
+from stel.graph_load import load_graphiti_export
 from stel.mcp_server.authorization import (
     ClaimAuthorizationProvider,
     Principal,
@@ -365,6 +367,55 @@ def test_graph_export_rdf_formats_are_the_same_graph_as_jsonl(
     relations = rdf_subjects("edges", "urn:stel:graph:Relation")
     assert relations == {"urn:stel:relation:" + i for i in jsonl_ids("edges", "relation_id")}
     assert relations
+
+
+@pytest.mark.filterwarnings("ignore:The Kuzu backend is deprecated:DeprecationWarning")
+def test_graph_export_graphiti_format_loads_into_a_graphiti_store(
+    built: Path, tmp_path: Path
+) -> None:
+    """ALE-603: the demo project's export, through the CLI, is saved by
+    graphiti-core into an embedded Graphiti store and holds the same entities and
+    facts the JSON Lines export has."""
+    exports = {}
+    for name in ("jsonl", "graphiti"):
+        out = tmp_path / name
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--project-dir", str(built),
+                "graph-export",
+                "--format", name,
+                "--linking-model", "entity_links",
+                "--relation-model", "entity_relations",
+                "--entity-name", "system",
+                "-o", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        exports[name] = out
+    edges = [
+        json.loads(line)
+        for shard in (exports["jsonl"] / "edges").rglob("*.jsonl")
+        for line in shard.read_text(encoding="utf-8").splitlines()
+    ]
+
+    async def load() -> list[dict[str, Any]]:
+        driver = KuzuDriver(db=str(tmp_path / "store.kuzu"))
+        try:
+            result = await load_graphiti_export(exports["graphiti"], driver)
+            assert result.edges == len(edges)
+            rows, _, _ = await driver.execute_query(
+                "MATCH (n:Entity) RETURN n.name AS name"
+            )
+            return [cast(dict[str, Any], row) for row in rows]
+        finally:
+            await driver.close()
+
+    entities = asyncio.run(load())
+
+    assert len(entities) == 8
+    assert "Postgres" in {row["name"] for row in entities}
+    assert edges
 
 
 def test_the_longest_declared_name_claims_an_overlapping_span(

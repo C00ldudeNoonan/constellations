@@ -42,8 +42,9 @@ An edge also carries the interval its fact holds over (`valid_from`, `valid_to`,
 (ADR-0056, schema v2).
 
 The shards are JSON Lines, or the same rows as JSON-LD or Turtle behind the `rdf`
-extra (`graph_rdf.py`, ADR-0063): a format changes how a shard's bytes are
-written and nothing about what is in it, and a directory keeps one.
+extra (`graph_rdf.py`, ADR-0063), or as Graphiti's records behind the `graphiti`
+extra (`graph_graphiti.py`, ADR-0065): a format changes how a shard's bytes are
+written and nothing about what is in the graph, and a directory keeps one.
 
 Only intended output tables are read. Mention text is never read: a node is a
 canonical id and an edge is a pair of them, so nothing the operator withheld
@@ -67,6 +68,7 @@ from .agent_context import canonical_entity_key, make_entity_id
 from .config import load_project
 from .config.class_hierarchy import ClassDeclaration, class_ancestors, class_parents
 from .config.vocabulary import Vocabulary, VocabularyTerm, declared_terms
+from .graph_graphiti import group_id_for, require_graphiti, serialize_document
 from .graph_rdf import RDF_FORMATS, require_rdflib, serialize_rows
 from .optional_dependencies import OptionalDependencyError
 
@@ -78,14 +80,17 @@ EDGES_DIRNAME = "edges"
 LEGACY_SCHEMAS = ("stel.graph_export/v1", "stel.graph_export/v2")
 LEGACY_FILENAMES = ("nodes.jsonl", "edges.jsonl")
 
-# `jsonl` is the default and needs nothing; the other two are RDF and need the
-# `rdf` extra (ADR-0063). Each maps to the extension its shard files carry.
-GRAPH_FORMATS = ("jsonl", *RDF_FORMATS)
-_EXTENSIONS = {"jsonl": "jsonl", "jsonld": "jsonld", "turtle": "ttl"}
+# `jsonl` is the default and needs nothing; `jsonld` and `turtle` are RDF and
+# need the `rdf` extra (ADR-0063); `graphiti` is Graphiti's records and needs the
+# `graphiti` extra (ADR-0065). Each maps to the extension its shard files carry.
+GRAPH_FORMATS = ("jsonl", *RDF_FORMATS, "graphiti")
+_EXTENSIONS = {
+    "jsonl": "jsonl", "jsonld": "jsonld", "turtle": "ttl", "graphiti": "graphiti.jsonl"
+}
 
 _STAGE_DIRNAME = ".graph_export_stage"
 _SHARD_STEM = re.compile(r"[0-9a-f]{32}")
-_SHARD_NAME = re.compile(r"[0-9a-f]{32}\.(?:jsonl|jsonld|ttl)")
+_SHARD_NAME = re.compile(r"[0-9a-f]{32}\.(?:jsonl|jsonld|ttl|graphiti\.jsonl)")
 _PREFIX_NAME = re.compile(r"[0-9a-f]{2}")
 # Rows pulled per warehouse batch. Residency is this plus one document.
 _READ_BATCH_ROWS = 10_000
@@ -134,11 +139,13 @@ def check_format(graph_format: str) -> None:
         raise GraphExportError(
             f"unknown graph format {graph_format!r}; choose one of {', '.join(GRAPH_FORMATS)}"
         )
-    if graph_format in RDF_FORMATS:
-        try:
+    try:
+        if graph_format in RDF_FORMATS:
             require_rdflib(f"The `{graph_format}` graph export format")
-        except OptionalDependencyError as error:
-            raise GraphExportError(str(error)) from error
+        elif graph_format == "graphiti":
+            require_graphiti("The `graphiti` graph export format")
+    except OptionalDependencyError as error:
+        raise GraphExportError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -471,11 +478,20 @@ def _shard_path(root: Path, kind: str, shard: str, graph_format: str) -> Path:
     return root / kind / shard[:2] / f"{shard}.{_EXTENSIONS[graph_format]}"
 
 
-def _payload(rows: Sequence[Mapping[str, Any]], kind: str, graph_format: str) -> bytes:
-    """One shard file's bytes: JSON Lines, or the same rows as RDF."""
-    if graph_format == "jsonl":
-        return _jsonl(rows)
-    return serialize_rows(rows, kind=kind, graph_format=graph_format)
+def _payloads(staged: Staged, document_id: str, graph: DocumentGraph) -> dict[str, bytes]:
+    """One document's two shard files' bytes, keyed by tree."""
+    if staged.graph_format == "graphiti":
+        nodes, edges = serialize_document(
+            graph.nodes, graph.edges, document_id=document_id, group_id=staged.group_id
+        )
+        return {NODES_DIRNAME: nodes, EDGES_DIRNAME: edges}
+    rows = {NODES_DIRNAME: graph.nodes, EDGES_DIRNAME: graph.edges}
+    if staged.graph_format == "jsonl":
+        return {kind: _jsonl(rows[kind]) for kind in rows}
+    return {
+        kind: serialize_rows(rows[kind], kind=kind, graph_format=staged.graph_format)
+        for kind in rows
+    }
 
 
 def _fingerprint(nodes: bytes, edges: bytes) -> str:
@@ -564,6 +580,7 @@ class Staged:
 
     output_dir: Path
     graph_format: str
+    group_id: str
     prior: _Prior
     documents: dict[str, dict[str, Any]]
     changed: list[str]
@@ -610,6 +627,7 @@ def stage_graph(
     staged = Staged(
         output_dir=output_dir,
         graph_format=graph_format,
+        group_id=group_id_for(project),
         prior=_read_prior(output_dir, graph_format),
         documents={},
         changed=[],
@@ -647,10 +665,7 @@ def stage_graph(
 
 
 def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> None:
-    payloads = {
-        NODES_DIRNAME: _payload(graph.nodes, NODES_DIRNAME, staged.graph_format),
-        EDGES_DIRNAME: _payload(graph.edges, EDGES_DIRNAME, staged.graph_format),
-    }
+    payloads = _payloads(staged, document_id, graph)
     shard = _shard_id(document_id)
     entry = {
         "shard": shard,

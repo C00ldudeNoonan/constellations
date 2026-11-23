@@ -86,3 +86,31 @@ def _restore_adapter_registry() -> Iterator[None]:
     finally:
         _REGISTRY.clear()
         _REGISTRY.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _restore_nlp_provider_registry() -> Iterator[None]:
+    """Undo whatever a test did to the NLP provider registry (issue #222).
+
+    The registry and its discovery state are module-level, and
+    `register_nlp_provider` is a plain insert, so a test that registers a fake
+    provider (or runs discovery against a fake distribution) would leave it
+    registered for every file that follows. Restored here, not in the test that
+    registers, because the next one will not know to.
+    """
+    from stel.text import nlp_registry
+
+    registry = dict(nlp_registry._REGISTRY)
+    distributions = dict(nlp_registry._PLUGIN_DISTRIBUTIONS)
+    incompatible = dict(nlp_registry._INCOMPATIBLE_PLUGINS)
+    complete = nlp_registry._DISCOVERY_COMPLETE
+    try:
+        yield
+    finally:
+        nlp_registry._REGISTRY.clear()
+        nlp_registry._REGISTRY.update(registry)
+        nlp_registry._PLUGIN_DISTRIBUTIONS.clear()
+        nlp_registry._PLUGIN_DISTRIBUTIONS.update(distributions)
+        nlp_registry._INCOMPATIBLE_PLUGINS.clear()
+        nlp_registry._INCOMPATIBLE_PLUGINS.update(incompatible)
+        nlp_registry._DISCOVERY_COMPLETE = complete

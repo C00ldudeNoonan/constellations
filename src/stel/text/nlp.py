@@ -4,7 +4,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast
+from typing import Any, ClassVar, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -20,6 +20,13 @@ from ..optional_dependencies import (
     import_optional_dependency,
     optional_dependency_version,
 )
+from .nlp_registry import (
+    NLPModelSpec,
+    NLPProviderRegistration,
+    get_nlp_registration,
+    register_nlp_provider,
+)
+from .nlp_routing import NLPLanguageRouting, NLPRoute
 
 
 class NLPError(OptionalDependencyError):
@@ -29,7 +36,11 @@ class NLPError(OptionalDependencyError):
 class NLPBaseOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    provider: Literal["spacy"] = "spacy"
+    # What a transform needs from its provider. Checked against the registry's
+    # declared capabilities at compile time (issue #222).
+    required_capabilities: ClassVar[frozenset[str]] = frozenset()
+
+    provider: str = "spacy"
     model: str = "en_core_web_sm"
     language: str = "en"
     disable: tuple[str, ...] = ()
@@ -37,8 +48,9 @@ class NLPBaseOptions(BaseModel):
     document_id_field: str = "document_id"
     text_field: str = "text"
     include_fields: tuple[str, ...] = ()
+    language_routing: NLPLanguageRouting | None = None
 
-    @field_validator("model", "language", "document_id_field", "text_field")
+    @field_validator("provider", "model", "language", "document_id_field", "text_field")
     @classmethod
     def _non_empty_string(cls, value: str) -> str:
         normalized = value.strip()
@@ -72,12 +84,71 @@ class NLPBaseOptions(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _routing_replaces_single_model(self) -> NLPBaseOptions:
+        if self.language_routing is None:
+            return self
+        conflicting = sorted(
+            self.model_fields_set & {"provider", "model", "language", "disable"}
+        )
+        if conflicting:
+            raise ValueError(
+                "language_routing replaces the single provider/model: move "
+                f"{conflicting} into routes (or the fallback) instead"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _routes_are_supported(self) -> NLPBaseOptions:
+        """Fail on an unknown provider, a missing capability or an unsupported
+        language here, before any source is read or model loaded."""
+        for label, route, language in self.routes_to_validate():
+            registration = get_nlp_registration(route.provider)
+            missing = sorted(self.required_capabilities - registration.capabilities)
+            if missing:
+                raise ValueError(
+                    f"{label}: provider '{route.provider}' does not provide "
+                    f"{missing}, which this transform needs"
+                )
+            if not registration.supports_language(language):
+                raise ValueError(
+                    f"{label}: provider '{route.provider}' does not support "
+                    f"language '{language}'"
+                )
+        return self
+
+    def routes_to_validate(self) -> list[tuple[str, NLPRoute, str]]:
+        """Every (label, route, expected language) this configuration can use."""
+        routing = self.language_routing
+        if routing is None:
+            single = NLPRoute(
+                provider=self.provider,
+                model=self.model,
+                language=self.language,
+                disable=self.disable,
+            )
+            return [("transform", single, self.language)]
+        entries = [
+            (f"route '{key}'", route, routing.route_language(key))
+            for key, route in routing.routes.items()
+        ]
+        fallback = routing.fallback
+        if fallback is not None and fallback.language is not None:
+            entries.append(("fallback route", fallback, fallback.language))
+        return entries
+
 
 class NLPTokenOptions(NLPBaseOptions):
+    required_capabilities: ClassVar[frozenset[str]] = frozenset(
+        ("tokens", "lemmas", "pos")
+    )
+
     include_space: bool = False
 
 
 class NLPEntityOptions(NLPBaseOptions):
+    required_capabilities: ClassVar[frozenset[str]] = frozenset(("entities",))
+
     include_text: StrictBool = False
 
 
@@ -151,9 +222,32 @@ class SpacyNLPProvider:
 
 
 def get_nlp_provider(options: NLPBaseOptions) -> NLPProvider:
-    if options.provider != "spacy":
-        raise NLPError(f"Unsupported NLP provider: {options.provider}")
-    return _spacy_provider(options.model, options.language, options.disable)
+    """The provider for a single-model (unrouted) configuration."""
+    route = NLPRoute(
+        provider=options.provider,
+        model=options.model,
+        language=options.language,
+        disable=options.disable,
+    )
+    return load_nlp_route(route, options.language)
+
+
+def load_nlp_route(route: NLPRoute, language: str) -> NLPProvider:
+    """Build the provider a route names, through the registry only."""
+    registration = get_nlp_registration(route.provider)
+    provider = registration.loader(
+        NLPModelSpec(model=route.model, language=language, disable=route.disable)
+    )
+    if provider.identity.provider != registration.name:
+        raise NLPError(
+            f"NLP provider '{registration.name}' returned a provider that "
+            f"identifies as '{provider.identity.provider}'"
+        )
+    return provider
+
+
+def _load_spacy(spec: NLPModelSpec) -> NLPProvider:
+    return _spacy_provider(spec.model, spec.language, spec.disable)
 
 
 @functools.lru_cache(maxsize=8)
@@ -237,3 +331,15 @@ def _convert_spacy_document(document: Any) -> NLPDocument:
         for index, entity in enumerate(document.ents)
     )
     return NLPDocument(tokens=tokens, entities=entities)
+
+
+register_nlp_provider(
+    NLPProviderRegistration(
+        name="spacy",
+        loader=_load_spacy,
+        # spaCy has no per-entity confidence in the pipelines stel reads.
+        capabilities=frozenset(("tokens", "lemmas", "pos", "entities", "sentences")),
+        # The installed model decides; the language is checked when it loads.
+        languages=None,
+    )
+)

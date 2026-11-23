@@ -55,6 +55,15 @@ from .nlp import (
     NLPTokenOptions,
     get_nlp_provider,
 )
+from .nlp_registry import (
+    NLP_PROVIDER_CONTRACT_VERSION,
+    NLPModelSpec,
+    NLPProviderRegistration,
+    NLPProviderRegistryError,
+    list_nlp_providers,
+    register_nlp_provider,
+)
+from .nlp_routing import NLPLanguageRouting, NLPRoute, NLPRoutingError
 from .pii import PIIEntity, PIIError, detect_pii, redact_pii
 from .relations import (
     CO_OCCURRENCE_EXTRACTOR_VERSION,
@@ -87,6 +96,7 @@ __all__ = [
     "KEYPHRASE_EXTRACTOR_NAME",
     "KEYPHRASE_EXTRACTOR_VERSION",
     "MODEL_ASSERTION_EXTRACTOR_VERSION",
+    "NLP_PROVIDER_CONTRACT_VERSION",
     "RULE_EXTRACTOR_VERSION",
     "TONE_SCORER_VERSION",
     "VECTOR_SIMILARITY_RESOLVER_VERSION",
@@ -103,7 +113,13 @@ __all__ = [
     "NLPEntityOptions",
     "NLPError",
     "NLPIdentity",
+    "NLPLanguageRouting",
+    "NLPModelSpec",
     "NLPProvider",
+    "NLPProviderRegistration",
+    "NLPProviderRegistryError",
+    "NLPRoute",
+    "NLPRoutingError",
     "NLPToken",
     "NLPTokenOptions",
     "PIIEntity",
@@ -125,6 +141,7 @@ __all__ = [
     "get_nlp_provider",
     "link_namespace_column",
     "link_status_column",
+    "list_nlp_providers",
     "minhash_signature",
     "near_duplicates",
     "normalize_alias_text",
@@ -133,6 +150,7 @@ __all__ = [
     "pos_count_column",
     "pos_ratio_column",
     "redact_pii",
+    "register_nlp_provider",
     "relation_id",
     "text_stats",
     "tone_lexicon_fingerprint",

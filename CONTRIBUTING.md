@@ -169,6 +169,27 @@ The `link_entities` transform dispatches to a resolver selected by its
    per-namespace `NamespaceResolution` outcomes, so `match_score` and the status
    columns stay consistent across resolvers.
 
+### Adding an NLP provider
+
+`nlp_tokens` and `nlp_entities` reach their analyzer only through the registry in
+`src/stel/text/nlp_registry.py` (ADR-0064); never branch on a vendor name in
+`_nlp.py` or the runner.
+
+1. Implement the `NLPProvider` protocol (`identity` and a batched `pipe` that
+   yields exactly one `NLPDocument` per input text, in order) and a loader
+   `(NLPModelSpec) -> NLPProvider`. Import the optional dependency lazily and
+   raise `NLPError` with a `pip install 'stel[...]'` or model-install command
+   when it is absent. Never download a model.
+2. Build an `NLPProviderRegistration(name, loader, capabilities, languages)`.
+   Declare only the capabilities the provider really emits, and `languages` when
+   they are known without loading a model (`None` otherwise). The loaded
+   provider's `identity.provider` must equal `name`.
+3. Register it with `register_nlp_provider` (a built-in) or, from a separate
+   package, expose the registration as an entry point in the
+   `stel.nlp_providers.v1` group whose name is the provider name.
+4. Add it to the contract test in `tests/test_nlp_routing.py` using a
+   deterministic fake, with no network.
+
 ## Adding a new model kind
 
 Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one

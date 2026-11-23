@@ -42,7 +42,7 @@ An edge also carries the interval its fact holds over (`valid_from`, `valid_to`,
 (ADR-0056, schema v2).
 
 The shards are JSON Lines, or the same rows as JSON-LD or Turtle behind the `rdf`
-extra (`graph_rdf.py`, ADR-0062): a format changes how a shard's bytes are
+extra (`graph_rdf.py`, ADR-0063): a format changes how a shard's bytes are
 written and nothing about what is in it, and a directory keeps one.
 
 Only intended output tables are read. Mention text is never read: a node is a
@@ -79,7 +79,7 @@ LEGACY_SCHEMAS = ("stel.graph_export/v1", "stel.graph_export/v2")
 LEGACY_FILENAMES = ("nodes.jsonl", "edges.jsonl")
 
 # `jsonl` is the default and needs nothing; the other two are RDF and need the
-# `rdf` extra (ADR-0062). Each maps to the extension its shard files carry.
+# `rdf` extra (ADR-0063). Each maps to the extension its shard files carry.
 GRAPH_FORMATS = ("jsonl", *RDF_FORMATS)
 _EXTENSIONS = {"jsonl": "jsonl", "jsonld": "jsonld", "turtle": "ttl"}
 

@@ -1,4 +1,4 @@
-# ADR-0062: Graph export RDF is a shard format behind the `rdf` extra, with `urn:` identifiers
+# ADR-0063: Graph export RDF is a shard format behind the `rdf` extra, with `urn:` identifiers
 
 - **Status:** accepted; amends 0055, 0061
 - **Date:** 2026-11-23

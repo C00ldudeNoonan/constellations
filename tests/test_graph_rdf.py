@@ -1,4 +1,4 @@
-"""Graph export as JSON-LD and Turtle (ALE-602, ADR-0062).
+"""Graph export as JSON-LD and Turtle (ALE-602, ADR-0063).
 
 The RDF shards are the same graph the JSON Lines export writes, so the test
 that matters parses them back with rdflib and compares the result to the JSON

@@ -1,4 +1,4 @@
-"""RDF serializations of one document's graph shard (ALE-602, ADR-0062).
+"""RDF serializations of one document's graph shard (ALE-602, ADR-0063).
 
 `graph_export` builds each document's nodes and edges as plain rows. This
 module turns the same rows into Turtle or JSON-LD, so the three formats are

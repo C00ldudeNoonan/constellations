@@ -6303,7 +6303,7 @@ edges has no file of that kind):
   that has one is complete.
 
 **JSON-LD and Turtle.** `--format jsonld` or `--format turtle` writes the same
-graph as RDF instead of JSON Lines (issue #811, [ADR-0062](adr/0062-graph-export-rdf-is-a-shard-format-behind-the-rdf-extra.md)).
+graph as RDF instead of JSON Lines (issue #811, [ADR-0063](adr/0063-graph-export-rdf-is-a-shard-format-behind-the-rdf-extra.md)).
 It needs the `rdf` extra, `pip install 'stel[rdf]'`; without it the command
 exits 2 naming that install, before the project or warehouse is read. The
 layout is unchanged except for the extension (`.jsonld`, `.ttl`), and

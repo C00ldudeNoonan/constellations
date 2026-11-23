@@ -9,7 +9,7 @@
   document, extractor and validity interval. Without the extra the command
   exits 2 naming `pip install 'stel[rdf]'` before reading anything. The
   manifest records `format`, and a directory keeps one format (issue #811,
-  ALE-602, ADR-0062).
+  ALE-602, ADR-0063).
 - `stel mcp serve` runs on the MCP Python SDK v2 (`MCPServer`); the `mcp`
   extra now requires `mcp>=2.3,<3` and `mcp<2` is no longer supported (issue
   #808, ALE-752). The four tools and their `mcp_context/v1` responses are

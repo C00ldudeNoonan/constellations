@@ -30,6 +30,7 @@ fingerprint depends on.
 """
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,7 @@ ENTITY_IRI = "urn:stel:entity:"
 RELATION_IRI = "urn:stel:relation:"
 DOCUMENT_IRI = "urn:stel:document:"
 XSD = "http://www.w3.org/2001/XMLSchema#"
+_XSD_DOUBLE = XSD + "double"
 
 _STRINGS = {
     "entity_namespace": "entityNamespace",
@@ -157,6 +159,30 @@ def _canonical_jsonld(text: str) -> bytes:
     return (json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def _turtle(graph: Graph) -> bytes:
+    """Turtle with a double written as its stored lexical form.
+
+    rdflib's Turtle serializer abbreviates an `xsd:double` to `"%e" % value`, six
+    decimals, so a confidence of 0.123456789 would come back as 0.1234568 and two
+    distinct scores could share a shard fingerprint (review of PR #814). Writing
+    the typed literal keeps the digits JSON Lines carries.
+    """
+    from rdflib.plugins.serializers.turtle import TurtleSerializer
+
+    class _Exact(TurtleSerializer):
+        def label(self, node: Any, position: Any) -> str:
+            if str(getattr(node, "datatype", None)) == _XSD_DOUBLE:
+                return str(node._literal_n3(use_plain=False, qname_callback=self._pname_for))
+            return super().label(node, position)
+
+        def _pname_for(self, datatype: Any) -> str | None:
+            return self.get_pname(datatype, True)
+
+    out = io.BytesIO()
+    _Exact(graph).serialize(out)
+    return out.getvalue()
+
+
 def serialize_rows(rows: Sequence[Mapping[str, Any]], *, kind: str, graph_format: str) -> bytes:
     """One shard file's rows as `graph_format`; empty bytes for no rows.
 
@@ -171,6 +197,6 @@ def serialize_rows(rows: Sequence[Mapping[str, Any]], *, kind: str, graph_format
     for row in rows:
         add(rdflib, graph, row)
     if graph_format == "turtle":
-        return graph.serialize(format="turtle").encode("utf-8")
+        return _turtle(graph)
     text = graph.serialize(format="json-ld", context=_jsonld_context(), auto_compact=False)
     return _canonical_jsonld(text)

@@ -67,7 +67,7 @@ def _rich_export(out: Path, graph_format: str) -> Any:
                 "document_id": document,
                 "subject_mention_id": "m1",
                 "object_mention_id": "m2",
-                "confidence": 0.1,
+                "confidence": 0.123456789,
                 "directed": True,
                 "relation_type": "depends_on",
             },
@@ -334,3 +334,15 @@ def test_importing_the_export_does_not_import_rdflib(
         monkeypatch.delitem(sys.modules, name)
 
     importlib.import_module("stel.graph_export")
+
+
+def test_a_confidence_keeps_every_digit_in_turtle(tmp_path: Path) -> None:
+    """rdflib's Turtle serializer writes a double with six decimals, which would
+    turn 0.123456789 into 0.1234568 and let two scores share a fingerprint
+    (review of PR #814)."""
+    out = tmp_path / "g"
+    _rich_export(out, "turtle")
+
+    graph = _parse(out, EDGES_DIRNAME, "turtle")
+    confidences = {float(o) for o in graph.objects(None, _STEL.confidence)}
+    assert confidences == {0.123456789}

@@ -12,7 +12,6 @@ from pydantic import ValidationError
 from stel.adapters import create_adapter, parse_warehouse_config
 from stel.agent_context import (
     AGENT_CONTEXT_CONTRACT,
-    AgentContextGrain,
     AgentContextValidationError,
     FreshnessStatus,
     active_as_of,
@@ -40,6 +39,7 @@ from stel.agent_context import (
     validate_agent_context_frame,
     validate_agent_context_relations,
 )
+from stel.agent_context_grain import AgentContextGrain
 from stel.config.model import ModelConfig
 from stel.dbt_export import build_dbt_sources
 from stel.docs import generate_docs

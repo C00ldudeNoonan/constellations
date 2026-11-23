@@ -42,12 +42,11 @@ import pytest
 from stel.retrieval import (
     CollectionSpec,
     IndexedRow,
-    LanceDBConfig,
-    LanceDBStore,
     RetrievalPredicate,
     RetrievalPredicateOperator,
     StoreRole,
 )
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 
 DIM = 16
 ROWS = 600

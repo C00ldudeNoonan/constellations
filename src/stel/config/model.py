@@ -21,7 +21,7 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 
-from ..agent_context import AgentContextGrain
+from ..agent_context_grain import AgentContextGrain
 from ..credentials import CredentialReference, CredentialReferenceError
 from .identifiers import validate_node_name
 from .search_partition import SearchPartitionConfig

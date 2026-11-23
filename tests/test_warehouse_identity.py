@@ -156,7 +156,7 @@ def test_replacing_a_registered_adapter_is_contained() -> None:
 
 
 def test_the_replaced_adapter_is_back_for_the_next_test() -> None:
-    assert _REGISTRY["duckdb"] is not _StubAdapter
+    assert _REGISTRY.get("duckdb") is not _StubAdapter
     assert adapter_supports_identity_scoped_connection("duckdb") is False
 
 

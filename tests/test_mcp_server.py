@@ -22,11 +22,11 @@ from stel.adapters.base import (
     WarehouseIdentity,
 )
 from stel.agent_context import (
-    AgentContextGrain,
     FreshnessStatus,
     contract_descriptor,
     project_entity_link,
 )
+from stel.agent_context_grain import AgentContextGrain
 from stel.append_log import QUERY_LOG_SCHEMA
 from stel.config.vocabulary import Vocabulary, VocabularyTerm
 from stel.manifest import SERVING_MANIFEST_VERSION

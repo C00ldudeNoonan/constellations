@@ -15,12 +15,12 @@ from stel.compiler import validate_project_contract
 from stel.config import load_project
 from stel.config.loader import ConfigError
 from stel.config.profile import LLMConfig
+from stel.relation_options import ModelAssertionExtractorOptions
 from stel.text.relations import (
     CO_OCCURRENCE_EXTRACTOR_VERSION,
     RULE_EXTRACTOR_VERSION,
     Mention,
     ModelAssertionExtractor,
-    ModelAssertionExtractorOptions,
     Relation,
     RelationAssertion,
     RelationExtractor,

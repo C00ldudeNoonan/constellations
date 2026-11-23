@@ -11,14 +11,13 @@ from stel.adapters import parse_warehouse_config
 from stel.compiler import validate_project_contract
 from stel.config import load_project
 from stel.config.loader import ConfigError
+from stel.entity_link_options import FuzzyResolverOptions, parse_entity_link_options
 from stel.text import (
     ALIAS_RESOLVER_VERSION,
     FUZZY_RESOLVER_VERSION,
     VECTOR_SIMILARITY_RESOLVER_VERSION,
-    FuzzyResolverOptions,
     alias_set_fingerprint,
     normalize_alias_text,
-    parse_entity_link_options,
 )
 from stel.text.transforms import link_entities
 from stel.transforms import IncrementalContract, TransformContext

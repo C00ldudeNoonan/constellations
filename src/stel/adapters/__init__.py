@@ -1,7 +1,3 @@
-from . import (
-    bigquery,  # noqa: F401  # side-effect: registers BigQueryAdapter
-    duckdb,  # noqa: F401  # side-effect: registers DuckDBAdapter
-)
 from .base import (
     AdapterCapabilityError,
     AdapterConfigError,

@@ -21,12 +21,9 @@ from stel.compiler import validate_project_contract
 from stel.config import load_project
 from stel.config.loader import ConfigError
 from stel.config.vocabulary import Vocabulary, VocabularyTerm
+from stel.entity_link_options import parse_vocabulary_alias_source
 from stel.link_contracts import validate_link_project_contracts
-from stel.text.linking import (
-    ALIAS_RESOLVER_VERSION,
-    parse_vocabulary_alias_source,
-    vocabulary_alias_rows,
-)
+from stel.text.linking import ALIAS_RESOLVER_VERSION, vocabulary_alias_rows
 from stel.text.transforms import link_entities
 from stel.transforms import TransformContext
 

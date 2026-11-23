@@ -16,14 +16,9 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from stel.retrieval import (
-    CollectionSpec,
-    DuckDBStore,
-    IndexedRow,
-    LanceDBStore,
-    StoreRole,
-    parse_store_config,
-)
+from stel.retrieval import CollectionSpec, IndexedRow, StoreRole, parse_store_config
+from stel.retrieval.duckdb import DuckDBStore
+from stel.retrieval.lancedb import LanceDBStore
 
 PHYSICAL = "demo__dev__context"
 pytestmark = pytest.mark.e2e

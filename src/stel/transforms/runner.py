@@ -8,14 +8,17 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Protocol, cast
-
-import polars as pl
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from ..budget import BudgetLedger
 from ..config.profile import LLMConfig, WarehouseConfig
 from ..config.vocabulary import RelationTypeDef, Vocabulary
 from ..paths import resolve_module_file
+
+if TYPE_CHECKING:
+    # Annotation only: validating a project must not import polars
+    # (issue #823, ALE-791).
+    import polars as pl
 
 
 @dataclass(frozen=True)

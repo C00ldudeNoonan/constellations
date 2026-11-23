@@ -29,7 +29,6 @@ from .coordination import (
     ServingNotReadyError,
     StaleServingLeaseError,
 )
-from .duckdb import DuckDBConfig, DuckDBStore
 from .evolution import (
     ChangeKind,
     ConfigChange,
@@ -40,7 +39,6 @@ from .evolution import (
     rebuild_required,
     semantic_search_config,
 )
-from .lancedb import LanceDBConfig, LanceDBStore
 from .registry import (
     absolutize_store_config,
     collection_config_fingerprint,
@@ -58,11 +56,7 @@ __all__ = [
     "CollectionMetadata",
     "CollectionSpec",
     "ConfigChange",
-    "DuckDBConfig",
-    "DuckDBStore",
     "IndexedRow",
-    "LanceDBConfig",
-    "LanceDBStore",
     "MutationOutcome",
     "MutationReceipt",
     "PublishLease",

@@ -249,7 +249,7 @@ def test_a_first_publish_speaks_as_the_streamed_count_crosses_the_line(
     to say; the in-progress site must speak from the running count, before
     the build, and claim a floor rather than a total."""
     from stel.execution import search as search_module
-    from stel.retrieval import LanceDBStore
+    from stel.retrieval.lancedb import LanceDBStore
     from stel.runner import run_project
 
     write_project(tmp_path)

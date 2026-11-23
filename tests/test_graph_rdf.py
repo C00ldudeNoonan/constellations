@@ -344,5 +344,5 @@ def test_a_confidence_keeps_every_digit_in_turtle(tmp_path: Path) -> None:
     _rich_export(out, "turtle")
 
     graph = _parse(out, EDGES_DIRNAME, "turtle")
-    confidences = {float(o) for o in graph.objects(None, _STEL.confidence)}
+    confidences = {float(str(o)) for o in graph.objects(None, _STEL.confidence)}
     assert confidences == {0.123456789}

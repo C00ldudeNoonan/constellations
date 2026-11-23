@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -145,6 +146,31 @@ async def load_graphiti_export(
     )
 
 
+_VECTOR_CALL = re.compile(
+    r"WITH [\w, ]+ CALL db\.create\.set(?:Node|Relationship)VectorProperty\([^)]*\)"
+)
+
+
+class _EmbeddingFreeDriver:
+    """A Neo4j driver whose saves skip graphiti-core's vector-setting procedure.
+
+    The export carries no embeddings (ADR-0065), and graphiti-core's Neo4j save
+    queries call `db.create.set*VectorProperty` unconditionally, which Neo4j
+    rejects for a null vector. The clause is removed from the query graphiti-core
+    itself builds, so a record is still saved by its own `save`; a property that
+    is null is simply not stored.
+    """
+
+    def __init__(self, driver: Any) -> None:
+        self._driver = driver
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._driver, name)
+
+    async def execute_query(self, query: str, **params: Any) -> Any:
+        return await self._driver.execute_query(_VECTOR_CALL.sub("", query), **params)
+
+
 def load_into_neo4j(
     export_dir: Path, *, uri: str, user: str, password: str, database: str | None
 ) -> GraphLoadResult:
@@ -160,7 +186,7 @@ def load_into_neo4j(
     async def run() -> GraphLoadResult:
         driver = Neo4jDriver(uri=uri, user=user, password=password, database=database or "neo4j")
         try:
-            return await load_graphiti_export(export_dir, driver)
+            return await load_graphiti_export(export_dir, _EmbeddingFreeDriver(driver))
         finally:
             await driver.close()
 

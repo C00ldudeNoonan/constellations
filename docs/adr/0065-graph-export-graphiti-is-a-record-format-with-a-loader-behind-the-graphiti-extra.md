@@ -48,7 +48,9 @@ invented in the file.
 **Identity is a `uuid5` of the group id and the ADR-0063 `urn:`.** The same
 entity is the same node in every document, a load is idempotent (Graphiti saves
 merge on `uuid`), and two projects exported under different groups do not
-collide. The group id is the project name restricted to what Graphiti accepts.
+collide. The group id is the project name restricted to what Graphiti accepts; a name
+that needed restricting carries a digest of the original, so `sales/eu` and
+`sales_eu` stay two groups.
 
 **The extra is `graphiti`, lazily imported, and the load is credential-free to
 test.** `graphiti-core>=0.31.2` (with `httpx`, which 0.31 imports without
@@ -57,7 +59,9 @@ reading anything, naming `pip install 'stel[graphiti]'`. The loader reads the
 manifest's shard list rather than walking the directory, checks each document's
 fingerprint before saving it, refuses symlinks, and holds one shard at a time.
 The credential-free test loads into Kuzu, an embedded database graphiti-core
-drives from a file; `kuzu` is a dev dependency only. A Neo4j load is
+drives from a file; `kuzu` is a dev dependency only. Graphiti's Neo4j save queries call a vector procedure that rejects a
+null embedding, so the Neo4j load removes that clause from the query graphiti-core
+builds (a unit test pins it against a recording driver). A Neo4j load is
 credential-gated (`STEL_NEO4J_TEST_URI`, `_USER`, `_PASSWORD`). `graph-load`
 reads `NEO4J_USER` and `NEO4J_PASSWORD` from the environment, never a flag, and
 reports a connection failure by exception type alone.

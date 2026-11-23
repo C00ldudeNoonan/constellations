@@ -46,6 +46,7 @@ the same node in each and merges when loaded.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -73,9 +74,16 @@ def require_graphiti(feature: str) -> Any:
 
 
 def group_id_for(project: str) -> str:
-    """Graphiti accepts letters, digits, dashes and underscores in a group id."""
+    """Graphiti accepts letters, digits, dashes and underscores in a group id.
+
+    A name that needed cleaning carries a digest of the original, so `sales/eu`
+    and `sales_eu` stay two groups instead of merging their records on load.
+    """
     cleaned = _GROUP_UNSAFE.sub("_", project)
-    return cleaned or "stel"
+    if cleaned == project:
+        return cleaned or "stel"
+    digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}_{digest}"
 
 
 def _uuid(group_id: str, name: str) -> str:

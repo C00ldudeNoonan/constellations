@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ from stel.graph_graphiti import group_id_for
 from stel.graph_load import (
     GraphLoadError,
     GraphLoadResult,
+    _EmbeddingFreeDriver,
     load_graphiti_export,
     load_into_neo4j,
 )
@@ -241,13 +243,59 @@ def test_identity_is_a_function_of_the_ids_and_the_group(tmp_path: Path) -> None
         linking_model="l", relation_model="r", context=context(), graph_format="graphiti",
     )
     (record,) = (r for r in _records(other, NODES_DIRNAME) if r["record"] == "entity_node")
-    assert record["group_id"] == "other_project"
+    assert record["group_id"] == group_id_for("other project")
     assert record["uuid"] not in entity_uuids
 
 
 def test_group_ids_use_only_what_graphiti_accepts() -> None:
-    assert group_id_for("my project/é") == "my_project__"
+    cleaned = group_id_for("my project/é")
+    assert re.fullmatch(r"my_project___[0-9a-f]{8}", cleaned)
+    assert group_id_for("clean-name_1") == "clean-name_1"
     assert group_id_for("") == "stel"
+
+
+def test_two_project_names_that_clean_alike_keep_separate_groups() -> None:
+    """`sales/eu` and `sales_eu` would otherwise share a group, hence uuids, and
+    merge on load (review of PR #817)."""
+    assert group_id_for("sales/eu") != group_id_for("sales_eu")
+    assert group_id_for("sales/eu") == group_id_for("sales/eu")
+
+
+class _FakeNeo4j:
+    """The part of a graphiti-core driver a save touches, recording queries."""
+
+    def __init__(self) -> None:
+        from graphiti_core.driver.driver import GraphProvider
+
+        self.provider = GraphProvider.NEO4J
+        self.graph_operations_interface = None
+        self.queries: list[str] = []
+
+    async def build_indices_and_constraints(self) -> None:
+        return None
+
+    async def execute_query(self, query: str, **params: Any) -> Any:
+        self.queries.append(query)
+        return ([], None, None)
+
+
+def test_a_neo4j_load_never_calls_the_vector_procedure_for_absent_embeddings(
+    tmp_path: Path,
+) -> None:
+    """Neo4j rejects a null vector, and graphiti-core's save queries call the
+    procedure unconditionally; the export carries no embeddings (review of
+    PR #817). The unwrapped driver is the control: it does see the call."""
+    out = tmp_path / "g"
+    _two_documents(out)
+
+    raw = _FakeNeo4j()
+    asyncio.run(load_graphiti_export(out, raw, loaded_at=_LOADED_AT))
+    assert any("VectorProperty" in q for q in raw.queries)
+
+    wrapped = _FakeNeo4j()
+    asyncio.run(load_graphiti_export(out, _EmbeddingFreeDriver(wrapped), loaded_at=_LOADED_AT))
+    assert wrapped.queries
+    assert not any("VectorProperty" in q for q in wrapped.queries)
 
 
 def test_without_the_graphiti_extra_the_export_names_the_install_command(

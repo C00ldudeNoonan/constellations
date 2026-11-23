@@ -736,6 +736,72 @@ def test_a_v2_export_is_left_alone_until_the_v3_export_has_committed(
     assert manifest["schema"] == GRAPH_EXPORT_SCHEMA
 
 
+def test_a_v2_export_survives_a_failed_manifest_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The earlier export is retained until the v3 manifest is published, so a
+    write that fails at the last step (a full disk) does not cost the user both."""
+    out = tmp_path / "g"
+    legacy = _legacy_export(out)
+    real_write = graph_export._write_file
+
+    def fail_manifest(path: Path, payload: bytes) -> None:
+        if path.name == GRAPH_MANIFEST_FILENAME:
+            raise OSError("disk full")
+        real_write(path, payload)
+
+    monkeypatch.setattr(graph_export, "_write_file", fail_manifest)
+    with pytest.raises(OSError, match="disk full"):
+        _export(out, *_corpus(2))
+
+    after = _snapshot(out)
+    assert {name: after.get(name) for name in legacy} == legacy
+
+
+def _stranded_shard(root: Path, kind: str) -> Path:
+    prefix = root / kind / "aa"
+    prefix.mkdir(parents=True)
+    path = prefix / f"{'a' * 32}.jsonl"
+    path.write_bytes(b"{}")
+    return path
+
+
+def test_a_symlinked_shard_directory_is_refused_before_anything_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recovery sweep removes shard-shaped files, so it must never follow a
+    link out of the export. `Path.is_symlink` is stood in for here because
+    creating a real link needs a privilege some machines lack."""
+    out = tmp_path / "g"
+    outside = _stranded_shard(tmp_path / "elsewhere", NODES_DIRNAME)
+    inside = _stranded_shard(out, EDGES_DIRNAME)
+    real = Path.is_symlink
+    monkeypatch.setattr(
+        Path, "is_symlink", lambda self: self.name == "aa" or real(self)
+    )
+
+    with pytest.raises(GraphExportError, match="symlink"):
+        _export(out, *_corpus(0))
+
+    assert outside.is_file()
+    assert inside.is_file()
+
+
+def test_a_real_symlinked_shard_directory_leaves_its_target_alone(tmp_path: Path) -> None:
+    out = tmp_path / "g"
+    outside = _stranded_shard(tmp_path / "elsewhere", NODES_DIRNAME)
+    (out / NODES_DIRNAME).mkdir(parents=True)
+    try:
+        (out / NODES_DIRNAME / "aa").symlink_to(outside.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not available here")
+
+    with pytest.raises(GraphExportError, match="symlink"):
+        _export(out, *_corpus(0))
+
+    assert outside.is_file()
+
+
 @pytest.mark.parametrize(
     "manifest",
     [

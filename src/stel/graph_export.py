@@ -551,6 +551,7 @@ def stage_graph(
     distinct-key term of the bounded-memory contract.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    _refuse_symlinked_trees(output_dir)
     staged = Staged(
         output_dir=output_dir,
         prior=_read_prior(output_dir),
@@ -615,6 +616,26 @@ def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> N
             target.write_bytes(payloads[kind])
 
 
+def _refuse_symlinked_trees(output_dir: Path) -> None:
+    """Fail before any write or removal if a shard tree or a fan-out directory
+    is a symlink: every path below them would lead outside the export."""
+    for kind in (NODES_DIRNAME, EDGES_DIRNAME):
+        base = output_dir / kind
+        if base.is_symlink():
+            raise GraphExportError(
+                f"{base} is a symlink; the export never follows symlinks. "
+                "Remove it or export to another directory"
+            )
+        if not base.is_dir():
+            continue
+        for prefix in base.iterdir():
+            if _PREFIX_NAME.fullmatch(prefix.name) and prefix.is_symlink():
+                raise GraphExportError(
+                    f"{prefix} is a symlink; the export never follows symlinks. "
+                    "Remove it or export to another directory"
+                )
+
+
 def _sweep_unnamed(output_dir: Path, keep: set[Path]) -> None:
     """Remove shard-named files no manifest names, after a crash left some.
 
@@ -633,6 +654,7 @@ def _sweep_unnamed(output_dir: Path, keep: set[Path]) -> None:
                 if (
                     _SHARD_NAME.fullmatch(candidate.name)
                     and candidate.is_file()
+                    and not candidate.is_symlink()
                     and candidate not in keep
                 ):
                     candidate.unlink()
@@ -657,8 +679,6 @@ def _replace_shards(staged: Staged, stale: Sequence[str]) -> None:
         entry = staged.prior.documents[document_id]
         for kind, _rows in _shard_files(entry):
             _shard_path(output_dir, kind, entry["shard"]).unlink(missing_ok=True)
-    for name in staged.prior.legacy_files:
-        (output_dir / name).unlink(missing_ok=True)
     if not staged.prior.present:
         # No manifest to say what is ours: a crash may have left shards behind.
         keep = {
@@ -694,10 +714,16 @@ def commit_graph(staged: Staged) -> GraphExportResult:
     try:
         if staged.changed or stale or staged.prior.legacy_files or not staged.prior.present:
             # A manifest left by an earlier export would vouch for files about
-            # to be replaced, so it goes first.
-            manifest_path.unlink(missing_ok=True)
+            # to be replaced, so it goes first. A v1/v2 manifest vouches only
+            # for the two whole files, which nothing here replaces, so it stays
+            # until the v3 manifest takes its place.
+            if not staged.prior.legacy_files:
+                manifest_path.unlink(missing_ok=True)
             _replace_shards(staged, stale)
             _write_file(manifest_path, payload)
+            # Only now is the earlier export superseded.
+            for name in staged.prior.legacy_files:
+                (staged.output_dir / name).unlink(missing_ok=True)
         elif manifest_path.read_bytes() != payload:
             # Only the header moved (a model renamed, a skip count): no shard did.
             _write_file(manifest_path, payload)

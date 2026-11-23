@@ -15,7 +15,7 @@ the SDK and could not tell the upgrade it was guarding had changed anything.
 
 What is pinned is what an operator documents (docs/mcp.md) or a client reads:
 the four tool names, each tool's argument and result contract, the shape of the
-`mcp_context/v1` responses, the refusals at the HTTP boundary, the OAuth
+`mcp_context/v2` responses, the refusals at the HTTP boundary, the OAuth
 discovery document, and the client identity a query-log row records. What is
 not pinned is the SDK's own wording: `serverInfo.version` is the SDK's version
 and a validation message is pydantic's, so neither is asserted.
@@ -81,7 +81,7 @@ TOOL_NAMES = {
 REQUIRED = "<required>"
 TOOL_CONTRACT: dict[str, dict[str, Any]] = {
     "list_context_models": {
-        "arguments": {"limit": 20, "cursor": None, "schema_version": "mcp_context/v1"},
+        "arguments": {"limit": 20, "cursor": None, "schema_version": "mcp_context/v2"},
         "required": [],
         "result": ["schema_version", "models", "next_cursor", "error"],
     },
@@ -94,12 +94,14 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
             "candidate_limit": None,
             "filters": None,
             "entity_scope": None,
-            "schema_version": "mcp_context/v1",
+            "detail": "lean",
+            "schema_version": "mcp_context/v2",
         },
         "required": ["model", "query"],
         "result": [
             "schema_version",
             "results",
+            "detail",
             "degraded",
             "entity_scope_applied",
             "safe_error_code",
@@ -113,7 +115,7 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
             "document_version_id": REQUIRED,
             "limit": 20,
             "cursor": None,
-            "schema_version": "mcp_context/v1",
+            "schema_version": "mcp_context/v2",
         },
         "required": ["model", "document_id", "document_version_id"],
         "result": [
@@ -134,7 +136,7 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
             "model": REQUIRED,
             "reference_type": REQUIRED,
             "reference_id": REQUIRED,
-            "schema_version": "mcp_context/v1",
+            "schema_version": "mcp_context/v2",
         },
         "required": ["model", "reference_type", "reference_id"],
         "result": ["schema_version", "record", "error"],
@@ -692,7 +694,7 @@ def test_search_filters_arrive_as_a_closed_operator_set(client: WireClient) -> N
     assert search["inputSchema"]["properties"]["mode"]["enum"] == ["vector", "text", "hybrid"]
 
 
-# ─── mcp_context/v1 responses ──────────────────────────────────────────────
+# ─── mcp_context/v2 responses ──────────────────────────────────────────────
 
 
 def _structured(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -742,11 +744,15 @@ def test_search_context_response(client: WireClient) -> None:
     assert hit["context_id"] == CONTEXT_ALLOWED_1
     assert hit["chunk_id"] == CHUNK_ALLOWED_1
     assert hit["snippet"].startswith("Consumer prices slowed")
-    assert hit["freshness"]["status"] == "fresh"
     assert hit["citation"]["chunk_index"] == 0
-    assert hit["lineage"]["search_index_unique_id"] == "search_index.context_demo.context_search"
     assert hit["entities"][0]["name"] == "series"
     assert hit["served_model"] == "context_search"
+    # Lean is the default (issue #812): the provenance blocks are null, and
+    # the response says why.
+    assert body["detail"] == "lean"
+    assert hit["interval"] is None
+    assert hit["freshness"] is None
+    assert hit["lineage"] is None
     assert set(hit) == {
         "rank", "score", "document_id", "document_version_id", "context_id", "chunk_id",
         "snippet", "snippet_truncated", "source_version", "entities", "interval",
@@ -754,6 +760,23 @@ def test_search_context_response(client: WireClient) -> None:
         "served_model", "served_generation",
     }  # fmt: skip
     assert CHUNK_HIDDEN not in json.dumps(body)
+
+
+def test_search_context_full_detail_inlines_provenance(client: WireClient) -> None:
+    """`detail: full` restores the blocks lean leaves null (issue #812)."""
+    body = _structured(
+        _call(
+            client,
+            "search_context",
+            {"model": "context_search", "query": "inflation", "detail": "full"},
+        )
+    )
+
+    assert body["detail"] == "full"
+    (hit,) = body["results"]
+    assert hit["freshness"]["status"] == "fresh"
+    assert hit["interval"]["recorded_from"]
+    assert hit["lineage"]["search_index_unique_id"] == "search_index.context_demo.context_search"
 
 
 def test_get_document_response(client: WireClient) -> None:
@@ -826,7 +849,7 @@ def test_a_malformed_call_is_a_tool_error(client: WireClient) -> None:
     other_version = _call(
         client,
         "search_context",
-        {"model": "context_search", "query": "x", "schema_version": "mcp_context/v2"},
+        {"model": "context_search", "query": "x", "schema_version": "mcp_context/v1"},
     )
     unknown_tool = _call(client, "delete_everything", {})
 
@@ -1135,7 +1158,7 @@ def test_the_log_row_for_a_token_call_names_the_verified_subject(
 # context the caller-identity and principal code read is built a different way.
 # The client below is the SDK's own, pinned to the newest protocol, talking to
 # the same spawned `stel mcp serve` as every other test here. What must not
-# change with the protocol is the tool's `mcp_context/v1` answer, the identity
+# change with the protocol is the tool's `mcp_context/v2` answer, the identity
 # the transport supplies, and the client the query log names.
 
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- MCP `search_context` results are lean by default: `interval`, `freshness`
+  and `lineage` are `null` unless the request passes `detail: "full"`, because
+  the lineage block repeated the same upstream resources on every chunk. The
+  response gains a `detail` field, and the contract is `mcp_context/v2`
+  (`schema_version` in requests and responses); transcript capture still
+  recognizes v1 records. `get_context_lineage` is unchanged and is the way to
+  trace one chunk (issue #812, ALE-108).
 - `stel mcp serve` runs on the MCP Python SDK v2 (`MCPServer`); the `mcp`
   extra now requires `mcp>=2.3,<3` and `mcp<2` is no longer supported (issue
   #808, ALE-752). The four tools and their `mcp_context/v1` responses are

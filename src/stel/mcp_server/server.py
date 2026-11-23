@@ -93,7 +93,7 @@ def create_mcp_server(
         ctx: Context,
         limit: int = 20,
         cursor: str | None = None,
-        schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
+        schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> ListContextModelsResponse:
         """List only the governed context models available to the caller."""
         with serving_request(ctx.request_context):
@@ -116,7 +116,8 @@ def create_mcp_server(
         candidate_limit: int | None = None,
         filters: list[BusinessFilter] | None = None,
         entity_scope: EntityScope | None = None,
-        schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
+        detail: Literal["lean", "full"] = "lean",
+        schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> SearchContextResponse:
         """Search an available context model with caller-derived authorization.
 
@@ -137,6 +138,12 @@ def create_mcp_server(
         `entity_scope_applied`, with each result's `matched_terms` naming the
         term it actually matched — so a hit reached through the hierarchy is
         never indistinguishable from an exact one.
+
+        `detail` is `lean` (the default) or `full`. Lean results carry the
+        passage, its ids, `citation`, `entities` and `attributes`; `full` adds
+        each result's `interval`, `freshness` and `lineage`. For one chunk's
+        lineage without paying for it on every result, call
+        `get_context_lineage`.
         """
         with serving_request(ctx.request_context):
             return service.search_context(
@@ -149,6 +156,7 @@ def create_mcp_server(
                     candidate_limit=candidate_limit,
                     filters=tuple(filters or ()),
                     entity_scope=entity_scope,
+                    detail=detail,
                 ),
                 caller=_caller_info(ctx, transport),
             )
@@ -161,7 +169,7 @@ def create_mcp_server(
         document_version_id: str,
         limit: int = 20,
         cursor: str | None = None,
-        schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
+        schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> GetDocumentResponse:
         """Fetch one authorized document version as bounded, paginated chunks."""
         with serving_request(ctx.request_context):
@@ -183,7 +191,7 @@ def create_mcp_server(
         model: str,
         reference_type: LineageReferenceType,
         reference_id: str,
-        schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
+        schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> GetContextLineageResponse:
         """Trace one authorized document, context, chunk, or search result."""
         with serving_request(ctx.request_context):

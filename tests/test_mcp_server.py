@@ -1178,7 +1178,7 @@ def test_broader_expansion_reaches_the_parent_term() -> None:
 def test_an_unscoped_search_reports_no_scope_at_all() -> None:
     """The scope report is absent unless asked for (#628).
 
-    Both fields are additive to `mcp_context/v1` under ADR-0008's precedent,
+    Both fields are additive to `mcp_context/v2` under ADR-0008's precedent,
     which only holds if an unscoped caller sees exactly the response it saw
     before.
     """
@@ -1493,9 +1493,8 @@ def test_search_uses_server_policy_and_rechecks_returned_rows() -> None:
     assert result.snippet_truncated is True
     assert result.entities[0].name == "series"
     assert result.citation.page_number == 1
-    assert result.lineage.search_index_unique_id == (
-        "search_index.context_demo.context_search"
-    )
+    assert (result.interval, result.freshness, result.lineage) == (None, None, None)
+    assert response.detail == "lean"
     assert fake_search.policy_filters[0].field == "tenant_id"
     assert fake_search.policy_filters[0].value == "research"
     assert fake_search.request is not None
@@ -1608,6 +1607,33 @@ def test_document_cursor_past_the_last_chunk_returns_an_empty_page() -> None:
     assert empty.chunks == ()
     assert empty.next_cursor is None
     assert empty.lineage is not None
+
+
+def test_full_detail_carries_provenance_and_lean_does_not() -> None:
+    """Issue #812: the three blocks are present exactly when asked for."""
+    service, _ = _service()
+    try:
+        lean = service.search_context(
+            SearchContextRequest(model="context_search", query="inflation", mode="text")
+        )
+        full = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation", mode="text", detail="full"
+            )
+        )
+    finally:
+        service.close()
+
+    assert (lean.detail, full.detail) == ("lean", "full")
+    (lean_hit,) = lean.results
+    (full_hit,) = full.results
+    assert lean_hit.lineage is None and lean_hit.interval is None
+    assert full_hit.lineage is not None and full_hit.interval is not None
+    assert full_hit.lineage.search_index_unique_id == "search_index.context_demo.context_search"
+    assert full_hit.freshness is not None
+    # Everything else is identical, so lean drops the blocks and nothing more.
+    dropped = {"interval", "freshness", "lineage"}
+    assert lean_hit.model_dump(exclude=dropped) == full_hit.model_dump(exclude=dropped)
 
 
 def test_lineage_is_authorized_and_uses_safe_artifact_identities() -> None:
@@ -2118,7 +2144,7 @@ def test_a_hit_carries_the_attributes_the_model_declares_returned() -> None:
 
 
 def test_declared_attribute_values_are_json_safe() -> None:
-    """`mcp_context/v1` admits no `date`, so a filing date has to arrive as a
+    """`mcp_context/v2` admits no `date`, so a filing date has to arrive as a
     string. The CLI and the MCP share one coercion precisely so the two
     surfaces cannot disagree about a value the model declares."""
     from datetime import date
@@ -2150,7 +2176,7 @@ def test_declared_attribute_values_are_json_safe() -> None:
 
 
 def test_a_model_declaring_no_returned_attributes_is_unchanged() -> None:
-    """Additive within `mcp_context/v1`: a model that declares none produces
+    """Additive within `mcp_context/v2`: a model that declares none produces
     the response it produced before the field existed."""
     service, _ = _service()
     try:
@@ -3160,8 +3186,9 @@ def test_group_catalog_lists_one_resource_and_keeps_members_addressable() -> Non
     fixture = _fixture_rows()
     served = service._search_result(
         groups[0], hit, fixture["document_chunks"][0], fixture["document_registry"][0], {},
-        matched_terms=(),
+        matched_terms=(), detail="full",
     )
+    assert served.lineage is not None
     assert served.lineage.resources == ("search_index.context_demo.new",)
     assert served.lineage.search_index_unique_id == "search_index.context_demo.new"
     assert served.served_generation == "g-test"

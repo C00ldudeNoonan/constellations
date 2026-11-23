@@ -83,6 +83,7 @@ from .contracts import (
     SearchContextRequest,
     SearchContextResponse,
     SearchContextResult,
+    SearchDetail,
     ToolError,
 )
 from .grants import (
@@ -1281,6 +1282,7 @@ class ContextService:
                 registry,
                 links,
                 matched_terms=matches.get(str(row["context_id"]), ()),
+                detail=request.detail,
             )
             for hit, row, registry in readable[: request.limit]
         )
@@ -1301,6 +1303,7 @@ class ContextService:
             )
         return SearchContextResponse(
             results=results,
+            detail=request.detail,
             degraded=outcome.degraded,
             entity_scope_applied=(
                 scope.applied(excluded) if scope is not None else None
@@ -1905,6 +1908,7 @@ class ContextService:
         links: Mapping[str, tuple[ContextEntity, ...]],
         *,
         matched_terms: tuple[MatchedTerm, ...],
+        detail: SearchDetail,
     ) -> SearchContextResult:
         snippet, truncated = _truncate_text(
             _required_string(row, "text"),
@@ -1925,6 +1929,7 @@ class ContextService:
                     "A search group member is missing from the catalog",
                 )
             lineage_resource = member_resource
+        full = detail == "full"
         return SearchContextResult(
             rank=hit.rank,
             score=hit.score,
@@ -1936,11 +1941,15 @@ class ContextService:
             snippet_truncated=truncated,
             source_version=_required_string(registry, "source_version"),
             entities=links.get(context_id, ()),
-            interval=_interval(row),
-            freshness=_freshness(row),
             citation=_citation(row),
-            lineage=_lineage(lineage_resource, row).model_copy(
-                update={"search_index_unique_id": hit.provenance.unique_id}
+            interval=_interval(row) if full else None,
+            freshness=_freshness(row) if full else None,
+            lineage=(
+                _lineage(lineage_resource, row).model_copy(
+                    update={"search_index_unique_id": hit.provenance.unique_id}
+                )
+                if full
+                else None
             ),
             # From the hit, not the warehouse row: `search()` already resolved
             # exactly the declared `returned: true` set, so this needs no

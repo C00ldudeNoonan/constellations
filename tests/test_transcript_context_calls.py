@@ -29,7 +29,7 @@ _TOOL = "mcp__stel-context__search_context"
 def _context_response(*context_ids: str) -> str:
     return json.dumps(
         {
-            "schema_version": "mcp_context/v1",
+            "schema_version": "mcp_context/v2",
             "results": [
                 {
                     "rank": rank,
@@ -209,7 +209,7 @@ def test_failed_call_is_not_a_zero_result(tmp_path: Path) -> None:
     for code in ("not_found_or_denied", "timeout", "busy"):
         error_response = json.dumps(
             {
-                "schema_version": "mcp_context/v1",
+                "schema_version": "mcp_context/v2",
                 "results": [],
                 "error": {"code": code, "message": "m", "retryable": True},
             }
@@ -222,7 +222,7 @@ def test_failed_call_is_not_a_zero_result(tmp_path: Path) -> None:
 
 def test_malformed_error_still_marks_the_call_failed(tmp_path: Path) -> None:
     malformed = json.dumps(
-        {"schema_version": "mcp_context/v1", "results": [], "error": "boom"}
+        {"schema_version": "mcp_context/v2", "results": [], "error": "boom"}
     )
     call, _ = _only_call(tmp_path, _session(result=malformed))
     assert call.error_code == "unknown"
@@ -352,3 +352,11 @@ def test_v1_documents_without_context_calls_still_validate() -> None:
     }
     document = TranscriptDocument.model_validate(payload)
     assert document.exchanges[0].context_calls == ()
+
+
+def test_a_v1_transcript_is_still_recognized(tmp_path: Path) -> None:
+    """Issue #812 moved the live contract to v2; a session recorded before it
+    carries v1 markers and must still yield its retrieval judgments."""
+    v1 = _context_response(_CTX_A).replace("mcp_context/v2", "mcp_context/v1")
+    call, _ = _only_call(tmp_path, _session(result=v1))
+    assert call.returned_context_ids == (_CTX_A,)

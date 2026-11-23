@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `stel orphans` (`stel ls --orphans`), `stel plan --pending` and the
+  `run --watch` re-run lines no longer fuse columns when a name reaches the
+  fixed width (32 characters for the first two). They size the name column from
+  the names printed, like the run ledger, and never truncate. Ordinary names
+  print exactly as before (issue #822, ALE-802, theme ALE-54).
 - Loading and validating a project no longer imports polars, pyarrow, numpy or
   the inactive warehouse adapter. `stel ls` and `stel compile` resolve the
   warehouse adapter and the retrieval store by type on first use, so a DuckDB

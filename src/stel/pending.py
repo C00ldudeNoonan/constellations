@@ -50,6 +50,7 @@ from .execution.warehouse import warehouse_options
 from .plan import PlanError
 from .profile import resolve_profile, validate_inference_dependencies
 from .read_filters import parse_read_filters
+from .table_layout import PENDING_NAME_MINIMUM, column_width
 from .transforms.runner import load_incremental_contract
 from .vocabulary_sources import resolve_warehouse_vocabularies
 
@@ -465,7 +466,10 @@ def write_pending_artifact(project_dir: Path, report: PendingReport) -> Path:
 
 
 def format_pending_table(report: PendingReport) -> list[str]:
-    lines = [f"{'model':<32} {'status':<17} {'new':>10} {'deleted':>9}  span"]
+    # The old layout was a 32-wide name and a literal space; 33 keeps ordinary
+    # names byte-for-byte and still leaves a space after a longer one.
+    width = column_width([model.name for model in report.models], minimum=PENDING_NAME_MINIMUM)
+    lines = [f"{'model':<{width}}{'status':<17} {'new':>10} {'deleted':>9}  span"]
     for model in report.models:
         span = (
             f"{model.partition_min} .. {model.partition_max}"
@@ -475,7 +479,7 @@ def format_pending_table(report: PendingReport) -> list[str]:
         new = "-" if model.new_rows is None else str(model.new_rows)
         deleted = "-" if model.deleted_rows is None else str(model.deleted_rows)
         lines.append(
-            f"{model.name:<32} {model.status:<17} {new:>10} {deleted:>9}  {span}"
+            f"{model.name:<{width}}{model.status:<17} {new:>10} {deleted:>9}  {span}"
         )
     lines.append("")
     if any(model.changed_rows is None for model in report.models):

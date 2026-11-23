@@ -15,6 +15,13 @@ from collections.abc import Iterable
 # up front rather than from rows already printed.
 LEDGER_NAME_MINIMUM = 24
 
+# `stel orphans`, `stel pending` and the `watch` re-run lines (issue #822). Each
+# is its historical name width including any space that used to follow it, so
+# the separating space now comes from `column_width` rather than a literal.
+ORPHAN_NAME_MINIMUM = 32
+PENDING_NAME_MINIMUM = 33
+RERUN_NAME_MINIMUM = 23
+
 
 def column_width(values: Iterable[str], *, minimum: int) -> int:
     """Width of a left-aligned column: the longest value plus one separating

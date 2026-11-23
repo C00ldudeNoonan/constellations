@@ -17,10 +17,12 @@ from ..adapters import create_adapter
 from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import ConfigError
 from ..cost_guard import CostConfirmation
+from ..execution import ModelRunResult
 from ..manifest import write_run_results
 from ..paths import resolve_within_project
 from ..profile import apply_source_path_overrides, resolve_profile
 from ..runner import RunError, run_project
+from ..table_layout import RERUN_NAME_MINIMUM, column_width
 from .context import CONFIG_ERRORS, ConfigClickError, load_project_or_click
 
 # One directory walk per interval: a created, modified or deleted file is
@@ -80,6 +82,17 @@ def watch_changes(
             current = settled
         previous = current
         yield
+
+
+def format_rerun_lines(results: Sequence[ModelRunResult]) -> list[str]:
+    """One line per model after a watch re-run (issue #822)."""
+    width = column_width([r.model_name for r in results], minimum=RERUN_NAME_MINIMUM)
+    return [
+        f"  {r.model_name:<{width}}{r.kind:<12} "
+        f"processed={r.documents_processed:<5} skipped={r.documents_skipped:<5} "
+        f"rows={r.rows_written}"
+        for r in results
+    ]
 
 
 def run_watch(
@@ -165,12 +178,8 @@ def run_watch(
         write_run_results(
             project_dir, results, target=target, profiles_dir=profiles_dir
         )
-        for r in results:
-            click.echo(
-                f"  {r.model_name:<22} {r.kind:<12} "
-                f"processed={r.documents_processed:<5} skipped={r.documents_skipped:<5} "
-                f"rows={r.rows_written}"
-            )
+        for line in format_rerun_lines(results):
+            click.echo(line)
 
     _do_run()
     try:

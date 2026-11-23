@@ -107,6 +107,20 @@ it — which is precisely the person this redirect is for.
    The tests create and drop their own scratch datasets. If you cannot run them,
    note in the release PR that the BigQuery live path was not exercised.
 
+   **The Graphiti load has a live Neo4j test too** (`tests/test_graph_graphiti.py`,
+   `test_live_neo4j_load`, issue #815). Point it at a scratch Neo4j database; the
+   test loads an export and writes Graphiti nodes and edges that nothing removes:
+
+   ```powershell
+   $env:STEL_NEO4J_TEST_URI = "bolt://localhost:7687"
+   $env:STEL_NEO4J_TEST_USER = "neo4j"
+   $env:STEL_NEO4J_TEST_PASSWORD = "..."
+   uv run pytest -q -rs tests/test_graph_graphiti.py
+   ```
+
+   Without the three variables it skips; the credential-free load into an
+   embedded Kuzu file always runs.
+
    **A new BigQuery operation needs a live test in that file before it ships.**
    The gate is only worth running if it touches the code the release changed.
    `append_rows` and `read_relation` shipped in v0.10.0 with no entry there, so

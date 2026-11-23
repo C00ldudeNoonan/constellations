@@ -47,6 +47,7 @@ from .docs import DocsError, generate_docs, serve_docs
 from .execution.deletion_guard import is_valid_approval
 from .freshness import check_freshness
 from .graph_export import GRAPH_FORMATS, GraphExportError, export_graph
+from .graph_load import GraphLoadError, load_into_neo4j
 from .interrupts import interrupt_on_termination
 from .logging_setup import (
     configure_diagnostics_file,
@@ -3003,8 +3004,10 @@ def _serve_concept_cloud(
     show_default=True,
     help=(
         "Shard format. `jsonld` and `turtle` write the same graph as RDF and "
-        "need the `rdf` extra (pip install 'stel[rdf]'). An export directory "
-        "keeps one format."
+        "need the `rdf` extra (pip install 'stel[rdf]'); `graphiti` writes "
+        "Graphiti's records for `stel graph-load` and needs the `graphiti` "
+        "extra (pip install 'stel[graphiti]'). An export directory keeps "
+        "one format."
     ),
 )
 @click.option(
@@ -3044,7 +3047,8 @@ def graph_export(
     Writes nodes keyed by the agent-context ``entity_id`` and one edge per
     extracted fact, each naming its document and extractor version, as one
     shard per document, plus a manifest. The shards are JSON Lines, or with
-    --format jsonld / turtle the same graph as RDF (needs ``stel[rdf]``). A
+    --format jsonld / turtle the same graph as RDF (needs ``stel[rdf]``), or
+    with --format graphiti Graphiti's records (needs ``stel[graphiti]``). A
     re-export rewrites only the documents that changed and removes those that
     left the source. Reads only the two models' output tables.
     """
@@ -3069,6 +3073,46 @@ def graph_export(
         f"{f', {skipped} relations skipped' if skipped else ''}) to {result.output_dir}: "
         f"{result.shards_written} shards written, {result.shards_unchanged} unchanged, "
         f"{result.shards_removed} removed"
+    )
+
+
+@cli.command("graph-load")
+@click.argument("export_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--neo4j-uri",
+    required=True,
+    help="Bolt URI of the Neo4j database behind the Graphiti store (e.g. bolt://localhost:7687).",
+)
+@click.option("--neo4j-database", default=None, help="Database name (default: neo4j).")
+@_verbose_option
+def graph_load(
+    export_dir: Path,
+    neo4j_uri: str,
+    neo4j_database: str | None,
+    verbose: int,
+    diagnostics_file: Path | None,
+) -> None:
+    """Load a `graph-export --format graphiti` directory into a Graphiti store.
+
+    Saves each document's episode, entities and facts with graphiti-core, so the
+    export loads with no hand transformation (needs ``stel[graphiti]``). The
+    Neo4j credentials are read from the NEO4J_USER and NEO4J_PASSWORD
+    environment variables, never from a flag. Loading twice leaves one copy.
+    """
+    _configure_output(verbose, diagnostics_file=diagnostics_file)
+    user = os.environ.get("NEO4J_USER")
+    password = os.environ.get("NEO4J_PASSWORD")
+    if not user or not password:
+        raise click.UsageError("set NEO4J_USER and NEO4J_PASSWORD to load into Neo4j")
+    try:
+        result = load_into_neo4j(
+            export_dir, uri=neo4j_uri, user=user, password=password, database=neo4j_database
+        )
+    except GraphLoadError as e:
+        raise ConfigClickError(str(e)) from e
+    click.echo(
+        f"Loaded graph ({result.documents} documents: {result.entities} entity saves, "
+        f"{result.episodes} episodes, {result.mentions} mentions, {result.edges} facts)"
     )
 
 

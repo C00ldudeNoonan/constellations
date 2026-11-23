@@ -442,7 +442,8 @@ stel providers list [--output {table,json}]              # built-in + entry-poin
 stel source freshness                                    # mtime vs warn_after/error_after
 stel docs generate [--output DIR]                        # static HTML site from manifest.json
 stel docs serve [--port N]                               # local http.server over target/docs/
-stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR] [--format jsonl|jsonld|turtle]  # per-document nodes/ + edges/ shards a graph store can load; incremental
+stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR] [--format jsonl|jsonld|turtle|graphiti]  # per-document nodes/ + edges/ shards a graph store can load; incremental
+stel graph-load EXPORT_DIR --neo4j-uri URI [--neo4j-database NAME]  # load a `--format graphiti` export into a Graphiti (Neo4j) store; NEO4J_USER / NEO4J_PASSWORD from the environment
 stel emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
 stel codegen --output DIR                                # generate dbt Python-model shims + schema.yml (embedded path)
 stel clean                                               # remove known target artifacts; preserve warehouses
@@ -6384,6 +6385,59 @@ document or relation, and `confidence`, `directed`, `sentenceIndex` and the
 validity instants typed `xsd:double`, `xsd:boolean`, `xsd:integer` and
 `xsd:dateTime`. A null column has no triple. The edge is a resource, not a bare
 predicate, so the fact keeps its provenance and interval.
+
+**Graphiti.** `--format graphiti` writes the records graphiti-core's own models
+take, and `stel graph-load` saves them, so an export loads into a Graphiti store
+with no hand transformation (issue #815, [ADR-0065](adr/0065-graph-export-graphiti-is-a-record-format-with-a-loader-behind-the-graphiti-extra.md)).
+It needs the `graphiti` extra, `pip install 'stel[graphiti]'`; without it either
+command exits 2 naming that install, before the project, the warehouse or the
+export is read. The layout is unchanged except for the extension
+(`.graphiti.jsonl`); each line is one record with a `record` field:
+
+- `nodes/` holds, per document, an `entity_node` for each linked entity (`name`
+  is the `canonical_id`; `entity_id`, `entity_namespace`, `entity_name`,
+  `canonical_id`, `entity_class` and `class_ancestors` are attributes), one
+  `episodic_node` (the document is the episode; its content is the document id
+  and the facts, never document text) and a `mentions` edge from the episode to
+  each entity.
+- `edges/` holds an `entity_edge` per fact: `name` is the `relation_type`,
+  `fact` reads `<subject canonical id> <relation_type> <object canonical id>`,
+  `episodes` names the document's episode, and `relation_id`, `confidence`,
+  `method`, `extractor`, `extractor_version`, the resolvers and `superseded_by`
+  are attributes (a null has no attribute).
+
+Graphiti separates when a fact was true from when the graph learned it. The
+file carries what stel measured, and the loader stamps the rest, so shards stay
+byte-identical across exports:
+
+| Graphiti field | Filled with |
+|---|---|
+| `EntityEdge.valid_at` | the relation's `valid_from`, null when unknown |
+| `EntityEdge.invalid_at` | the relation's `valid_to`, null when open |
+| `EntityEdge.reference_time` | the relation's `observed_at`, null when unknown |
+| `EntityEdge.expired_at` | the load time for a fact `supersede_relations` closed, else null |
+| `EpisodicNode.valid_at` | the earliest `observed_at` among the document's edges; the load time if none has one |
+| `created_at`, any node or edge | the load time |
+
+Every uuid is a `uuid5` of the group id (the project name, restricted to letters,
+digits, `-` and `_`) and the same `urn:` the RDF formats use, so an entity linked
+in several documents is one node and loading twice leaves one copy. No
+embeddings are written: Graphiti's vector search needs a backfill with the
+store's own embedder; text search over names and facts works without it.
+
+```bash
+stel graph-export --format graphiti --linking-model entity_links   --relation-model entity_relations --entity-name system -o target/graphiti
+NEO4J_USER=neo4j NEO4J_PASSWORD=... stel graph-load target/graphiti   --neo4j-uri bolt://localhost:7687
+```
+
+`graph-load` reads the manifest's shard list (a stray file is not loaded),
+checks each document's fingerprint before saving it, refuses symlinks, and holds
+one shard at a time. The Neo4j credentials come from the environment, never a
+flag, and a connection failure is reported by exception type alone. Use a
+scratch database: the load writes Graphiti nodes and edges and nothing removes
+them. Only Neo4j is wired into the command; the library function
+`stel.graph_load.load_graphiti_export(export_dir, driver)` takes any
+graphiti-core driver, and the test suite loads into an embedded Kuzu file.
 
 **Node ids join to governed metrics.** `entity_id` is the agent-context
 `make_entity_id(entity_namespace, entity_name, canonical_id)`, the same id

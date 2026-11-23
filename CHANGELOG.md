@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `stel orphans` (`stel ls --orphans`), `stel plan --pending` and the
+  `run --watch` re-run lines no longer fuse columns when a name reaches the
+  fixed width (32 characters for the first two). They size the name column from
+  the names printed, like the run ledger, and never truncate. Ordinary names
+  print exactly as before (issue #822, ALE-802, theme ALE-54).
 - The run ledger and the summary tables no longer fuse columns when a model
   name reaches the fixed width. The live ledger, the `run` and `build`
   summaries, the test and eval tables, `stel ls` and source freshness size their

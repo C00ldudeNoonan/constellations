@@ -21,6 +21,7 @@ from .compiler import validate_project_contract
 from .config.loader import load_project
 from .config.model import ModelConfig
 from .profile import resolve_profile
+from .table_layout import ORPHAN_NAME_MINIMUM, column_width
 
 
 @dataclass(frozen=True)
@@ -114,17 +115,22 @@ def _collect(
 def format_orphans(report: OrphanReport) -> list[str]:
     if report.is_empty():
         return [f"No orphans in schema {report.schema}: every table and state scope is claimed."]
-    lines = [f"{'name':<32}{'kind':<13}{'rows':>10}  detail"]
+    width = column_width(
+        [table.name for table in report.tables]
+        + [orphan.name for orphan in report.state_scopes],
+        minimum=ORPHAN_NAME_MINIMUM,
+    )
+    lines = [f"{'name':<{width}}{'kind':<13}{'rows':>10}  detail"]
     lines.append("-" * len(lines[0]))
     for table in report.tables:
-        lines.append(f"{table.name:<32}{'table':<13}{table.rows:>10}")
+        lines.append(f"{table.name:<{width}}{'table':<13}{table.rows:>10}")
     for orphan in report.state_scopes:
         summary = orphan.summary
         detail = (
             f"stage={summary.scope.stage} code_versions={summary.code_versions}"
             f" last_run_at={summary.last_run_at or '-'}"
         )
-        lines.append(f"{orphan.name:<32}{'state_scope':<13}{summary.rows:>10}  {detail}")
+        lines.append(f"{orphan.name:<{width}}{'state_scope':<13}{summary.rows:>10}  {detail}")
     lines.append("")
     lines.append(
         f"{len(report.tables)} table(s) and {len(report.state_scopes)} state scope(s) in "

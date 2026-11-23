@@ -20,13 +20,12 @@ So these tests are deliberately shallow and deliberately end-to-end. They run
 the real CLI, the real flag validation, the real verifier construction, and the
 real `create_mcp_server`, and they assert one thing — the transport ran. Only
 the two edges are stubbed: the warehouse behind `ContextService.from_project`,
-and `FastMCP.run`, which would otherwise block forever serving.
+and `MCPServer.run`, which would otherwise block forever serving.
 
 A configuration that an operator can legally type belongs in `CONFIGURATIONS`.
 """
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +79,10 @@ CONFIGURATIONS: dict[str, list[str]] = {
 }
 
 
+# The keywords `MCPServer.run` was last called with, for the tests below.
+RUN_ARGUMENTS: list[dict[str, Any]] = []
+
+
 class _StubService:
     """Stands in for the warehouse-backed service, which is not what is under
     test here — the wiring above it is."""
@@ -95,11 +98,13 @@ class _StubService:
 def started(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
     """Boot a server without a warehouse or a blocking transport.
 
-    `FastMCP.run` is patched on the class rather than on an instance, so the
+    `MCPServer.run` is patched on the class rather than on an instance, so the
     server the CLI builds is the real one: every SDK-side validation that
     rejected stel's own arguments still runs.
     """
-    from mcp.server.fastmcp import FastMCP
+    import inspect
+
+    from mcp.server.mcpserver import MCPServer
 
     from stel.mcp_server import service as service_module
 
@@ -110,9 +115,23 @@ def started(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
         classmethod(lambda cls, *args, **kwargs: _StubService()),
     )
     transports: list[str] = []
-    monkeypatch.setattr(
-        FastMCP, "run", lambda self, transport: transports.append(transport)
-    )
+    runners = {
+        "stdio": MCPServer.run_stdio_async,
+        "sse": MCPServer.run_sse_async,
+        "streamable-http": MCPServer.run_streamable_http_async,
+    }
+
+    def fake_run(self: Any, transport: str, **kwargs: Any) -> None:
+        # SDK v2 forwards `run`'s keywords to the transport and rejects one it
+        # does not know only when the transport starts, which this fake would
+        # otherwise never reach. Bind them to the real signature so a keyword
+        # the SDK would refuse at startup fails here.
+        inspect.signature(runners[transport]).bind(self, **kwargs)
+        transports.append(transport)
+        RUN_ARGUMENTS.append(kwargs)
+
+    RUN_ARGUMENTS.clear()
+    monkeypatch.setattr(MCPServer, "run", fake_run)
     (tmp_path / "stel_project.yml").write_text(
         "name: p\nversion: '0.1.0'\n", encoding="utf-8"
     )
@@ -149,6 +168,43 @@ def test_a_valid_configuration_reaches_its_transport(
     assert started, f"{name} exited cleanly without ever running a transport"
 
 
+def test_the_listen_address_reaches_the_transport_as_run_arguments(
+    started: list[str], tmp_path: Path
+) -> None:
+    """SDK v2 takes `host` and `port` as arguments to `run`; assigning them on
+    the server's settings, as v1 allowed, now raises. A server that ignored
+    them would bind the SDK default (127.0.0.1:8000) instead of the address
+    the operator asked for, with nothing to say so."""
+    args = [*CONFIGURATIONS["http-trusted-proxy"], "--host", "0.0.0.0", "--port", "9123"]
+
+    result = _serve(args, tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert RUN_ARGUMENTS == [{"host": "0.0.0.0", "port": 9123, "json_response": True}]
+
+
+def test_a_stdio_server_is_given_no_network_arguments(
+    started: list[str], tmp_path: Path
+) -> None:
+    result = _serve(CONFIGURATIONS["stdio"], tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert RUN_ARGUMENTS == [{}]
+
+
+def test_the_sse_transport_is_not_given_a_json_response_argument(
+    started: list[str], tmp_path: Path
+) -> None:
+    """`json_response` is a streamable-HTTP option; SSE is event-stream by
+    definition and the SDK would refuse the keyword."""
+    args = [*CONFIGURATIONS["sse-trusted-proxy"], "--host", "0.0.0.0", "--port", "9124"]
+
+    result = _serve(args, tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert RUN_ARGUMENTS == [{"host": "0.0.0.0", "port": 9124}]
+
+
 def test_every_transport_choice_is_represented() -> None:
     """A transport with no configuration here is a transport nothing boots.
 
@@ -177,67 +233,3 @@ def test_both_verifiers_are_represented() -> None:
     assert "--jwt-issuer" in flags
     assert "--introspection-endpoint" in flags
     assert "--trust-proxy-principal-headers" in flags
-
-
-# ─── a healthy stdio server writes nothing to stderr (issue #526) ───────────
-
-
-def test_the_upstream_lifespan_warning_is_swallowed() -> None:
-    """pydantic-settings 2.15+ warns that the SDK's `Settings.lifespan` holds
-    an unresolved forward reference, because that module defines `FastMCP`
-    after `Settings`. Harmless here — stel passes no lifespan and reads none
-    from a settings source — but on stdio, stderr *is* the client's log, and
-    this is the only line a healthy server writes there, directly above the
-    connection lines where it reads like their cause.
-
-    Raised synthetically: the pinned pydantic-settings predates the warning,
-    so asserting on a real one would pass without testing anything.
-    """
-    from stel.mcp_server.server import _without_the_upstream_lifespan_warning
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with _without_the_upstream_lifespan_warning():
-            warnings.warn(
-                "Field 'lifespan' has an incomplete definition: its annotation "
-                "contains an unresolved forward reference, so settings sources "
-                "may fail to correctly resolve its value.",
-                UserWarning,
-                stacklevel=1,
-            )
-
-    assert caught == []
-
-
-def test_every_other_warning_still_reaches_the_operator() -> None:
-    """The suppression is one message wide on purpose. Silencing the SDK
-    generally would hide the next thing it has to say."""
-    from stel.mcp_server.server import _without_the_upstream_lifespan_warning
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with _without_the_upstream_lifespan_warning():
-            warnings.warn("the token verifier is deprecated", UserWarning, stacklevel=1)
-
-    assert [str(item.message) for item in caught] == [
-        "the token verifier is deprecated"
-    ]
-
-
-def test_the_suppression_does_not_outlive_the_construction() -> None:
-    """`catch_warnings` restores the filter list, so a matching warning raised
-    later in the process is still reported."""
-    from stel.mcp_server.server import _without_the_upstream_lifespan_warning
-
-    with _without_the_upstream_lifespan_warning():
-        pass
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        warnings.warn(
-            "Field 'lifespan' has an unresolved forward reference",
-            UserWarning,
-            stacklevel=1,
-        )
-
-    assert len(caught) == 1

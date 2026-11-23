@@ -11,8 +11,7 @@ from pathlib import Path
 import duckdb
 import pytest
 import yaml
-from mcp import ClientSession
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import Client
 
 from stel.agent_context import FreshnessStatus
 from stel.checks import run_project_tests
@@ -143,14 +142,14 @@ async def test_mcp_array_membership_filters_the_published_index(tmp_path: Path) 
     )
     wanted = "Labor market cooling continues into the second quarter"
     try:
-        async with create_connected_server_and_client_session(
+        async with Client(
             create_mcp_server(service),
             raise_exceptions=True,
         ) as session:
             catalog = await session.call_tool("list_context_models", {})
-            assert not catalog.isError
-            assert catalog.structuredContent is not None
-            fields = catalog.structuredContent["models"][0]["retrieval"]["filter_fields"]
+            assert not catalog.is_error
+            assert catalog.structured_content is not None
+            fields = catalog.structured_content["models"][0]["retrieval"]["filter_fields"]
             assert next(field for field in fields if field["field"] == "topics") == {
                 "field": "topics",
                 "data_type": "array[string]",
@@ -171,28 +170,28 @@ async def test_mcp_array_membership_filters_the_published_index(tmp_path: Path) 
                         "filters": [{"field": field, "operator": operator, "value": value}],
                     },
                 )
-                assert refused.structuredContent is not None
-                assert refused.structuredContent["results"] == []
-                assert refused.structuredContent["error"]["code"] == "capability_unavailable"
+                assert refused.structured_content is not None
+                assert refused.structured_content["results"] == []
+                assert refused.structured_content["error"]["code"] == "capability_unavailable"
     finally:
         service.close()
 
 
-async def _assert_array_membership_search(session: ClientSession, mode: str, wanted: str) -> None:
+async def _assert_array_membership_search(session: Client, mode: str, wanted: str) -> None:
     arguments = {"model": "context_search", "query": "growth", "mode": mode}
     baseline = await session.call_tool("search_context", arguments)
-    assert baseline.structuredContent is not None
-    assert baseline.structuredContent["error"] is None
-    assert len({hit["document_id"] for hit in baseline.structuredContent["results"]}) > 1
+    assert baseline.structured_content is not None
+    assert baseline.structured_content["error"] is None
+    assert len({hit["document_id"] for hit in baseline.structured_content["results"]}) > 1
     for values, expected in ((["absent", wanted], True), (["absent"], False)):
         response = await session.call_tool("search_context", {
             **arguments,
             "filters": [{"field": "topics", "operator": "array_contains_any", "value": values}],
         })
-        assert not response.isError
-        assert response.structuredContent is not None
-        assert response.structuredContent["error"] is None
-        hits = response.structuredContent["results"]
+        assert not response.is_error
+        assert response.structured_content is not None
+        assert response.structured_content["error"] is None
+        hits = response.structured_content["results"]
         assert bool(hits) is expected
         assert all(hit["attributes"]["topics"] == [wanted] for hit in hits)
 

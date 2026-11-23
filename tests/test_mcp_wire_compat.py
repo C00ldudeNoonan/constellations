@@ -960,13 +960,20 @@ def at_jwt(jwt_server: Served) -> Served:
 
 
 def test_the_protected_resource_metadata_is_served_without_a_token(at_jwt: Served) -> None:
-    """RFC 9728: a client handed only this server's URL finds who issues tokens."""
+    """RFC 9728: a client handed only this server's URL finds who issues tokens.
+
+    One deliberate difference from SDK v1 (ALE-752): v1 normalized a path-less
+    issuer to `https://issuer.example/`; v2 keeps the configured string, so the
+    advertised authorization server is exactly what the operator passed to
+    `--jwt-issuer`. RFC 8414 compares issuers as exact strings, which makes the
+    v2 form the one that matches a token's `iss`.
+    """
     response = httpx.get(f"{at_jwt.base_url}/.well-known/oauth-protected-resource/mcp")
 
     assert response.status_code == 200
     assert response.json() == {
         "resource": PUBLIC_URL,
-        "authorization_servers": [f"{ISSUER}/"],
+        "authorization_servers": [ISSUER],
         "bearer_methods_supported": ["header"],
     }
 
@@ -1118,3 +1125,93 @@ def test_the_log_row_for_a_token_call_names_the_verified_subject(
     assert row["principal_id"] == "bob"
     assert row["client_name"] == CLIENT_NAME
     assert row["transport"] == "streamable-http"
+
+
+# ─── the newer protocol (ALE-752) ───────────────────────────────────────────
+#
+# SDK v2 serves the 2026-07-28 protocol beside the handshake versions the rest
+# of this file pins. That version has no `initialize`: the client sends its
+# identity and capabilities in each request's envelope, so the per-request
+# context the caller-identity and principal code read is built a different way.
+# The client below is the SDK's own, pinned to the newest protocol, talking to
+# the same spawned `stel mcp serve` as every other test here. What must not
+# change with the protocol is the tool's `mcp_context/v1` answer, the identity
+# the transport supplies, and the client the query log names.
+
+
+def _call_on_the_newest_protocol(
+    served: Served, headers: Mapping[str, str], arguments: Mapping[str, Any]
+) -> tuple[str, str, Any]:
+    """(negotiated version, newest version, structured result) of one search."""
+    import anyio
+    import httpx2
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.types import Implementation
+    from mcp.types.version import MODERN_PROTOCOL_VERSIONS
+
+    newest = MODERN_PROTOCOL_VERSIONS[-1]
+
+    async def call() -> tuple[str, str, Any]:
+        async with httpx2.AsyncClient(headers=dict(headers), timeout=REPLY_SECONDS) as http:
+            transport = streamable_http_client(f"{served.base_url}/mcp", http_client=http)
+            async with Client(
+                transport,
+                mode=newest,
+                client_info=Implementation(name=CLIENT_NAME, version=CLIENT_VERSION),
+            ) as sdk_client:
+                result = await sdk_client.call_tool("search_context", dict(arguments))
+                assert result.is_error is False
+                return sdk_client.protocol_version, newest, result.structured_content
+
+    return anyio.run(call)
+
+
+def _first_logged_row(served: Served, *, since: int) -> dict[str, Any]:
+    """The first query-log row written after `since`, waiting for the batch."""
+    deadline = time.monotonic() + REPLY_SECONDS
+    while time.monotonic() < deadline:
+        if served.query_log.exists():
+            lines = served.query_log.read_text(encoding="utf-8").splitlines()
+            if len(lines) > since:
+                return dict(json.loads(lines[since]))
+        time.sleep(0.2)
+    pytest.fail("no query-log row was written")
+
+
+def test_a_call_negotiated_on_the_newer_protocol_returns_the_same_contract(
+    http_server: Served,
+) -> None:
+    since = http_server.mark()
+
+    negotiated, newest, structured = _call_on_the_newest_protocol(
+        http_server, RESEARCH, {"model": "context_search", "query": "inflation"}
+    )
+
+    assert negotiated == newest
+    assert structured["schema_version"] == MCP_CONTEXT_SCHEMA_VERSION
+    assert structured["error"] is None
+    assert structured["results"]
+    row = _first_logged_row(http_server, since=since)
+    assert row["client_name"] == CLIENT_NAME
+    assert row["client_version"] == CLIENT_VERSION
+    assert row["request_id"] is not None
+    assert row["principal_id"] == "local-user"
+
+
+def test_a_verified_token_is_the_identity_on_the_newer_protocol(
+    at_jwt: Served, rsa_key: Any
+) -> None:
+    """Token verification runs in the HTTP layer and hands the subject to the
+    tool through a contextvar; the newer protocol must not lose it on the way."""
+    since = at_jwt.mark()
+
+    _, _, structured = _call_on_the_newest_protocol(
+        at_jwt,
+        _bearer(_mint(rsa_key, sub="alice")),
+        {"model": "context_search", "query": "inflation"},
+    )
+
+    assert structured["error"] is None
+    assert [hit["chunk_id"] for hit in structured["results"]] == [CHUNK_ALLOWED_1]
+    assert _first_logged_row(at_jwt, since=since)["principal_id"] == "alice"

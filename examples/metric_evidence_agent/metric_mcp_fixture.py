@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel, ConfigDict
 
 
@@ -22,7 +22,7 @@ class OrderByParam(BaseModel):
 
 
 def create_metric_mcp_server() -> Any:
-    app = FastMCP(
+    app = MCPServer(
         "dbt-semantic-layer-fixture",
         instructions="Deterministic offline fixture for the dbt MCP query_metrics tool.",
     )

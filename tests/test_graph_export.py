@@ -27,83 +27,32 @@ from stel.graph_export import (
     LINK_COLUMNS,
     NODES_DIRNAME,
     RELATION_COLUMNS,
-    GraphContext,
     GraphExportError,
     build_document,
     merge_documents,
     require_columns,
     write_graph_export,
 )
+from tests.support_graph_export import (
+    context as _context,
+)
+from tests.support_graph_export import (
+    documents as _documents,
+)
+from tests.support_graph_export import (
+    export as _export,
+)
+from tests.support_graph_export import (
+    links_frame as _links,
+)
+from tests.support_graph_export import (
+    relations_frame as _relations,
+)
+from tests.support_graph_export import (
+    snapshot as _snapshot,
+)
 
 _RECORDED = datetime(2026, 1, 1)
-
-
-def _links(rows: list[dict[str, Any]]) -> pl.DataFrame:
-    base = {
-        "document_id": "d1",
-        "entity_namespace": "systems",
-        "status": "matched",
-        "resolver": "alias_table",
-        "resolver_version": "1",
-    }
-    return pl.DataFrame(
-        [{**base, "entity_link_id": f"l{index}", **row} for index, row in enumerate(rows)],
-        schema={
-            "entity_link_id": pl.String(),
-            "document_id": pl.String(),
-            "mention_id": pl.String(),
-            "canonical_id": pl.String(),
-            "entity_namespace": pl.String(),
-            "status": pl.String(),
-            "resolver": pl.String(),
-            "resolver_version": pl.String(),
-        },
-    )
-
-
-def _relations(rows: list[dict[str, Any]]) -> pl.DataFrame:
-    base = {
-        "document_id": "d1",
-        "relation_type": "co_occurs_with",
-        "directed": False,
-        "method": "co_occurrence",
-        "status": "asserted",
-        "confidence": None,
-        "sentence_index": 0,
-        "extractor": "co_occurrence",
-        "extractor_version": "1",
-    }
-    return pl.DataFrame(
-        [{**base, **row} for row in rows],
-        schema={
-            "relation_id": pl.String(),
-            "document_id": pl.String(),
-            "subject_mention_id": pl.String(),
-            "object_mention_id": pl.String(),
-            "relation_type": pl.String(),
-            "directed": pl.Boolean(),
-            "method": pl.String(),
-            "status": pl.String(),
-            "confidence": pl.Float64(),
-            "sentence_index": pl.Int64(),
-            "extractor": pl.String(),
-            "extractor_version": pl.String(),
-        },
-    )
-
-
-def _documents(links: pl.DataFrame, relations: pl.DataFrame) -> Iterator[Any]:
-    """The two tables as the warehouse hands them over: ordered by document."""
-    return merge_documents(
-        links.sort("document_id").iter_rows(named=True),
-        relations.sort("document_id").iter_rows(named=True),
-    )
-
-
-def _context(**kwargs: Any) -> GraphContext:
-    options: dict[str, Any] = {"entity_name": "system", "vocabularies": {}, "classes": ()}
-    options.update(kwargs)
-    return GraphContext.create(**options)
 
 
 def _build(links: pl.DataFrame, relations: pl.DataFrame, **kwargs: Any) -> Any:
@@ -379,32 +328,6 @@ def _corpus(
     return _links(link_rows), _relations(relation_rows)
 
 
-def _export(
-    out: Path,
-    links: pl.DataFrame,
-    relations: pl.DataFrame,
-    *,
-    relation_model: str = "r",
-    **kwargs: Any,
-) -> Any:
-    return write_graph_export(
-        _documents(links, relations),
-        out,
-        project="p",
-        linking_model="l",
-        relation_model=relation_model,
-        context=_context(**kwargs),
-    )
-
-
-def _snapshot(out: Path) -> dict[str, bytes]:
-    return {
-        path.relative_to(out).as_posix(): path.read_bytes()
-        for path in sorted(out.rglob("*"))
-        if path.is_file()
-    }
-
-
 def _shard(out: Path, document: str, kind: str) -> Path:
     shard = graph_export._shard_id(document)
     return out / kind / shard[:2] / f"{shard}.jsonl"
@@ -639,6 +562,7 @@ def test_a_failed_read_leaves_the_previous_export_untouched(tmp_path: Path) -> N
             linking_model="l",
             relation_model="r",
             context=_context(),
+            graph_format="jsonl",
         )
     assert _snapshot(out) == before
 

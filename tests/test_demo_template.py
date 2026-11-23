@@ -20,6 +20,7 @@ from typing import Any, cast
 import duckdb
 import polars as pl
 import pytest
+import rdflib
 from click.testing import CliRunner
 from mcp import Client
 
@@ -316,6 +317,54 @@ def test_graph_export_nodes_join_to_the_governed_context(
     assert again.exit_code == 0, again.output
     assert "0 shards written" in again.output
     assert before == {p: p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize(
+    ("graph_format", "extension", "parser"),
+    [("turtle", "ttl", "turtle"), ("jsonld", "jsonld", "json-ld")],
+)
+def test_graph_export_rdf_formats_are_the_same_graph_as_jsonl(
+    built: Path, tmp_path: Path, graph_format: str, extension: str, parser: str
+) -> None:
+    """ALE-602: through the CLI against the demo warehouse, the RDF shards parse
+    back with rdflib to the entities and relations the JSON Lines export has."""
+    exports = {}
+    for name in ("jsonl", graph_format):
+        out = tmp_path / name
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--project-dir", str(built),
+                "graph-export",
+                "--format", name,
+                "--linking-model", "entity_links",
+                "--relation-model", "entity_relations",
+                "--entity-name", "system",
+                "-o", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        exports[name] = out
+
+    def rdf_subjects(kind: str, rdf_type: str) -> set[str]:
+        graph = rdflib.Graph()
+        for shard in sorted((exports[graph_format] / kind).rglob(f"*.{extension}")):
+            graph.parse(data=shard.read_bytes(), format=parser)
+        return {str(s) for s in graph.subjects(rdflib.RDF.type, rdflib.URIRef(rdf_type))}
+
+    def jsonl_ids(kind: str, column: str) -> set[str]:
+        return {
+            json.loads(line)[column]
+            for shard in (exports["jsonl"] / kind).rglob("*.jsonl")
+            for line in shard.read_text(encoding="utf-8").splitlines()
+        }
+
+    entities = rdf_subjects("nodes", "urn:stel:graph:Entity")
+    assert entities == {"urn:stel:entity:" + i for i in jsonl_ids("nodes", "entity_id")}
+    assert len(entities) == 8
+    relations = rdf_subjects("edges", "urn:stel:graph:Relation")
+    assert relations == {"urn:stel:relation:" + i for i in jsonl_ids("edges", "relation_id")}
+    assert relations
 
 
 def test_the_longest_declared_name_claims_an_overlapping_span(

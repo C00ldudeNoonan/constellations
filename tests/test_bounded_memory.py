@@ -834,6 +834,7 @@ def _export_snapshot(project: Path, out: Path) -> dict[str, bytes]:
         relation_model="entity_relations",
         entity_name="system",
         output_dir=out,
+        graph_format="jsonl",
         target=None,
         profiles_dir=None,
     )

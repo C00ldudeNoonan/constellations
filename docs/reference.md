@@ -442,7 +442,7 @@ stel providers list [--output {table,json}]              # built-in + entry-poin
 stel source freshness                                    # mtime vs warn_after/error_after
 stel docs generate [--output DIR]                        # static HTML site from manifest.json
 stel docs serve [--port N]                               # local http.server over target/docs/
-stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR]  # per-document nodes/ + edges/ shards a graph store can load; incremental
+stel graph-export --linking-model M --relation-model M --entity-name NAME [-o DIR] [--format jsonl|jsonld|turtle]  # per-document nodes/ + edges/ shards a graph store can load; incremental
 stel emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
 stel codegen --output DIR                                # generate dbt Python-model shims + schema.yml (embedded path)
 stel clean                                               # remove known target artifacts; preserve warehouses
@@ -6301,6 +6301,32 @@ edges has no file of that kind):
   shard its `shard` name, node and edge row counts, and a `sha256`
   fingerprint of its two files' content. It is written last, so a directory
   that has one is complete.
+
+**JSON-LD and Turtle.** `--format jsonld` or `--format turtle` writes the same
+graph as RDF instead of JSON Lines (issue #811, [ADR-0063](adr/0063-graph-export-rdf-is-a-shard-format-behind-the-rdf-extra.md)).
+It needs the `rdf` extra, `pip install 'stel[rdf]'`; without it the command
+exits 2 naming that install, before the project or warehouse is read. The
+layout is unchanged except for the extension (`.jsonld`, `.ttl`), and
+`graph_manifest.json` records `format`. Every shard parses on its own, with its
+own prefixes or `@context`, and RDF is a set of triples, so load the directory
+by loading each file: an entity linked in several documents is the same triples
+in each and merges. An export directory keeps one format, and exporting another
+format into it is refused with the directory untouched.
+
+Until an imported ontology gives entities IRIs, identity is a `urn:` built from
+the values above, percent-encoded: an entity is `urn:stel:entity:<entity_id>`, a
+relation `urn:stel:relation:<relation_id>` and a document
+`urn:stel:document:<document_id>`. Properties are `urn:stel:graph:<name>`
+(`stel:` in Turtle), with the JSON Lines column names in camel case
+(`entityNamespace`, `canonicalId`, `relationType`, `validFrom`, ...). A node is a
+`stel:Entity`; its `class` and each `classAncestor` are string literals, not
+IRIs, and the ancestors are an unordered set (the nearest-first order is only in
+the JSON Lines array). An edge is a `stel:Relation` resource with `subject` and
+`object` linking the two entities, `document` and `supersededBy` linking a
+document or relation, and `confidence`, `directed`, `sentenceIndex` and the
+validity instants typed `xsd:double`, `xsd:boolean`, `xsd:integer` and
+`xsd:dateTime`. A null column has no triple. The edge is a resource, not a bare
+predicate, so the fact keeps its provenance and interval.
 
 **Node ids join to governed metrics.** `entity_id` is the agent-context
 `make_entity_id(entity_namespace, entity_name, canonical_id)`, the same id

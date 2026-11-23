@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `stel graph-export --format jsonld|turtle` writes the same graph as RDF, one
+  standalone file per shard (`.jsonld`, `.ttl`), behind the existing `rdf`
+  extra; `jsonl` stays the default. Entities are `urn:stel:entity:<entity_id>`,
+  relations and documents have URNs too, and an edge is a resource carrying its
+  document, extractor and validity interval. Without the extra the command
+  exits 2 naming `pip install 'stel[rdf]'` before reading anything. The
+  manifest records `format`, and a directory keeps one format (issue #811,
+  ALE-602, ADR-0063).
 - MCP `search_context` results are lean by default: `interval`, `freshness`
   and `lineage` are `null` unless the request passes `detail: "full"`, because
   the lineage block repeated the same upstream resources on every chunk. The

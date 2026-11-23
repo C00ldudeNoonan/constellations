@@ -46,7 +46,7 @@ from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .execution.deletion_guard import is_valid_approval
 from .freshness import check_freshness
-from .graph_export import GraphExportError, export_graph
+from .graph_export import GRAPH_FORMATS, GraphExportError, export_graph
 from .interrupts import interrupt_on_termination
 from .logging_setup import (
     configure_diagnostics_file,
@@ -2996,6 +2996,18 @@ def _serve_concept_cloud(
     ),
 )
 @click.option(
+    "--format",
+    "graph_format",
+    type=click.Choice(GRAPH_FORMATS),
+    default="jsonl",
+    show_default=True,
+    help=(
+        "Shard format. `jsonld` and `turtle` write the same graph as RDF and "
+        "need the `rdf` extra (pip install 'stel[rdf]'). An export directory "
+        "keeps one format."
+    ),
+)
+@click.option(
     "--linking-model",
     required=True,
     help="Entity-linking model (link_entities output) whose matched links become nodes.",
@@ -3020,6 +3032,7 @@ def _serve_concept_cloud(
 def graph_export(
     ctx: click.Context,
     output: Path,
+    graph_format: str,
     linking_model: str,
     relation_model: str,
     entity_name: str,
@@ -3028,11 +3041,12 @@ def graph_export(
 ) -> None:
     """Export linked entities and relations as a graph (#762).
 
-    Writes JSON Lines nodes keyed by the agent-context ``entity_id`` and one
-    edge per extracted fact, each naming its document and extractor version,
-    as one shard per document, plus a manifest. A re-export rewrites only the
-    documents that changed and removes those that left the source. Reads only
-    the two models' output tables.
+    Writes nodes keyed by the agent-context ``entity_id`` and one edge per
+    extracted fact, each naming its document and extractor version, as one
+    shard per document, plus a manifest. The shards are JSON Lines, or with
+    --format jsonld / turtle the same graph as RDF (needs ``stel[rdf]``). A
+    re-export rewrites only the documents that changed and removes those that
+    left the source. Reads only the two models' output tables.
     """
     _configure_output(verbose, diagnostics_file=diagnostics_file)
     try:
@@ -3042,6 +3056,7 @@ def graph_export(
             relation_model=relation_model,
             entity_name=entity_name,
             output_dir=output,
+            graph_format=graph_format,
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
         )

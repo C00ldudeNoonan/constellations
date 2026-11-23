@@ -41,6 +41,10 @@ An edge also carries the interval its fact holds over (`valid_from`, `valid_to`,
 `observed_at`, `superseded_by`), when the relation model has those columns
 (ADR-0056, schema v2).
 
+The shards are JSON Lines, or the same rows as JSON-LD or Turtle behind the `rdf`
+extra (`graph_rdf.py`, ADR-0063): a format changes how a shard's bytes are
+written and nothing about what is in it, and a directory keeps one.
+
 Only intended output tables are read. Mention text is never read: a node is a
 canonical id and an edge is a pair of them, so nothing the operator withheld
 upstream (`include_mention_text`) can reach the files.
@@ -63,6 +67,8 @@ from .agent_context import canonical_entity_key, make_entity_id
 from .config import load_project
 from .config.class_hierarchy import ClassDeclaration, class_ancestors, class_parents
 from .config.vocabulary import Vocabulary, VocabularyTerm, declared_terms
+from .graph_rdf import RDF_FORMATS, require_rdflib, serialize_rows
+from .optional_dependencies import OptionalDependencyError
 
 GRAPH_EXPORT_SCHEMA = "stel.graph_export/v3"
 GRAPH_MANIFEST_FILENAME = "graph_manifest.json"
@@ -72,8 +78,14 @@ EDGES_DIRNAME = "edges"
 LEGACY_SCHEMAS = ("stel.graph_export/v1", "stel.graph_export/v2")
 LEGACY_FILENAMES = ("nodes.jsonl", "edges.jsonl")
 
+# `jsonl` is the default and needs nothing; the other two are RDF and need the
+# `rdf` extra (ADR-0063). Each maps to the extension its shard files carry.
+GRAPH_FORMATS = ("jsonl", *RDF_FORMATS)
+_EXTENSIONS = {"jsonl": "jsonl", "jsonld": "jsonld", "turtle": "ttl"}
+
 _STAGE_DIRNAME = ".graph_export_stage"
-_SHARD_NAME = re.compile(r"[0-9a-f]{32}\.jsonl")
+_SHARD_STEM = re.compile(r"[0-9a-f]{32}")
+_SHARD_NAME = re.compile(r"[0-9a-f]{32}\.(?:jsonl|jsonld|ttl)")
 _PREFIX_NAME = re.compile(r"[0-9a-f]{2}")
 # Rows pulled per warehouse batch. Residency is this plus one document.
 _READ_BATCH_ROWS = 10_000
@@ -110,6 +122,23 @@ DocumentRows = tuple[str, Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any
 
 class GraphExportError(Exception):
     pass
+
+
+def check_format(graph_format: str) -> None:
+    """Refuse an unknown format, or an RDF one whose extra is not installed.
+
+    Called before a project, profile or warehouse is read, so a setup error is
+    never discovered at the first shard.
+    """
+    if graph_format not in GRAPH_FORMATS:
+        raise GraphExportError(
+            f"unknown graph format {graph_format!r}; choose one of {', '.join(GRAPH_FORMATS)}"
+        )
+    if graph_format in RDF_FORMATS:
+        try:
+            require_rdflib(f"The `{graph_format}` graph export format")
+        except OptionalDependencyError as error:
+            raise GraphExportError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -437,9 +466,16 @@ def _shard_id(document_id: str) -> str:
     return hashlib.sha256(document_id.encode("utf-8")).hexdigest()[:32]
 
 
-def _shard_path(root: Path, kind: str, shard: str) -> Path:
+def _shard_path(root: Path, kind: str, shard: str, graph_format: str) -> Path:
     # Two hex characters of fan-out keep a directory from holding every shard.
-    return root / kind / shard[:2] / f"{shard}.jsonl"
+    return root / kind / shard[:2] / f"{shard}.{_EXTENSIONS[graph_format]}"
+
+
+def _payload(rows: Sequence[Mapping[str, Any]], kind: str, graph_format: str) -> bytes:
+    """One shard file's bytes: JSON Lines, or the same rows as RDF."""
+    if graph_format == "jsonl":
+        return _jsonl(rows)
+    return serialize_rows(rows, kind=kind, graph_format=graph_format)
 
 
 def _fingerprint(nodes: bytes, edges: bytes) -> str:
@@ -468,7 +504,7 @@ def _manifest_error(path: Path, why: str) -> GraphExportError:
     )
 
 
-def _read_prior(output_dir: Path) -> _Prior:
+def _read_prior(output_dir: Path, graph_format: str) -> _Prior:
     path = output_dir / GRAPH_MANIFEST_FILENAME
     if not path.is_file():
         return _Prior(False, {}, ())
@@ -483,6 +519,16 @@ def _read_prior(output_dir: Path) -> _Prior:
         return _Prior(False, {}, LEGACY_FILENAMES)
     if schema != GRAPH_EXPORT_SCHEMA:
         raise _manifest_error(path, f"is schema {schema!r}, not {GRAPH_EXPORT_SCHEMA}")
+    # A manifest written before `format` existed was JSON Lines.
+    prior_format = data.get("format", "jsonl")
+    if prior_format != graph_format:
+        # Shards of two formats differ in extension, so neither export could
+        # vouch for or sweep the other's files. Switching is a new directory.
+        raise GraphExportError(
+            f"{path} holds a {prior_format!r} export and this one is {graph_format!r}; "
+            "an export directory keeps one format. Export to another directory, "
+            "or delete this one if its contents are disposable"
+        )
     documents = data.get("documents")
     if not isinstance(documents, dict):
         raise _manifest_error(path, "has no `documents` object")
@@ -493,7 +539,7 @@ def _read_prior(output_dir: Path) -> _Prior:
             and isinstance(entry.get("edges"), int)
             and isinstance(entry.get("sha256"), str)
             and isinstance(entry.get("shard"), str)
-            and _SHARD_NAME.fullmatch(f"{entry['shard']}.jsonl")
+            and _SHARD_STEM.fullmatch(entry["shard"])
         ):
             raise _manifest_error(path, "has a malformed `documents` entry")
     stray = tuple(name for name in LEGACY_FILENAMES if (output_dir / name).is_file())
@@ -517,6 +563,7 @@ class Staged:
     """An export read in full and validated, not yet visible in the directory."""
 
     output_dir: Path
+    graph_format: str
     prior: _Prior
     documents: dict[str, dict[str, Any]]
     changed: list[str]
@@ -545,6 +592,7 @@ def stage_graph(
     linking_model: str,
     relation_model: str,
     context: GraphContext,
+    graph_format: str,
 ) -> Staged:
     """Consume the document stream, building every shard and staging the changed
     ones in a scratch directory inside `output_dir`.
@@ -554,13 +602,15 @@ def stage_graph(
     one document plus the manifest's per-document entries, which is the
     distinct-key term of the bounded-memory contract.
     """
+    check_format(graph_format)
     output_dir.mkdir(parents=True, exist_ok=True)
     _refuse_symlinked_trees(output_dir)
     # A manifest scratch file a hard kill left behind is ours and is stale.
     (output_dir / (GRAPH_MANIFEST_FILENAME + ".tmp")).unlink(missing_ok=True)
     staged = Staged(
         output_dir=output_dir,
-        prior=_read_prior(output_dir),
+        graph_format=graph_format,
+        prior=_read_prior(output_dir, graph_format),
         documents={},
         changed=[],
         unchanged=0,
@@ -580,6 +630,7 @@ def stage_graph(
         raise
     staged.manifest = {
         "schema": GRAPH_EXPORT_SCHEMA,
+        "format": graph_format,
         "project": project,
         "entity_name": context.entity_name,
         "linking_model": linking_model,
@@ -596,7 +647,10 @@ def stage_graph(
 
 
 def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> None:
-    payloads = {NODES_DIRNAME: _jsonl(graph.nodes), EDGES_DIRNAME: _jsonl(graph.edges)}
+    payloads = {
+        NODES_DIRNAME: _payload(graph.nodes, NODES_DIRNAME, staged.graph_format),
+        EDGES_DIRNAME: _payload(graph.edges, EDGES_DIRNAME, staged.graph_format),
+    }
     shard = _shard_id(document_id)
     entry = {
         "shard": shard,
@@ -607,7 +661,7 @@ def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> N
     staged.documents[document_id] = entry
     # A shard the manifest vouches for but the directory lost is rewritten.
     on_disk = all(
-        _shard_path(staged.output_dir, kind, shard).is_file()
+        _shard_path(staged.output_dir, kind, shard, staged.graph_format).is_file()
         for kind, rows in _shard_files(entry)
         if rows
     )
@@ -617,7 +671,7 @@ def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> N
     staged.changed.append(document_id)
     for kind, rows in _shard_files(entry):
         if rows:
-            target = _shard_path(staged.stage_dir, kind, shard)
+            target = _shard_path(staged.stage_dir, kind, shard, staged.graph_format)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(payloads[kind])
 
@@ -679,23 +733,24 @@ def _manifest_bytes(manifest: Mapping[str, Any]) -> bytes:
 
 def _replace_shards(staged: Staged, stale: Sequence[str]) -> None:
     output_dir = staged.output_dir
+    fmt = staged.graph_format
     for document_id in staged.changed:
         entry = staged.documents[document_id]
         for kind, rows in _shard_files(entry):
-            final = _shard_path(output_dir, kind, entry["shard"])
+            final = _shard_path(output_dir, kind, entry["shard"], fmt)
             if rows:
                 final.parent.mkdir(parents=True, exist_ok=True)
-                _shard_path(staged.stage_dir, kind, entry["shard"]).replace(final)
+                _shard_path(staged.stage_dir, kind, entry["shard"], fmt).replace(final)
             else:
                 final.unlink(missing_ok=True)
     for document_id in stale:
         entry = staged.prior.documents[document_id]
         for kind, _rows in _shard_files(entry):
-            _shard_path(output_dir, kind, entry["shard"]).unlink(missing_ok=True)
+            _shard_path(output_dir, kind, entry["shard"], fmt).unlink(missing_ok=True)
     if not staged.prior.present:
         # No manifest to say what is ours: a crash may have left shards behind.
         keep = {
-            _shard_path(output_dir, kind, entry["shard"])
+            _shard_path(output_dir, kind, entry["shard"], fmt)
             for entry in staged.documents.values()
             for kind, rows in _shard_files(entry)
             if rows
@@ -754,6 +809,7 @@ def write_graph_export(
     linking_model: str,
     relation_model: str,
     context: GraphContext,
+    graph_format: str,
 ) -> GraphExportResult:
     """Stage and commit an export of an already-joined document stream."""
     staged = stage_graph(
@@ -763,6 +819,7 @@ def write_graph_export(
         linking_model=linking_model,
         relation_model=relation_model,
         context=context,
+        graph_format=graph_format,
     )
     return commit_graph(staged)
 
@@ -779,6 +836,7 @@ def export_graph(
     relation_model: str,
     entity_name: str,
     output_dir: Path,
+    graph_format: str,
     target: str | None,
     profiles_dir: str | Path | None,
 ) -> GraphExportResult:
@@ -795,6 +853,7 @@ def export_graph(
 
     # Checked before the project, profile or warehouse is touched.
     entity_name = _clean_entity_name(entity_name)
+    check_format(graph_format)
     project_path = Path(project_dir)
     project, _, _ = load_project(project_path)
     context = GraphContext.create(entity_name, project.vocabularies, project.classes)
@@ -849,6 +908,7 @@ def export_graph(
                     linking_model=linking_model,
                     relation_model=relation_model,
                     context=context,
+                    graph_format=graph_format,
                 )
         return commit_graph(staged)
     finally:

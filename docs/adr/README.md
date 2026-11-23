@@ -71,6 +71,7 @@ history (issue #311).
 | [0059](0059-scoped-embeddings-bound-warehouse-vector-reuse.md) | Scoped embedding runs bound warehouse vector reads by the filter and input window | accepted |
 | [0060](0060-language-detection-stays-on-langdetect.md) | Language detection stays on langdetect behind the `text` extra; py3langid, lingua and fasttext were weighed and lost on footprint | accepted |
 | [0061](0061-graph-export-is-incremental-by-document-shards.md) | Graph export is incremental by per-document shards with a manifest fingerprint; both reads stream ordered by document, and a vanished document is swept after a successful read, the way a stale key is | accepted, amends 0055 |
+| [0062](0062-graph-export-rdf-is-a-shard-format-behind-the-rdf-extra.md) | Graph export RDF (JSON-LD, Turtle) is a shard format behind the `rdf` extra with `urn:` identifiers, one format per directory, rdflib imported only when serializing | accepted, amends 0055 and 0061 |
 
 ## When to write one
 

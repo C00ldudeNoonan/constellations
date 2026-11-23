@@ -456,6 +456,9 @@ class _Prior:
     present: bool
     documents: dict[str, dict[str, Any]]
     legacy_files: tuple[str, ...]
+    # Whole-file outputs of an earlier release that a v3 manifest sits beside,
+    # because a run died between writing it and removing them.
+    stray_legacy: tuple[str, ...] = ()
 
 
 def _manifest_error(path: Path, why: str) -> GraphExportError:
@@ -493,7 +496,8 @@ def _read_prior(output_dir: Path) -> _Prior:
             and _SHARD_NAME.fullmatch(f"{entry['shard']}.jsonl")
         ):
             raise _manifest_error(path, "has a malformed `documents` entry")
-    return _Prior(True, documents, ())
+    stray = tuple(name for name in LEGACY_FILENAMES if (output_dir / name).is_file())
+    return _Prior(True, documents, (), stray)
 
 
 @dataclass(frozen=True)
@@ -552,6 +556,8 @@ def stage_graph(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     _refuse_symlinked_trees(output_dir)
+    # A manifest scratch file a hard kill left behind is ours and is stale.
+    (output_dir / (GRAPH_MANIFEST_FILENAME + ".tmp")).unlink(missing_ok=True)
     staged = Staged(
         output_dir=output_dir,
         prior=_read_prior(output_dir),
@@ -617,8 +623,15 @@ def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> N
 
 
 def _refuse_symlinked_trees(output_dir: Path) -> None:
-    """Fail before any write or removal if a shard tree or a fan-out directory
-    is a symlink: every path below them would lead outside the export."""
+    """Fail before any write or removal if a shard tree, a fan-out directory
+    or the scratch directory is a symlink: every path below them would lead
+    outside the export."""
+    stage = output_dir / _STAGE_DIRNAME
+    if stage.is_symlink() or (stage.exists() and not stage.is_dir()):
+        raise GraphExportError(
+            f"{stage} is a symlink or not a directory; the export never follows symlinks. "
+            "Remove it or export to another directory"
+        )
     for kind in (NODES_DIRNAME, EDGES_DIRNAME):
         base = output_dir / kind
         if base.is_symlink():
@@ -721,12 +734,13 @@ def commit_graph(staged: Staged) -> GraphExportResult:
                 manifest_path.unlink(missing_ok=True)
             _replace_shards(staged, stale)
             _write_file(manifest_path, payload)
-            # Only now is the earlier export superseded.
-            for name in staged.prior.legacy_files:
-                (staged.output_dir / name).unlink(missing_ok=True)
         elif manifest_path.read_bytes() != payload:
             # Only the header moved (a model renamed, a skip count): no shard did.
             _write_file(manifest_path, payload)
+        # Only now is the earlier export superseded. The stray files are those a
+        # previous run's v3 manifest outlived, so they go whichever branch ran.
+        for name in (*staged.prior.legacy_files, *staged.prior.stray_legacy):
+            (staged.output_dir / name).unlink(missing_ok=True)
     finally:
         staged.discard()
     return result
@@ -773,7 +787,8 @@ def export_graph(
     Both tables stream through `table_snapshot`, ordered by `document_id`, so
     no whole-table frame is built. The snapshots are validated when their
     block exits and the files are committed only after that, so a table that
-    changed under the read leaves the previous export in place.
+    changed under the read leaves the previous export in place. A failure while
+    committing is recovered by the next run, which sweeps what it left.
     """
     from .adapters import create_adapter
     from .profile import resolve_profile

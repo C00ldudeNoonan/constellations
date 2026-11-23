@@ -6332,8 +6332,9 @@ unchanged is not rewritten; one that changed has its shard and the manifest
 rewritten; one that is no longer in either table (or has nothing left to
 export) has its shards and manifest entry removed, so its edges leave the
 export. Removal happens only after the whole read succeeded, and an export
-that fails, or whose tables changed under the read, leaves the previous
-export as it was. An export of two empty tables removes every shard. The
+that fails to read, or whose tables changed under the read, leaves the
+previous export as it was; a failure while committing is recovered by the next
+run, which rewrites every shard. An export of two empty tables removes every shard. The
 command prints how many shards it wrote, left alone and removed, and a
 re-export of unchanged tables writes nothing at all.
 

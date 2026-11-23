@@ -787,6 +787,56 @@ def test_a_symlinked_shard_directory_is_refused_before_anything_is_removed(
     assert inside.is_file()
 
 
+@pytest.mark.parametrize("name", [NODES_DIRNAME, graph_export._STAGE_DIRNAME])
+def test_a_symlinked_tree_or_scratch_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The shard trees and the scratch directory are written through, so a link
+    in either place leads outside the export. Only the link itself is stood in
+    for (see the test above); the directory behind it is real, and the stranded
+    shard inside the tree is what the recovery sweep would remove."""
+    out = tmp_path / "g"
+    inside = _stranded_shard(out, NODES_DIRNAME)
+    (out / graph_export._STAGE_DIRNAME).mkdir()
+    real = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda self: self.name == name or real(self))
+
+    with pytest.raises(GraphExportError, match="symlink"):
+        _export(out, *_corpus(0))
+
+    assert inside.is_file()
+    assert not any((out / graph_export._STAGE_DIRNAME).iterdir())
+
+
+def test_legacy_files_a_v3_manifest_outlived_are_removed_by_the_next_run(
+    tmp_path: Path,
+) -> None:
+    """A run killed after writing the v3 manifest and before removing the old
+    whole files leaves both; the next run, which has nothing to write, still
+    finishes the removal."""
+    out = tmp_path / "g"
+    _export(out, *_corpus(2))
+    (out / "nodes.jsonl").write_bytes(b"{}")
+    (out / "edges.jsonl").write_bytes(b"{}")
+
+    result = _export(out, *_corpus(2))
+
+    assert result.shards_written == 0
+    assert not (out / "nodes.jsonl").exists()
+    assert not (out / "edges.jsonl").exists()
+
+
+def test_a_manifest_scratch_file_a_hard_kill_left_is_removed(tmp_path: Path) -> None:
+    out = tmp_path / "g"
+    _export(out, *_corpus(1))
+    leftover = out / (GRAPH_MANIFEST_FILENAME + ".tmp")
+    leftover.write_bytes(b"{")
+
+    _export(out, *_corpus(1))
+
+    assert not leftover.exists()
+
+
 def test_a_real_symlinked_shard_directory_leaves_its_target_alone(tmp_path: Path) -> None:
     out = tmp_path / "g"
     outside = _stranded_shard(tmp_path / "elsewhere", NODES_DIRNAME)

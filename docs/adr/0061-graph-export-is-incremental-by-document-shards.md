@@ -50,9 +50,10 @@ is removed until the whole read has succeeded and validated.
 the output directory; only after the read, the snapshots' own change validation
 and every document's checks have passed does the commit unlink the old manifest,
 move the shards in, remove the stale ones and write the manifest last. A failed
-run leaves the previous export exactly as it was. A directory with a manifest is
-still complete. A crash between unlinking the manifest and writing the new one
-leaves no manifest, so the next run treats the directory as unmanaged: it
+run, one that fails to read or validate, leaves the previous export exactly as
+it was; a failure during the commit itself does not, and the next run recovers
+as described below. A directory with a manifest is still complete. A crash
+between unlinking the manifest and writing the new one leaves no manifest, so the next run treats the directory as unmanaged: it
 rewrites every shard and removes shard-named files that nothing names, in
 two-hex-character directories of the two trees and nowhere else.
 

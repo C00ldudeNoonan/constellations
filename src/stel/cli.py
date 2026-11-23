@@ -130,6 +130,7 @@ from .synth import (
     generate_support_emails,
     generate_support_tickets,
 )
+from .table_layout import column_width
 
 
 def _context_override(
@@ -1005,9 +1006,12 @@ def ls(
     if output == "json":
         click.echo(json.dumps(rows, indent=2))
         return
+    nw = column_width((row["name"] for row in rows), minimum=24)
+    rw = column_width((row["resource_type"] for row in rows), minimum=10)
+    kw = column_width((row["kind"] for row in rows), minimum=12)
     for row in rows:
         tags = ",".join(row["tags"]) if row["tags"] else "-"
-        click.echo(f"{row['name']:<24}{row['resource_type']:<10}{row['kind']:<12}{tags}")
+        click.echo(f"{row['name']:<{nw}}{row['resource_type']:<{rw}}{row['kind']:<{kw}}{tags}")
 
 
 def _ls_orphans(ctx: click.Context, project_dir: Path, *, output: str) -> None:
@@ -1581,15 +1585,18 @@ def run(
         click.echo("No models selected.")
         return
 
+    nw = column_width((r.model_name for r in results), minimum=22)
+    kw = column_width((r.kind for r in results), minimum=12)
+    mw = column_width((r.materialization for r in results), minimum=14)
     header = (
-        f"{'model':<22}{'kind':<12}{'mater.':<14}"
+        f"{'model':<{nw}}{'kind':<{kw}}{'mater.':<{mw}}"
         f"{'processed':>10}{'skipped':>10}{'deleted':>9}{'rows':>8}{'time(s)':>10}"
     )
     click.echo(header)
     click.echo("-" * len(header))
     for r in results:
         click.echo(
-            f"{r.model_name:<22}{r.kind:<12}{r.materialization:<14}"
+            f"{r.model_name:<{nw}}{r.kind:<{kw}}{r.materialization:<{mw}}"
             f"{r.documents_processed:>10}{r.documents_skipped:>10}"
             f"{r.documents_deleted:>9}{r.rows_written:>8}{r.duration_seconds:>10.3f}"
         )
@@ -1600,7 +1607,7 @@ def run(
         _echo_warnings(r)
 
     usage_lines = [
-        f"{r.model_name:<22}"
+        f"{r.model_name:<{nw}}"
         f"{_usage_summary(r.metrics, provider=r.provider, model=r.provider_model)}"
         for r in results
         if "api_calls" in r.metrics or "provider_calls" in r.metrics
@@ -1849,29 +1856,36 @@ def _echo_build(result: BuildResult) -> None:
         click.echo("No models selected.")
         return
 
-    rheader = f"{'model':<22}{'kind':<12}{'rows':>8}{'time(s)':>10}  status"
+    nw = column_width(
+        [*(r.model_name for r in result.run_results), *result.skipped], minimum=22
+    )
+    kw = column_width((r.kind for r in result.run_results), minimum=12)
+    rheader = f"{'model':<{nw}}{'kind':<{kw}}{'rows':>8}{'time(s)':>10}  status"
     click.echo(rheader)
     click.echo("-" * len(rheader))
     for r in result.run_results:
         status = r.status.upper() if r.status else ("ERROR" if r.errors else "ok")
         click.echo(
-            f"{r.model_name:<22}{r.kind:<12}{r.rows_written:>8}"
+            f"{r.model_name:<{nw}}{r.kind:<{kw}}{r.rows_written:>8}"
             f"{r.duration_seconds:>10.3f}  {status}"
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
         _echo_warnings(r)
     for name in result.skipped:
-        click.echo(f"{name:<22}{'-':<12}{'-':>8}{'-':>10}  SKIPPED (upstream failed)")
+        click.echo(f"{name:<{nw}}{'-':<{kw}}{'-':>8}{'-':>10}  SKIPPED (upstream failed)")
 
     if result.test_results:
         click.echo("")
-        theader = f"{'model':<22}{'test':<14}{'column':<22}{'status':<8}{'message'}"
+        tnw = column_width((t.model_name for t in result.test_results), minimum=22)
+        ttw = column_width((t.test_name for t in result.test_results), minimum=14)
+        tcw = column_width((t.column or "" for t in result.test_results), minimum=22)
+        theader = f"{'model':<{tnw}}{'test':<{ttw}}{'column':<{tcw}}{'status':<8}{'message'}"
         click.echo(theader)
         click.echo("-" * 90)
         for t in result.test_results:
             click.echo(
-                f"{t.model_name:<22}{t.test_name:<14}{(t.column or ''):<22}"
+                f"{t.model_name:<{tnw}}{t.test_name:<{ttw}}{(t.column or ''):<{tcw}}"
                 f"{t.status:<8}{_test_message(t)}"
             )
 
@@ -1935,12 +1949,15 @@ def test(
     passed = sum(1 for r in results if r.status == "pass")
     warned = sum(1 for r in results if r.status == "warn")
     failed = sum(1 for r in results if r.status == "fail")
-    header = f"{'model':<22}{'test':<14}{'column':<22}{'status':<8}{'message'}"
+    nw = column_width((r.model_name for r in results), minimum=22)
+    tw = column_width((r.test_name for r in results), minimum=14)
+    cw = column_width((r.column or "" for r in results), minimum=22)
+    header = f"{'model':<{nw}}{'test':<{tw}}{'column':<{cw}}{'status':<8}{'message'}"
     click.echo(header)
     click.echo("-" * 90)
     for r in results:
         click.echo(
-            f"{r.model_name:<22}{r.test_name:<14}{(r.column or ''):<22}"
+            f"{r.model_name:<{nw}}{r.test_name:<{tw}}{(r.column or ''):<{cw}}"
             f"{r.status:<8}{_test_message(r)}"
         )
     click.echo("-" * 90)
@@ -2052,7 +2069,9 @@ def eval_(
             ctx.exit(1)
         return
 
-    header = f"{'model':<22}{'test':<26}{'status':<8}{'thresholds'}"
+    nw = column_width((r.model_name for r in results), minimum=22)
+    tw = column_width((r.test_name for r in results), minimum=26)
+    header = f"{'model':<{nw}}{'test':<{tw}}{'status':<8}{'thresholds'}"
     click.echo(header)
     click.echo("-" * 90)
     for r in results:
@@ -2060,7 +2079,7 @@ def eval_(
             f"{t.key}={t.actual:.3f}(>={t.min:.3f}){'*' if t.status != 'pass' else ''}"
             for t in r.thresholds
         )
-        click.echo(f"{r.model_name:<22}{r.test_name:<26}{r.status:<8}{threshold_summary}")
+        click.echo(f"{r.model_name:<{nw}}{r.test_name:<{tw}}{r.status:<8}{threshold_summary}")
         for violation in r.policy_violations:
             click.echo(
                 f"    POLICY VIOLATION [{violation.query_id}] {violation.kind}: "
@@ -3203,13 +3222,15 @@ def source_freshness(ctx: click.Context) -> None:
         click.echo("No sources defined.")
         return
 
-    header = f"{'source':<24}{'status':<10}{'files':>8}{'age':>10}  {'message'}"
+    sw = column_width((r.source_name for r in results), minimum=24)
+    stw = column_width((r.status for r in results), minimum=10)
+    header = f"{'source':<{sw}}{'status':<{stw}}{'files':>8}{'age':>10}  {'message'}"
     click.echo(header)
     click.echo("-" * 90)
     for r in results:
         age = "-" if r.newest_age_seconds is None else f"{r.newest_age_seconds:.0f}s"
         click.echo(
-            f"{r.source_name:<24}{r.status:<10}{r.file_count:>8}{age:>10}  {r.message}"
+            f"{r.source_name:<{sw}}{r.status:<{stw}}{r.file_count:>8}{age:>10}  {r.message}"
         )
     click.echo("-" * 90)
     failed = sum(1 for r in results if r.status == "fail")

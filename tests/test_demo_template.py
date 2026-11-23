@@ -266,28 +266,56 @@ def test_graph_export_nodes_join_to_the_governed_context(
         ],
     )
     assert result.exit_code == 0, result.output
+    manifest = json.loads((out / "graph_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema"] == "stel.graph_export/v3"
+    # A shard per document: a node appears once for each document that links it.
+    shards = sorted((out / "nodes").rglob("*.jsonl"))
+    assert len(shards) == len(manifest["documents"])
     nodes = [
         json.loads(line)
-        for line in (out / "nodes.jsonl").read_text(encoding="utf-8").splitlines()
+        for shard in shards
+        for line in shard.read_text(encoding="utf-8").splitlines()
     ]
     edges = [
         json.loads(line)
-        for line in (out / "edges.jsonl").read_text(encoding="utf-8").splitlines()
+        for shard in sorted((out / "edges").rglob("*.jsonl"))
+        for line in shard.read_text(encoding="utf-8").splitlines()
     ]
+    assert manifest["totals"]["node_rows"] == len(nodes)
+    assert manifest["totals"]["edges"] == len(edges)
     governed = {
         row[0] for row in _rows(built, f"select entity_id from {NAME}.context_entity_links")
     }
     assert {node["entity_id"] for node in nodes} == governed
-    assert len(nodes) == 8
-    assert {node["canonical_id"]: node["class"] for node in nodes}["Postgres"] == "datastore"
+    distinct = {node["entity_id"]: node for node in nodes}
+    assert len(distinct) == 8
+    assert {node["canonical_id"]: node["class"] for node in distinct.values()}["Postgres"] == (
+        "datastore"
+    )
 
     assert edges
-    node_ids = {node["entity_id"] for node in nodes}
     for edge in edges:
-        assert edge["subject_entity_id"] in node_ids
-        assert edge["object_entity_id"] in node_ids
+        assert edge["subject_entity_id"] in distinct
+        assert edge["object_entity_id"] in distinct
         assert edge["document_id"]
         assert edge["extractor_version"]
+
+    # A second export of the unchanged warehouse rewrites no shard (ALE-601).
+    before = {p: p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
+    again = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir", str(built),
+            "graph-export",
+            "--linking-model", "entity_links",
+            "--relation-model", "entity_relations",
+            "--entity-name", "system",
+            "-o", str(out),
+        ],
+    )
+    assert again.exit_code == 0, again.output
+    assert "0 shards written" in again.output
+    assert before == {p: p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
 
 
 def test_the_longest_declared_name_claims_an_overlapping_span(

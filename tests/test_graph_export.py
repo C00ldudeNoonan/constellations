@@ -1,29 +1,37 @@
-"""Graph export contract (issue #762, ALE-423, ADR-0055).
+"""Graph export contract (issue #762, ALE-423, ADR-0055; incremental, ADR-0061).
 
-The pure builder and the file writer, over hand-built frames. The demo project
-runs through the CLI in `test_demo_template.py`.
+The pure per-document builder, the two-stream join and the incremental file
+writer, over hand-built frames. The demo project runs through the CLI in
+`test_demo_template.py`, and the bounded read in `test_bounded_memory.py`.
 """
 from __future__ import annotations
 
-import hashlib
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import polars as pl
 import pytest
 
+from stel import graph_export
 from stel.agent_context import project_entity_link
 from stel.config.class_hierarchy import ClassDef
 from stel.config.vocabulary import Vocabulary
 from stel.graph_export import (
-    EDGES_FILENAME,
+    EDGES_DIRNAME,
     GRAPH_EXPORT_SCHEMA,
     GRAPH_MANIFEST_FILENAME,
-    NODES_FILENAME,
+    LINK_COLUMNS,
+    NODES_DIRNAME,
+    RELATION_COLUMNS,
+    GraphContext,
     GraphExportError,
-    build_graph,
+    build_document,
+    merge_documents,
+    require_columns,
     write_graph_export,
 )
 
@@ -32,14 +40,17 @@ _RECORDED = datetime(2026, 1, 1)
 
 def _links(rows: list[dict[str, Any]]) -> pl.DataFrame:
     base = {
+        "document_id": "d1",
         "entity_namespace": "systems",
         "status": "matched",
         "resolver": "alias_table",
         "resolver_version": "1",
     }
     return pl.DataFrame(
-        [{**base, **row} for row in rows],
+        [{**base, "entity_link_id": f"l{index}", **row} for index, row in enumerate(rows)],
         schema={
+            "entity_link_id": pl.String(),
+            "document_id": pl.String(),
             "mention_id": pl.String(),
             "canonical_id": pl.String(),
             "entity_namespace": pl.String(),
@@ -81,15 +92,41 @@ def _relations(rows: list[dict[str, Any]]) -> pl.DataFrame:
     )
 
 
-def _build(links: pl.DataFrame, relations: pl.DataFrame, **kwargs: Any) -> Any:
-    options: dict[str, Any] = {
-        "project": "p",
-        "entity_name": "system",
-        "vocabularies": {},
-        "classes": (),
-    }
+def _documents(links: pl.DataFrame, relations: pl.DataFrame) -> Iterator[Any]:
+    """The two tables as the warehouse hands them over: ordered by document."""
+    return merge_documents(
+        links.sort("document_id").iter_rows(named=True),
+        relations.sort("document_id").iter_rows(named=True),
+    )
+
+
+def _context(**kwargs: Any) -> GraphContext:
+    options: dict[str, Any] = {"entity_name": "system", "vocabularies": {}, "classes": ()}
     options.update(kwargs)
-    return build_graph(links=links, relations=relations, **options)
+    return GraphContext.create(**options)
+
+
+def _build(links: pl.DataFrame, relations: pl.DataFrame, **kwargs: Any) -> Any:
+    """Every document's shard merged into one graph, for the builder's rules."""
+    require_columns(links.columns, LINK_COLUMNS, "linking model")
+    require_columns(relations.columns, RELATION_COLUMNS, "relation model")
+    context = _context(**kwargs)
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: dict[str, dict[str, Any]] = {}
+    skipped = {"not_asserted": 0, "unlinked_mention": 0, "self_relation": 0}
+    for _document, document_links, document_relations in _documents(links, relations):
+        graph = build_document(
+            links=document_links, relations=document_relations, context=context
+        )
+        nodes.update({node["entity_id"]: node for node in graph.nodes})
+        edges.update({edge["relation_id"]: edge for edge in graph.edges})
+        for reason, count in graph.edges_skipped.items():
+            skipped[reason] += count
+    return SimpleNamespace(
+        nodes=tuple(nodes[key] for key in sorted(nodes)),
+        edges=tuple(edges[key] for key in sorted(edges)),
+        edges_skipped=skipped,
+    )
 
 
 def test_node_ids_are_the_agent_context_entity_id() -> None:
@@ -125,8 +162,13 @@ def test_every_edge_names_its_document_and_extractor_version() -> None:
     graph = _build(
         _links(
             [
-                {"mention_id": "m1", "canonical_id": "A", "resolver_version": "7"},
-                {"mention_id": "m2", "canonical_id": "B"},
+                {
+                    "mention_id": "m1",
+                    "canonical_id": "A",
+                    "resolver_version": "7",
+                    "document_id": "doc-9",
+                },
+                {"mention_id": "m2", "canonical_id": "B", "document_id": "doc-9"},
             ]
         ),
         _relations(
@@ -311,72 +353,516 @@ def test_an_empty_entity_name_is_refused() -> None:
         _build(_links([]), _relations([]), entity_name="  ")
 
 
-def _two_node_graph() -> Any:
-    return _build(
-        _links(
-            [
-                {"mention_id": "m1", "canonical_id": "Café"},
-                {"mention_id": "m2", "canonical_id": "B"},
-            ]
-        ),
-        _relations(
-            [
-                {
-                    "relation_id": "r",
-                    "subject_mention_id": "m1",
-                    "object_mention_id": "m2",
-                    "confidence": 0.5,
-                }
-            ]
-        ),
+def _corpus(
+    documents: int, *, skip: tuple[int, ...] = (), confidence: dict[int, float] | None = None
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """`documents` documents, each linking two systems and relating them once."""
+    link_rows: list[dict[str, Any]] = []
+    relation_rows: list[dict[str, Any]] = []
+    for index in range(documents):
+        if index in skip:
+            continue
+        document = f"doc{index}"
+        link_rows += [
+            {"document_id": document, "mention_id": f"{document}-a", "canonical_id": f"A{index}"},
+            {"document_id": document, "mention_id": f"{document}-b", "canonical_id": f"B{index}"},
+        ]
+        relation_rows.append(
+            {
+                "relation_id": f"r-{document}",
+                "document_id": document,
+                "subject_mention_id": f"{document}-a",
+                "object_mention_id": f"{document}-b",
+                "confidence": (confidence or {}).get(index, 0.5),
+            }
+        )
+    return _links(link_rows), _relations(relation_rows)
+
+
+def _export(
+    out: Path,
+    links: pl.DataFrame,
+    relations: pl.DataFrame,
+    *,
+    relation_model: str = "r",
+    **kwargs: Any,
+) -> Any:
+    return write_graph_export(
+        _documents(links, relations),
+        out,
+        project="p",
+        linking_model="l",
+        relation_model=relation_model,
+        context=_context(**kwargs),
     )
 
 
-def test_the_files_are_deterministic_and_the_manifest_digests_them(tmp_path: Path) -> None:
-    graph = _two_node_graph()
-    out = write_graph_export(
-        graph, tmp_path / "g", linking_model="l", relation_model="r"
-    )
-    first = {p.name: p.read_bytes() for p in out.iterdir()}
-    write_graph_export(graph, tmp_path / "g", linking_model="l", relation_model="r")
-    assert {p.name: p.read_bytes() for p in out.iterdir()} == first
-    assert set(first) == {NODES_FILENAME, EDGES_FILENAME, GRAPH_MANIFEST_FILENAME}
+def _snapshot(out: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(out).as_posix(): path.read_bytes()
+        for path in sorted(out.rglob("*"))
+        if path.is_file()
+    }
 
-    manifest = json.loads(first[GRAPH_MANIFEST_FILENAME])
+
+def _shard(out: Path, document: str, kind: str) -> Path:
+    shard = graph_export._shard_id(document)
+    return out / kind / shard[:2] / f"{shard}.jsonl"
+
+
+def _two_node_graph(out: Path) -> Any:
+    links = _links(
+        [
+            {"mention_id": "m1", "canonical_id": "Café"},
+            {"mention_id": "m2", "canonical_id": "B"},
+        ]
+    )
+    relations = _relations(
+        [
+            {
+                "relation_id": "r",
+                "subject_mention_id": "m1",
+                "object_mention_id": "m2",
+                "confidence": 0.5,
+            }
+        ]
+    )
+    return _export(out, links, relations)
+
+
+def test_a_document_is_two_shard_files_named_by_a_hash_of_its_id(tmp_path: Path) -> None:
+    out = tmp_path / "g"
+    result = _two_node_graph(out)
+
+    nodes_path = _shard(out, "d1", NODES_DIRNAME)
+    edges_path = _shard(out, "d1", EDGES_DIRNAME)
+    assert set(_snapshot(out)) == {
+        GRAPH_MANIFEST_FILENAME,
+        nodes_path.relative_to(out).as_posix(),
+        edges_path.relative_to(out).as_posix(),
+    }
+    nodes = [json.loads(line) for line in nodes_path.read_text(encoding="utf-8").splitlines()]
+    assert "Café" in {node["canonical_id"] for node in nodes}
+    assert len(edges_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert (result.documents, result.node_rows, result.edges) == (1, 2, 1)
+
+    manifest = json.loads((out / GRAPH_MANIFEST_FILENAME).read_text(encoding="utf-8"))
     assert manifest["schema"] == GRAPH_EXPORT_SCHEMA
     assert manifest["entity_name"] == "system"
-    assert manifest["files"][EDGES_FILENAME] == {
-        "rows": 1,
-        "sha256": hashlib.sha256(first[EDGES_FILENAME]).hexdigest(),
-    }
-    assert manifest["files"][NODES_FILENAME]["rows"] == 2
+    assert manifest["totals"] == {"documents": 1, "node_rows": 2, "edges": 1}
+    entry = manifest["documents"]["d1"]
+    assert (entry["nodes"], entry["edges"]) == (2, 1)
+    assert entry["shard"] == graph_export._shard_id("d1")
     # No timestamp: identical inputs must give identical bytes.
     assert not any("time" in key or "generated" in key for key in manifest)
 
-    nodes = [json.loads(line) for line in first[NODES_FILENAME].decode("utf-8").splitlines()]
-    assert "Café" in {node["canonical_id"] for node in nodes}
+
+def test_two_exports_of_unchanged_tables_write_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ALE-601: an unchanged source costs a read, not a rewrite. Every write the
+    writer makes goes through `write_bytes`, so none being made is the claim."""
+    out = tmp_path / "g"
+    links, relations = _corpus(4)
+    first = _export(out, links, relations)
+    before = _snapshot(out)
+    assert first.shards_written == 4
+
+    written: list[str] = []
+    real_write = Path.write_bytes
+
+    def spy(self: Path, data: Any) -> int:
+        written.append(self.name)
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", spy)
+    again = _export(out, links, relations)
+
+    assert written == []
+    assert (again.shards_written, again.shards_unchanged, again.shards_removed) == (0, 4, 0)
+    assert _snapshot(out) == before
 
 
-def test_a_failed_re_export_leaves_no_manifest_and_no_temp_file(
+def test_a_changed_document_rewrites_only_its_shard_and_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ALE-601 done-when: one document moves, one shard and the manifest are
+    written, and every other document's files keep their bytes."""
+    out = tmp_path / "g"
+    links, relations = _corpus(5)
+    _export(out, links, relations)
+    before = _snapshot(out)
+
+    written: list[str] = []
+    real_write = Path.write_bytes
+
+    def spy(self: Path, data: Any) -> int:
+        written.append(self.name)
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", spy)
+    links, relations = _corpus(5, confidence={2: 0.9})
+    result = _export(out, links, relations)
+
+    shard = f"{graph_export._shard_id('doc2')}.jsonl"
+    assert sorted(written) == sorted([shard, shard, "graph_manifest.json.tmp"])
+    assert (result.shards_written, result.shards_unchanged) == (1, 4)
+    after = _snapshot(out)
+    changed = {name for name in after if after[name] != before.get(name)}
+    assert changed == {
+        GRAPH_MANIFEST_FILENAME,
+        _shard(out, "doc2", EDGES_DIRNAME).relative_to(out).as_posix(),
+    }
+    moved = json.loads(_shard(out, "doc2", EDGES_DIRNAME).read_text(encoding="utf-8"))
+    assert moved["confidence"] == 0.9
+
+
+def test_a_removed_document_loses_its_shards_and_its_manifest_entry(tmp_path: Path) -> None:
+    """ALE-601 done-when: a document that left the source has its edges removed
+    from the export, and nothing else moves."""
+    out = tmp_path / "g"
+    _export(out, *_corpus(4))
+    before = _snapshot(out)
+    gone = [_shard(out, "doc1", kind) for kind in (NODES_DIRNAME, EDGES_DIRNAME)]
+    assert all(path.is_file() for path in gone)
+
+    result = _export(out, *_corpus(4, skip=(1,)))
+
+    assert not any(path.exists() for path in gone)
+    assert result.shards_removed == 1
+    manifest = json.loads((out / GRAPH_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert sorted(manifest["documents"]) == ["doc0", "doc2", "doc3"]
+    assert manifest["totals"] == {"documents": 3, "node_rows": 6, "edges": 3}
+    after = _snapshot(out)
+    kept = {
+        name: payload
+        for name, payload in before.items()
+        if name != GRAPH_MANIFEST_FILENAME and graph_export._shard_id("doc1") not in name
+    }
+    assert {name: after[name] for name in kept} == kept
+
+
+def test_an_empty_source_makes_every_shard_stale(tmp_path: Path) -> None:
+    """The reconciler's rule (#153): absence is complete even for an empty
+    upstream, so an export of nothing leaves no document behind."""
+    out = tmp_path / "g"
+    _export(out, *_corpus(3))
+
+    result = _export(out, *_corpus(0))
+
+    assert result.shards_removed == 3
+    assert [p for p in _snapshot(out) if p != GRAPH_MANIFEST_FILENAME] == []
+    manifest = json.loads((out / GRAPH_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["documents"] == {}
+
+
+def test_a_document_that_keeps_nodes_but_loses_its_edges_loses_only_the_edge_file(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "g"
+    links, relations = _corpus(2)
+    _export(out, links, relations)
+    edges_path = _shard(out, "doc0", EDGES_DIRNAME)
+    assert edges_path.is_file()
+
+    # The relation is no longer asserted, so the document still links two
+    # entities and asserts nothing between them.
+    relations = relations.with_columns(
+        pl.when(pl.col("document_id") == "doc0")
+        .then(pl.lit("ambiguous"))
+        .otherwise(pl.col("status"))
+        .alias("status")
+    )
+    result = _export(out, links, relations)
+
+    assert not edges_path.exists()
+    assert _shard(out, "doc0", NODES_DIRNAME).is_file()
+    assert result.edges_skipped["not_asserted"] == 1
+    entry = json.loads((out / GRAPH_MANIFEST_FILENAME).read_text(encoding="utf-8"))["documents"]
+    assert (entry["doc0"]["nodes"], entry["doc0"]["edges"]) == (2, 0)
+
+
+def test_a_document_with_nothing_to_export_is_not_a_shard(tmp_path: Path) -> None:
+    """A relation whose mentions no link resolves is skipped and counted, and
+    the document it names gets no shard and no manifest entry."""
+    out = tmp_path / "g"
+    relations = _relations(
+        [
+            {
+                "relation_id": "r",
+                "document_id": "orphan",
+                "subject_mention_id": "x",
+                "object_mention_id": "y",
+            }
+        ]
+    )
+    result = _export(out, _links([]), relations)
+
+    assert result.edges_skipped["unlinked_mention"] == 1
+    assert [p for p in _snapshot(out) if p != GRAPH_MANIFEST_FILENAME] == []
+
+
+def test_a_shard_the_manifest_vouches_for_but_the_directory_lost_is_rewritten(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "g"
+    links, relations = _corpus(3)
+    _export(out, links, relations)
+    before = _snapshot(out)
+    _shard(out, "doc1", EDGES_DIRNAME).unlink()
+
+    result = _export(out, links, relations)
+
+    assert result.shards_written == 1
+    assert _snapshot(out) == before
+
+
+def test_a_failed_read_leaves_the_previous_export_untouched(tmp_path: Path) -> None:
+    """The directory is what a consumer loads from, so a run that fails partway
+    must not leave it half-updated, whichever way it fails."""
+    out = tmp_path / "g"
+    _export(out, *_corpus(4))
+    before = _snapshot(out)
+
+    def failing() -> Iterator[Any]:
+        links, relations = _corpus(4, confidence={0: 0.1, 1: 0.2})
+        for index, document in enumerate(_documents(links, relations)):
+            if index == 2:
+                raise RuntimeError("warehouse went away")
+            yield document
+
+    with pytest.raises(RuntimeError, match="went away"):
+        write_graph_export(
+            failing(),
+            out,
+            project="p",
+            linking_model="l",
+            relation_model="r",
+            context=_context(),
+        )
+    assert _snapshot(out) == before
+
+    # A document that fails validation does the same.
+    links, relations = _corpus(4, skip=(3,))
+    conflicted = pl.concat(
+        [
+            links,
+            _links(
+                [
+                    {"document_id": "doc0", "mention_id": "doc0-a", "canonical_id": "Z"},
+                ]
+            ).with_columns(pl.lit("lz").alias("entity_link_id")),
+        ]
+    )
+    with pytest.raises(GraphExportError, match="matched to two different entities"):
+        _export(out, conflicted, relations)
+    assert _snapshot(out) == before
+
+
+def test_a_failed_commit_leaves_no_manifest_and_no_scratch_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A manifest from an earlier export must not vouch for half-replaced files."""
     out = tmp_path / "g"
-    write_graph_export(_two_node_graph(), out, linking_model="l", relation_model="r")
+    links, relations = _corpus(2)
+    _export(out, links, relations)
     assert (out / GRAPH_MANIFEST_FILENAME).exists()
 
     real_replace = Path.replace
 
-    def fail_on_edges(self: Path, target: Any) -> Any:
-        if Path(target).name == EDGES_FILENAME:
+    def fail_on_shards(self: Path, target: Any) -> Any:
+        if Path(target).parent.parent.name == EDGES_DIRNAME:
             raise OSError("disk full")
         return real_replace(self, target)
 
-    monkeypatch.setattr(Path, "replace", fail_on_edges)
+    monkeypatch.setattr(Path, "replace", fail_on_shards)
+    links, relations = _corpus(2, confidence={0: 0.9})
     with pytest.raises(OSError, match="disk full"):
-        write_graph_export(_two_node_graph(), out, linking_model="l", relation_model="r")
+        _export(out, links, relations)
     assert not (out / GRAPH_MANIFEST_FILENAME).exists()
-    assert not list(out.glob("*.tmp"))
+    assert not list(out.rglob("*.tmp"))
+    assert not (out / graph_export._STAGE_DIRNAME).exists()
+
+
+def test_a_crash_that_cost_the_manifest_is_swept_on_the_next_export(tmp_path: Path) -> None:
+    """With no manifest to say what is ours, shard-shaped files nobody names are
+    removed, and nothing else in the directory is looked at."""
+    out = tmp_path / "g"
+    _export(out, *_corpus(3))
+    stranded = _shard(out, "doc1", EDGES_DIRNAME)
+    (out / GRAPH_MANIFEST_FILENAME).unlink()
+    keepsake = stranded.parent / "notes.txt"
+    keepsake.write_text("mine", encoding="utf-8")
+    elsewhere = out / "README.md"
+    elsewhere.write_text("mine too", encoding="utf-8")
+
+    _export(out, *_corpus(3, skip=(1,)))
+
+    assert not stranded.exists()
+    assert not _shard(out, "doc1", NODES_DIRNAME).exists()
+    assert keepsake.read_text(encoding="utf-8") == "mine"
+    assert elsewhere.read_text(encoding="utf-8") == "mine too"
+    assert _shard(out, "doc0", EDGES_DIRNAME).is_file()
+
+
+def _legacy_export(out: Path) -> dict[str, bytes]:
+    out.mkdir(parents=True)
+    (out / "nodes.jsonl").write_bytes(b'{"entity_id":"old"}\n')
+    (out / "edges.jsonl").write_bytes(b'{"relation_id":"old"}\n')
+    (out / GRAPH_MANIFEST_FILENAME).write_text(
+        json.dumps({"schema": "stel.graph_export/v2", "files": {}}), encoding="utf-8"
+    )
+    return _snapshot(out)
+
+
+def test_a_v2_export_is_left_alone_until_the_v3_export_has_committed(
+    tmp_path: Path,
+) -> None:
+    """The directory an earlier release wrote is the user's data: a run that
+    fails does not touch it, and one that succeeds replaces it whole."""
+    out = tmp_path / "g"
+    legacy = _legacy_export(out)
+    links, relations = _corpus(1)
+    with pytest.raises(GraphExportError, match="appears twice"):
+        _export(out, links, pl.concat([relations, relations]))
+    assert _snapshot(out) == legacy
+
+    result = _export(out, *_corpus(2))
+
+    assert result.shards_written == 2
+    assert not (out / "nodes.jsonl").exists()
+    assert not (out / "edges.jsonl").exists()
+    manifest = json.loads((out / GRAPH_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["schema"] == GRAPH_EXPORT_SCHEMA
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        "{not json",
+        json.dumps({"schema": "stel.graph_export/v9", "documents": {}}),
+        json.dumps({"schema": GRAPH_EXPORT_SCHEMA}),
+        json.dumps({"schema": GRAPH_EXPORT_SCHEMA, "documents": {"d": {"nodes": 1}}}),
+    ],
+    ids=["unreadable", "newer-schema", "no-documents", "malformed-entry"],
+)
+def test_a_manifest_it_cannot_vouch_for_is_refused_and_left_in_place(
+    tmp_path: Path, manifest: str
+) -> None:
+    out = tmp_path / "g"
+    out.mkdir()
+    (out / GRAPH_MANIFEST_FILENAME).write_text(manifest, encoding="utf-8")
+    (out / "mine.txt").write_text("keep", encoding="utf-8")
+    before = _snapshot(out)
+
+    with pytest.raises(GraphExportError, match="refusing to overwrite"):
+        _export(out, *_corpus(2))
+    assert _snapshot(out) == before
+
+
+def test_a_header_only_change_rewrites_the_manifest_and_no_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "g"
+    links, relations = _corpus(3)
+    _export(out, links, relations)
+    before = _snapshot(out)
+
+    written: list[str] = []
+    real_write = Path.write_bytes
+
+    def spy(self: Path, data: Any) -> int:
+        written.append(self.name)
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", spy)
+    result = _export(out, links, relations, relation_model="renamed")
+
+    assert written == ["graph_manifest.json.tmp"]
+    assert result.shards_written == 0
+    after = _snapshot(out)
+    assert {name for name in after if after[name] != before[name]} == {GRAPH_MANIFEST_FILENAME}
+
+
+def test_a_changed_entity_name_rewrites_every_shard(tmp_path: Path) -> None:
+    """Node ids are derived from `entity_name`, so a new name moves every shard's
+    bytes and the fingerprint notices without being told the context changed."""
+    out = tmp_path / "g"
+    links, relations = _corpus(3)
+    _export(out, links, relations)
+
+    result = _export(out, links, relations, entity_name="service")
+
+    assert result.shards_written == 3
+
+
+def test_a_changed_class_declaration_rewrites_the_shards_it_touches(tmp_path: Path) -> None:
+    out = tmp_path / "g"
+    links, relations = _corpus(3)
+    _export(out, links, relations)
+
+    vocabularies = {
+        "systems": Vocabulary.model_validate({"terms": [{"label": "A1", "class": "cache"}]})
+    }
+    result = _export(out, links, relations, vocabularies=vocabularies, classes=("cache",))
+
+    assert result.shards_written == 1
+    nodes = _shard(out, "doc1", NODES_DIRNAME).read_text(encoding="utf-8")
+    assert '"class":"cache"' in nodes
+
+
+# --- the two-stream join ----------------------------------------------------
+
+
+def _link_row(document: str, mention: str) -> dict[str, Any]:
+    return {"document_id": document, "mention_id": mention}
+
+
+def test_the_join_pairs_each_document_with_its_own_rows_from_either_table() -> None:
+    links = [_link_row("a", "m1"), _link_row("a", "m2"), _link_row("c", "m3")]
+    relations = [_link_row("a", "r1"), _link_row("b", "r2"), _link_row("c", "r3")]
+
+    joined = [
+        (document, [row["mention_id"] for row in left], [row["mention_id"] for row in right])
+        for document, left, right in merge_documents(links, relations)
+    ]
+
+    assert joined == [
+        ("a", ["m1", "m2"], ["r1"]),
+        ("b", [], ["r2"]),
+        ("c", ["m3"], ["r3"]),
+    ]
+
+
+def test_the_join_handles_one_table_being_empty() -> None:
+    only_links = list(merge_documents([_link_row("a", "m1")], []))
+    only_relations = list(merge_documents([], [_link_row("a", "r1")]))
+    assert [(d, len(left), len(right)) for d, left, right in only_links] == [("a", 1, 0)]
+    assert [(d, len(left), len(right)) for d, left, right in only_relations] == [("a", 0, 1)]
+    assert list(merge_documents([], [])) == []
+
+
+@pytest.mark.parametrize("side", ["links", "relations"])
+def test_a_stream_out_of_document_order_fails_instead_of_mispairing(side: str) -> None:
+    """The join trusts nothing it cannot check: a warehouse collation that
+    disagrees with Python's would otherwise pair the wrong documents silently."""
+    ordered = [_link_row("a", "x"), _link_row("c", "y")]
+    shuffled = [_link_row("b", "x"), _link_row("a", "y")]
+    streams = (shuffled, ordered) if side == "links" else (ordered, shuffled)
+    with pytest.raises(GraphExportError, match="ascending document_id order"):
+        list(merge_documents(*streams))
+
+
+def test_a_stream_that_returns_to_a_document_it_left_fails() -> None:
+    rows = [_link_row("a", "x"), _link_row("b", "y"), _link_row("a", "z")]
+    with pytest.raises(GraphExportError, match="ascending document_id order"):
+        list(merge_documents(rows, []))
+
+
+@pytest.mark.parametrize("missing", [None, ""])
+def test_a_row_with_no_document_id_is_refused(missing: str | None) -> None:
+    with pytest.raises(GraphExportError, match="no document_id"):
+        list(merge_documents([_link_row("a", "x")], [{"document_id": missing}]))
 
 
 def test_a_link_without_a_namespace_is_not_a_node() -> None:
@@ -418,12 +904,11 @@ def test_a_relation_model_without_confidence_is_refused() -> None:
 
 
 def test_lines_end_in_a_bare_newline_on_every_platform(tmp_path: Path) -> None:
-    out = write_graph_export(
-        _two_node_graph(), tmp_path / "g", linking_model="l", relation_model="r"
-    )
-    for name in (NODES_FILENAME, EDGES_FILENAME):
-        assert b"\r" not in (out / name).read_bytes()
-    assert not list(out.glob("*.tmp"))
+    out = tmp_path / "g"
+    _two_node_graph(out)
+    for kind in (NODES_DIRNAME, EDGES_DIRNAME):
+        assert b"\r" not in _shard(out, "d1", kind).read_bytes()
+    assert not list(out.rglob("*.tmp"))
 
 
 # --- validity on edges (ALE-422, ADR-0056): schema v2 -----------------------
@@ -446,8 +931,8 @@ def _ab_links() -> pl.DataFrame:
     )
 
 
-def _validity_graph(**validity: Any) -> Any:
-    relations = _relations(
+def _validity_relations(**validity: Any) -> pl.DataFrame:
+    return _relations(
         [
             {
                 "relation_id": "r1",
@@ -462,16 +947,18 @@ def _validity_graph(**validity: Any) -> Any:
             for name, dtype in _VALIDITY_SCHEMA.items()
         )
     )
-    return _build(
-        _ab_links(),
-        relations,
-    )
 
 
-def test_the_export_schema_is_v2_because_edges_gained_validity() -> None:
-    """ADR-0055 said validity arrives as a version bump, not as null columns
-    on v1: a reader that checks the version learns the edge shape changed."""
-    assert GRAPH_EXPORT_SCHEMA == "stel.graph_export/v2"
+def _validity_graph(**validity: Any) -> Any:
+    return _build(_ab_links(), _validity_relations(**validity))
+
+
+def test_the_export_schema_is_v3_because_the_layout_became_shards() -> None:
+    """ADR-0055 said a change of shape arrives as a version bump, not as null
+    columns: v2 added edge validity, v3 replaced the two whole files with a
+    shard per document (ADR-0061), so a reader that checks the version learns
+    the layout changed."""
+    assert GRAPH_EXPORT_SCHEMA == "stel.graph_export/v3"
 
 
 def test_an_edge_carries_its_validity_interval_as_utc_iso_strings() -> None:
@@ -510,18 +997,20 @@ def test_a_relation_model_built_before_validity_exports_null_validity() -> None:
 
 
 def test_validity_survives_the_written_file_byte_for_byte(tmp_path: Path) -> None:
-    graph = _validity_graph(
+    relations = _validity_relations(
         valid_from=datetime(2020, 1, 1, tzinfo=UTC),
         valid_to=datetime(2023, 1, 1, tzinfo=UTC),
         superseded_by="r2",
     )
 
-    out = write_graph_export(graph, tmp_path / "g", linking_model="l", relation_model="r")
-    again = write_graph_export(graph, tmp_path / "g2", linking_model="l", relation_model="r")
+    out = tmp_path / "g"
+    _export(out, _ab_links(), relations)
+    _export(tmp_path / "g2", _ab_links(), relations)
 
-    line = (out / EDGES_FILENAME).read_text(encoding="utf-8").splitlines()[0]
+    shard = _shard(out, "d1", EDGES_DIRNAME)
+    line = shard.read_text(encoding="utf-8").splitlines()[0]
     assert json.loads(line)["valid_to"] == "2023-01-01T00:00:00Z"
-    assert (out / EDGES_FILENAME).read_bytes() == (again / EDGES_FILENAME).read_bytes()
+    assert shard.read_bytes() == _shard(tmp_path / "g2", "d1", EDGES_DIRNAME).read_bytes()
 
 
 def test_a_validity_column_that_is_not_a_timestamp_is_refused_by_name() -> None:

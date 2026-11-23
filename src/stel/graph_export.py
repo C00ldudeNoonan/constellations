@@ -19,10 +19,23 @@ Two properties carry the design (ADR-0055):
   therefore names its relation row, document, extractor and the resolvers that
   linked its two ends.
 
-`build_graph` is a pure function over frames so it is exercised without a
-warehouse; `export_graph` reads the frames through the active adapter and
-`write_graph_export` writes the files. Output is deterministic and carries no
-timestamp, so two exports of unchanged tables are byte-identical.
+The export is incremental by document (ADR-0061, schema v3). A document is the
+unit: its nodes and edges are one *shard* of two files, named by a hash of the
+document id, and `graph_manifest.json` carries a fingerprint per shard. A
+re-export streams both tables ordered by `document_id`, joins the two streams
+document by document so only one document's rows are resident, builds each
+shard and rewrites only the ones whose fingerprint moved. A document that left
+the source is stale in the same sense a published key absent from its upstream
+is stale in the state reconciler (`state_reconciliation.py`, #153/#764): absence
+is judged against exactly the rows this export read, the streams are validated
+to be strictly ascending rather than trusted, an empty source makes every
+shard stale, and nothing is removed until the whole read has succeeded.
+
+`build_document` is a pure function over one document's rows so it is
+exercised without a warehouse; `export_graph` reads the tables through the
+active adapter and `stage_graph` / `commit_graph` write the files. Output is
+deterministic and carries no timestamp, so two exports of unchanged tables
+leave every file, and its modification time, alone.
 
 An edge also carries the interval its fact holds over (`valid_from`, `valid_to`,
 `observed_at`, `superseded_by`), when the relation model has those columns
@@ -36,25 +49,38 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import re
+import shutil
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import polars as pl
-
+from .adapters.base import AdapterError, TableReadSnapshot
 from .agent_context import canonical_entity_key, make_entity_id
 from .config import load_project
 from .config.class_hierarchy import ClassDeclaration, class_ancestors, class_parents
 from .config.vocabulary import Vocabulary, VocabularyTerm, declared_terms
 
-GRAPH_EXPORT_SCHEMA = "stel.graph_export/v2"
-NODES_FILENAME = "nodes.jsonl"
-EDGES_FILENAME = "edges.jsonl"
+GRAPH_EXPORT_SCHEMA = "stel.graph_export/v3"
 GRAPH_MANIFEST_FILENAME = "graph_manifest.json"
+NODES_DIRNAME = "nodes"
+EDGES_DIRNAME = "edges"
+# v1 and v2 wrote these two whole files; v3 replaces them with shards.
+LEGACY_SCHEMAS = ("stel.graph_export/v1", "stel.graph_export/v2")
+LEGACY_FILENAMES = ("nodes.jsonl", "edges.jsonl")
 
-_LINK_COLUMNS = (
+_STAGE_DIRNAME = ".graph_export_stage"
+_SHARD_NAME = re.compile(r"[0-9a-f]{32}\.jsonl")
+_PREFIX_NAME = re.compile(r"[0-9a-f]{2}")
+# Rows pulled per warehouse batch. Residency is this plus one document.
+_READ_BATCH_ROWS = 10_000
+
+LINK_COLUMNS = (
+    "entity_link_id",
+    "document_id",
     "mention_id",
     "canonical_id",
     "entity_namespace",
@@ -62,7 +88,7 @@ _LINK_COLUMNS = (
     "resolver",
     "resolver_version",
 )
-_RELATION_COLUMNS = (
+RELATION_COLUMNS = (
     "relation_id",
     "document_id",
     "subject_mention_id",
@@ -76,6 +102,10 @@ _RELATION_COLUMNS = (
     "extractor",
     "extractor_version",
 )
+# Present on a relation model built after ADR-0056; read when there.
+_OPTIONAL_RELATION_COLUMNS = ("valid_from", "valid_to", "observed_at", "superseded_by")
+
+DocumentRows = tuple[str, Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]]
 
 
 class GraphExportError(Exception):
@@ -94,13 +124,36 @@ class _Linked:
 
 
 @dataclass(frozen=True)
-class GraphExport:
-    project: str
+class GraphContext:
+    """What turns a document's rows into nodes: the operator's `entity_name`
+    and the declarations a node's class is read from."""
+
     entity_name: str
+    terms: Mapping[tuple[str, str], VocabularyTerm]
+    parents: Mapping[str, str]
+
+    @classmethod
+    def create(
+        cls,
+        entity_name: str,
+        vocabularies: Mapping[str, Vocabulary],
+        classes: Sequence[ClassDeclaration],
+    ) -> GraphContext:
+        return cls(
+            entity_name=_clean_entity_name(entity_name),
+            terms=declared_terms(vocabularies),
+            parents=class_parents(classes),
+        )
+
+
+@dataclass(frozen=True)
+class DocumentGraph:
+    """One document's shard: its nodes, its edges, and what it left out."""
+
     nodes: tuple[dict[str, Any], ...]
     edges: tuple[dict[str, Any], ...]
-    # Relation rows the graph left out, by reason, so a count that looks short
-    # is explained rather than discovered.
+    # Relation rows the document's graph left out, by reason, so a count that
+    # looks short is explained rather than discovered.
     edges_skipped: dict[str, int]
 
 
@@ -138,8 +191,8 @@ def _clean_entity_name(entity_name: str) -> str:
     return cleaned
 
 
-def _require_columns(frame: pl.DataFrame, required: Sequence[str], model: str) -> None:
-    missing = [name for name in required if name not in frame.columns]
+def require_columns(available: Sequence[str], required: Sequence[str], model: str) -> None:
+    missing = [name for name in required if name not in available]
     if missing:
         raise GraphExportError(
             f"the {model} is missing column(s) {', '.join(missing)}; the graph "
@@ -147,7 +200,9 @@ def _require_columns(frame: pl.DataFrame, required: Sequence[str], model: str) -
         )
 
 
-def _linked_mentions(links: pl.DataFrame, entity_name: str) -> dict[str, _Linked]:
+def _linked_mentions(
+    links: Iterable[Mapping[str, Any]], entity_name: str
+) -> dict[str, _Linked]:
     """Mention id -> its resolved entity, for matched links only.
 
     An ambiguous or unmatched mention names no single entity, and the governed
@@ -156,14 +211,14 @@ def _linked_mentions(links: pl.DataFrame, entity_name: str) -> dict[str, _Linked
     fails the export instead of letting row order pick a side.
     """
     mentions: dict[str, _Linked] = {}
-    matched = links.filter(
-        (pl.col("status") == "matched")
-        & pl.col("canonical_id").is_not_null()
-        & pl.col("entity_namespace").is_not_null()
-    )
-    for row in matched.iter_rows(named=True):
+    for row in links:
         canonical = row["canonical_id"]
-        if not str(canonical):
+        if (
+            row["status"] != "matched"
+            or canonical is None
+            or row["entity_namespace"] is None
+            or not str(canonical)
+        ):
             continue
         namespace = str(row["entity_namespace"])
         linked = _Linked(
@@ -206,7 +261,7 @@ def _node(
     }
 
 
-def _edge(row: dict[str, Any], subject: _Linked, obj: _Linked) -> dict[str, Any]:
+def _edge(row: Mapping[str, Any], subject: _Linked, obj: _Linked) -> dict[str, Any]:
     return {
         "relation_id": str(row["relation_id"]),
         "subject_entity_id": subject.entity_id,
@@ -232,16 +287,13 @@ def _edge(row: dict[str, Any], subject: _Linked, obj: _Linked) -> dict[str, Any]
     }
 
 
-def build_graph(
+def build_document(
     *,
-    project: str,
-    links: pl.DataFrame,
-    relations: pl.DataFrame,
-    entity_name: str,
-    vocabularies: Mapping[str, Vocabulary],
-    classes: Sequence[ClassDeclaration],
-) -> GraphExport:
-    """Nodes and edges from entity-link and relation frames.
+    links: Sequence[Mapping[str, Any]],
+    relations: Sequence[Mapping[str, Any]],
+    context: GraphContext,
+) -> DocumentGraph:
+    """One document's nodes and edges from its link and relation rows.
 
     A relation becomes an edge when it is `asserted` and both its mentions
     resolve to a matched entity, and the two entities differ. An undirected
@@ -249,25 +301,24 @@ def build_graph(
     order, so the same pair never appears as two edges that differ only in
     which mention came first.
 
+    A relation's mentions are resolved against its own document's links, which
+    is where `extract_relations` takes them from.
+
     The skip reasons are exclusive and checked in the order `not_asserted`,
     `unlinked_mention`, `self_relation`: a row is counted under the first that
     applies, so a non-asserted row never also counts as unlinked.
     """
-    entity_name = _clean_entity_name(entity_name)
-    _require_columns(links, _LINK_COLUMNS, "linking model")
-    _require_columns(relations, _RELATION_COLUMNS, "relation model")
-
-    mentions = _linked_mentions(links, entity_name)
-    terms = declared_terms(vocabularies)
-    parents = class_parents(classes)
+    mentions = _linked_mentions(links, context.entity_name)
     nodes: dict[str, dict[str, Any]] = {}
     for linked in mentions.values():
         if linked.entity_id not in nodes:
-            nodes[linked.entity_id] = _node(linked, entity_name, terms, parents)
+            nodes[linked.entity_id] = _node(
+                linked, context.entity_name, context.terms, context.parents
+            )
 
     skipped = {"not_asserted": 0, "unlinked_mention": 0, "self_relation": 0}
     edges: dict[str, dict[str, Any]] = {}
-    for row in relations.iter_rows(named=True):
+    for row in relations:
         if row["status"] != "asserted":
             skipped["not_asserted"] += 1
             continue
@@ -289,13 +340,74 @@ def build_graph(
             )
         edges[edge["relation_id"]] = edge
 
-    return GraphExport(
-        project=project,
-        entity_name=entity_name,
+    return DocumentGraph(
         nodes=tuple(nodes[key] for key in sorted(nodes)),
         edges=tuple(edges[key] for key in sorted(edges)),
         edges_skipped=skipped,
     )
+
+
+def _grouped_by_document(
+    rows: Iterable[Mapping[str, Any]], model: str
+) -> Iterator[tuple[str, list[Mapping[str, Any]]]]:
+    """`(document_id, its rows)` from a stream ordered by `document_id`.
+
+    The order is checked here, not assumed: a warehouse that collates ids
+    differently from Python would otherwise let the two-stream join below pair
+    the wrong documents without a word. A stream that moves backwards, or
+    returns to a document it left, fails the export instead.
+    """
+    current: str | None = None
+    group: list[Mapping[str, Any]] = []
+    for row in rows:
+        raw = row["document_id"]
+        if raw is None or not str(raw):
+            raise GraphExportError(
+                f"the {model} has a row with no document_id; every row must name "
+                "the document it came from"
+            )
+        document_id = str(raw)
+        if document_id != current:
+            if current is not None:
+                if document_id < current:
+                    raise GraphExportError(
+                        f"the {model} is not in ascending document_id order "
+                        f"('{document_id}' follows '{current}'); the warehouse's "
+                        "ordering must match a plain string comparison"
+                    )
+                yield current, group
+            current, group = document_id, []
+        group.append(row)
+    if current is not None:
+        yield current, group
+
+
+def merge_documents(
+    links: Iterable[Mapping[str, Any]], relations: Iterable[Mapping[str, Any]]
+) -> Iterator[DocumentRows]:
+    """Join the two `document_id`-ordered streams into one document at a time.
+
+    Holds one document's link rows and one document's relation rows, however
+    large the tables are. A document present in only one table is yielded with
+    nothing for the other: links with no relations still give nodes, and
+    relations with no links give only skipped relations.
+    """
+    link_groups = _grouped_by_document(links, "linking model")
+    relation_groups = _grouped_by_document(relations, "relation model")
+    link = next(link_groups, None)
+    relation = next(relation_groups, None)
+    while link is not None or relation is not None:
+        if link is not None and (relation is None or link[0] < relation[0]):
+            yield link[0], link[1], []
+            link = next(link_groups, None)
+        elif relation is not None and (link is None or relation[0] < link[0]):
+            yield relation[0], [], relation[1]
+            relation = next(relation_groups, None)
+        else:
+            assert link is not None and relation is not None
+            yield link[0], link[1], relation[1]
+            link = next(link_groups, None)
+            relation = next(relation_groups, None)
 
 
 def _jsonl(rows: Sequence[Mapping[str, Any]]) -> bytes:
@@ -320,46 +432,304 @@ def _write_file(path: Path, payload: bytes) -> None:
         raise
 
 
-def write_graph_export(
-    graph: GraphExport,
+def _shard_id(document_id: str) -> str:
+    # A document id is arbitrary text, so the file is named by its hash.
+    return hashlib.sha256(document_id.encode("utf-8")).hexdigest()[:32]
+
+
+def _shard_path(root: Path, kind: str, shard: str) -> Path:
+    # Two hex characters of fan-out keep a directory from holding every shard.
+    return root / kind / shard[:2] / f"{shard}.jsonl"
+
+
+def _fingerprint(nodes: bytes, edges: bytes) -> str:
+    digest = hashlib.sha256()
+    for part in (nodes, edges):
+        digest.update(hashlib.sha256(part).digest())
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _Prior:
+    """What the output directory already holds, per its manifest."""
+
+    present: bool
+    documents: dict[str, dict[str, Any]]
+    legacy_files: tuple[str, ...]
+
+
+def _manifest_error(path: Path, why: str) -> GraphExportError:
+    return GraphExportError(
+        f"{path} {why}; refusing to overwrite an export it cannot vouch for. "
+        "Export to another directory, or delete this one if its contents are disposable"
+    )
+
+
+def _read_prior(output_dir: Path) -> _Prior:
+    path = output_dir / GRAPH_MANIFEST_FILENAME
+    if not path.is_file():
+        return _Prior(False, {}, ())
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise _manifest_error(path, "is not readable JSON") from error
+    schema = data.get("schema") if isinstance(data, dict) else None
+    if schema in LEGACY_SCHEMAS:
+        # v1/v2 wrote whole files. They are replaced once the new export has
+        # committed, never before: a failed run leaves the old export intact.
+        return _Prior(False, {}, LEGACY_FILENAMES)
+    if schema != GRAPH_EXPORT_SCHEMA:
+        raise _manifest_error(path, f"is schema {schema!r}, not {GRAPH_EXPORT_SCHEMA}")
+    documents = data.get("documents")
+    if not isinstance(documents, dict):
+        raise _manifest_error(path, "has no `documents` object")
+    for entry in documents.values():
+        if not (
+            isinstance(entry, dict)
+            and isinstance(entry.get("nodes"), int)
+            and isinstance(entry.get("edges"), int)
+            and isinstance(entry.get("sha256"), str)
+            and isinstance(entry.get("shard"), str)
+            and _SHARD_NAME.fullmatch(f"{entry['shard']}.jsonl")
+        ):
+            raise _manifest_error(path, "has a malformed `documents` entry")
+    return _Prior(True, documents, ())
+
+
+@dataclass(frozen=True)
+class GraphExportResult:
+    output_dir: Path
+    documents: int
+    node_rows: int
+    edges: int
+    edges_skipped: dict[str, int]
+    shards_written: int
+    shards_unchanged: int
+    shards_removed: int
+
+
+@dataclass
+class Staged:
+    """An export read in full and validated, not yet visible in the directory."""
+
+    output_dir: Path
+    prior: _Prior
+    documents: dict[str, dict[str, Any]]
+    changed: list[str]
+    unchanged: int
+    skipped: dict[str, int]
+    manifest: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def stage_dir(self) -> Path:
+        return self.output_dir / _STAGE_DIRNAME
+
+    def discard(self) -> None:
+        if self.stage_dir.exists():
+            shutil.rmtree(self.stage_dir, ignore_errors=True)
+
+
+def _shard_files(entry: Mapping[str, Any]) -> tuple[tuple[str, int], ...]:
+    return ((NODES_DIRNAME, entry["nodes"]), (EDGES_DIRNAME, entry["edges"]))
+
+
+def stage_graph(
+    documents: Iterable[DocumentRows],
     output_dir: Path,
     *,
+    project: str,
     linking_model: str,
     relation_model: str,
-) -> Path:
-    """Write `nodes.jsonl`, `edges.jsonl` and `graph_manifest.json`.
+    context: GraphContext,
+) -> Staged:
+    """Consume the document stream, building every shard and staging the changed
+    ones in a scratch directory inside `output_dir`.
 
-    The manifest is written last, so a directory that has one is complete. It
-    carries the schema version, the models read, row counts and a digest of
-    each file, and no timestamp, so unchanged inputs give identical bytes.
+    Nothing the previous export wrote is touched: a document that fails
+    validation, or a read that fails, leaves the directory as it was. Memory is
+    one document plus the manifest's per-document entries, which is the
+    distinct-key term of the bounded-memory contract.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    # A manifest left by an earlier export would vouch for files about to be
-    # replaced, so it goes first: a directory with a manifest is then complete.
-    (output_dir / GRAPH_MANIFEST_FILENAME).unlink(missing_ok=True)
-    payloads = {
-        NODES_FILENAME: (_jsonl(graph.nodes), len(graph.nodes)),
-        EDGES_FILENAME: (_jsonl(graph.edges), len(graph.edges)),
-    }
-    for name, (payload, _) in payloads.items():
-        _write_file(output_dir / name, payload)
-    manifest = {
+    staged = Staged(
+        output_dir=output_dir,
+        prior=_read_prior(output_dir),
+        documents={},
+        changed=[],
+        unchanged=0,
+        skipped={"not_asserted": 0, "unlinked_mention": 0, "self_relation": 0},
+    )
+    # A scratch directory a crashed run left behind is ours and is stale.
+    staged.discard()
+    try:
+        for document_id, links, relations in documents:
+            graph = build_document(links=links, relations=relations, context=context)
+            for reason, count in graph.edges_skipped.items():
+                staged.skipped[reason] += count
+            if graph.nodes or graph.edges:
+                _stage_document(staged, document_id, graph)
+    except BaseException:
+        staged.discard()
+        raise
+    staged.manifest = {
         "schema": GRAPH_EXPORT_SCHEMA,
-        "project": graph.project,
-        "entity_name": graph.entity_name,
+        "project": project,
+        "entity_name": context.entity_name,
         "linking_model": linking_model,
         "relation_model": relation_model,
-        "files": {
-            name: {"rows": rows, "sha256": hashlib.sha256(payload).hexdigest()}
-            for name, (payload, rows) in sorted(payloads.items())
+        "totals": {
+            "documents": len(staged.documents),
+            "node_rows": sum(entry["nodes"] for entry in staged.documents.values()),
+            "edges": sum(entry["edges"] for entry in staged.documents.values()),
         },
-        "edges_skipped": dict(sorted(graph.edges_skipped.items())),
+        "edges_skipped": dict(sorted(staged.skipped.items())),
+        "documents": dict(sorted(staged.documents.items())),
     }
-    _write_file(
-        output_dir / GRAPH_MANIFEST_FILENAME,
-        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    return staged
+
+
+def _stage_document(staged: Staged, document_id: str, graph: DocumentGraph) -> None:
+    payloads = {NODES_DIRNAME: _jsonl(graph.nodes), EDGES_DIRNAME: _jsonl(graph.edges)}
+    shard = _shard_id(document_id)
+    entry = {
+        "shard": shard,
+        "nodes": len(graph.nodes),
+        "edges": len(graph.edges),
+        "sha256": _fingerprint(payloads[NODES_DIRNAME], payloads[EDGES_DIRNAME]),
+    }
+    staged.documents[document_id] = entry
+    # A shard the manifest vouches for but the directory lost is rewritten.
+    on_disk = all(
+        _shard_path(staged.output_dir, kind, shard).is_file()
+        for kind, rows in _shard_files(entry)
+        if rows
     )
-    return output_dir
+    if on_disk and staged.prior.documents.get(document_id) == entry:
+        staged.unchanged += 1
+        return
+    staged.changed.append(document_id)
+    for kind, rows in _shard_files(entry):
+        if rows:
+            target = _shard_path(staged.stage_dir, kind, shard)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payloads[kind])
+
+
+def _sweep_unnamed(output_dir: Path, keep: set[Path]) -> None:
+    """Remove shard-named files no manifest names, after a crash left some.
+
+    Only files shaped like a shard, in a two-hex-character directory of the two
+    shard trees, are ever removed; anything else the operator keeps there is
+    never looked at.
+    """
+    for kind in (NODES_DIRNAME, EDGES_DIRNAME):
+        base = output_dir / kind
+        if not base.is_dir():
+            continue
+        for prefix in sorted(base.iterdir()):
+            if not (prefix.is_dir() and _PREFIX_NAME.fullmatch(prefix.name)):
+                continue
+            for candidate in sorted(prefix.iterdir()):
+                if (
+                    _SHARD_NAME.fullmatch(candidate.name)
+                    and candidate.is_file()
+                    and candidate not in keep
+                ):
+                    candidate.unlink()
+
+
+def _manifest_bytes(manifest: Mapping[str, Any]) -> bytes:
+    return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _replace_shards(staged: Staged, stale: Sequence[str]) -> None:
+    output_dir = staged.output_dir
+    for document_id in staged.changed:
+        entry = staged.documents[document_id]
+        for kind, rows in _shard_files(entry):
+            final = _shard_path(output_dir, kind, entry["shard"])
+            if rows:
+                final.parent.mkdir(parents=True, exist_ok=True)
+                _shard_path(staged.stage_dir, kind, entry["shard"]).replace(final)
+            else:
+                final.unlink(missing_ok=True)
+    for document_id in stale:
+        entry = staged.prior.documents[document_id]
+        for kind, _rows in _shard_files(entry):
+            _shard_path(output_dir, kind, entry["shard"]).unlink(missing_ok=True)
+    for name in staged.prior.legacy_files:
+        (output_dir / name).unlink(missing_ok=True)
+    if not staged.prior.present:
+        # No manifest to say what is ours: a crash may have left shards behind.
+        keep = {
+            _shard_path(output_dir, kind, entry["shard"])
+            for entry in staged.documents.values()
+            for kind, rows in _shard_files(entry)
+            if rows
+        }
+        _sweep_unnamed(output_dir, keep)
+
+
+def commit_graph(staged: Staged) -> GraphExportResult:
+    """Make a staged export visible: replace the changed shards, remove the stale
+    ones, then write the manifest last, so a directory that has one is complete.
+
+    A document is stale when the previous manifest names it and this read did
+    not see it (or saw it with nothing to export). Removal happens here, after
+    the read succeeded, never during it.
+    """
+    manifest_path = staged.output_dir / GRAPH_MANIFEST_FILENAME
+    payload = _manifest_bytes(staged.manifest)
+    stale = sorted(set(staged.prior.documents) - set(staged.documents))
+    result = GraphExportResult(
+        output_dir=staged.output_dir,
+        documents=len(staged.documents),
+        node_rows=staged.manifest["totals"]["node_rows"],
+        edges=staged.manifest["totals"]["edges"],
+        edges_skipped=dict(staged.skipped),
+        shards_written=len(staged.changed),
+        shards_unchanged=staged.unchanged,
+        shards_removed=len(stale),
+    )
+    try:
+        if staged.changed or stale or staged.prior.legacy_files or not staged.prior.present:
+            # A manifest left by an earlier export would vouch for files about
+            # to be replaced, so it goes first.
+            manifest_path.unlink(missing_ok=True)
+            _replace_shards(staged, stale)
+            _write_file(manifest_path, payload)
+        elif manifest_path.read_bytes() != payload:
+            # Only the header moved (a model renamed, a skip count): no shard did.
+            _write_file(manifest_path, payload)
+    finally:
+        staged.discard()
+    return result
+
+
+def write_graph_export(
+    documents: Iterable[DocumentRows],
+    output_dir: Path,
+    *,
+    project: str,
+    linking_model: str,
+    relation_model: str,
+    context: GraphContext,
+) -> GraphExportResult:
+    """Stage and commit an export of an already-joined document stream."""
+    staged = stage_graph(
+        documents,
+        output_dir,
+        project=project,
+        linking_model=linking_model,
+        relation_model=relation_model,
+        context=context,
+    )
+    return commit_graph(staged)
+
+
+def _rows(snapshot: TableReadSnapshot) -> Iterator[dict[str, Any]]:
+    for batch in snapshot:
+        yield from batch.to_pylist()
 
 
 def export_graph(
@@ -368,10 +738,17 @@ def export_graph(
     linking_model: str,
     relation_model: str,
     entity_name: str,
+    output_dir: Path,
     target: str | None,
     profiles_dir: str | Path | None,
-) -> GraphExport:
-    """Read the two models through the active adapter and build the graph."""
+) -> GraphExportResult:
+    """Read the two models through the active adapter and write the graph.
+
+    Both tables stream through `table_snapshot`, ordered by `document_id`, so
+    no whole-table frame is built. The snapshots are validated when their
+    block exits and the files are committed only after that, so a table that
+    changed under the read leaves the previous export in place.
+    """
     from .adapters import create_adapter
     from .profile import resolve_profile
 
@@ -379,18 +756,60 @@ def export_graph(
     entity_name = _clean_entity_name(entity_name)
     project_path = Path(project_dir)
     project, _, _ = load_project(project_path)
+    context = GraphContext.create(entity_name, project.vocabularies, project.classes)
     resolved = resolve_profile(
         project, project_path, target=target,
         profiles_dir=Path(profiles_dir) if profiles_dir else None,
     )
-    with create_adapter(resolved.warehouse, project_dir=project_path) as adapter:
-        links = adapter.read_table(linking_model)
-        relations = adapter.read_table(relation_model)
-    return build_graph(
-        project=project.name,
-        links=links,
-        relations=relations,
-        entity_name=entity_name,
-        vocabularies=project.vocabularies,
-        classes=project.classes,
-    )
+    staged: Staged | None = None
+    try:
+        with create_adapter(resolved.warehouse, project_dir=project_path) as adapter:
+            link_available = adapter.read_table_schema(linking_model).columns
+            relation_available = adapter.read_table_schema(relation_model).columns
+            require_columns(link_available, LINK_COLUMNS, "linking model")
+            require_columns(relation_available, RELATION_COLUMNS, "relation model")
+            relation_columns = (
+                *RELATION_COLUMNS,
+                *(name for name in _OPTIONAL_RELATION_COLUMNS if name in relation_available),
+            )
+            with ExitStack() as stack:
+                # Ordered by document so one document at a time is resident (the
+                # bounded-memory contract). The key check refuses a repeated or
+                # null id before the first row, which also makes the order total.
+                try:
+                    links = stack.enter_context(
+                        adapter.table_snapshot(
+                            linking_model,
+                            columns=LINK_COLUMNS,
+                            batch_size=_READ_BATCH_ROWS,
+                            order_by=("document_id", "entity_link_id"),
+                            key_column="entity_link_id",
+                        )
+                    )
+                    relations = stack.enter_context(
+                        adapter.table_snapshot(
+                            relation_model,
+                            columns=relation_columns,
+                            batch_size=_READ_BATCH_ROWS,
+                            order_by=("document_id", "relation_id"),
+                            key_column="relation_id",
+                        )
+                    )
+                except AdapterError as error:
+                    raise GraphExportError(
+                        "could not read the linking and relation models for the "
+                        "graph export (entity_link_id and relation_id must each "
+                        f"be unique and non-null): {error}"
+                    ) from error
+                staged = stage_graph(
+                    merge_documents(_rows(links), _rows(relations)),
+                    output_dir,
+                    project=project.name,
+                    linking_model=linking_model,
+                    relation_model=relation_model,
+                    context=context,
+                )
+        return commit_graph(staged)
+    finally:
+        if staged is not None:
+            staged.discard()

@@ -62,12 +62,16 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+import duckdb
+import polars as pl
 import pytest
 
+from stel import graph_export as graph_export_module
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.execution import transform as transform_module
 from stel.execution.embed import _INPUT_BATCH_ROWS
 from stel.execution.llm import _INPUT_BATCH_ROWS as _LLM_INPUT_BATCH_ROWS
+from stel.graph_export import export_graph
 from stel.runner import run_project
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
@@ -176,16 +180,6 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         "mention-grain reads already here. The 8th is the #555 `--breakdown` "
         "model, at document grain -- one row per document, also smaller than "
         "the mention-grain linking read beside it",
-    ),
-    (
-        "graph_export.py",
-        "export_graph",
-        2,
-        EXCEPTION,
-        "an artifact export like the concept cloud, not a pipeline stage (#762, "
-        "ADR-0055): it reads the mention-grain links and the relation table whole "
-        "and rewrites the graph in full, so it is corpus-scale on a large project. "
-        "Incremental export is the deferred change that would bound it",
     ),
 )
 
@@ -772,3 +766,110 @@ def test_a_full_refresh_transform_is_the_recorded_exception(
         "a full refresh is expected to read every parent at once; if this now "
         "reads less, the exception recorded in _READ_TABLE_SITES is stale."
     )
+
+
+# ─── graph export residency (ALE-601, issue #807) ───────────────────────────
+
+
+def _graph_project(root: Path, *, docs: int) -> Path:
+    """A project whose warehouse already holds a link and a relation table: two
+    mentions and one relation per document, which is all the export reads."""
+    project = _embed_project(root, docs=0)
+    links: list[dict[str, str]] = []
+    relations: list[dict[str, str]] = []
+    for index in range(docs):
+        document = f"doc{index:03d}"
+        links += [
+            {
+                "entity_link_id": f"{document}-l{side}",
+                "document_id": document,
+                "mention_id": f"{document}-{side}",
+                "canonical_id": f"{side.upper()}{index}",
+                "entity_namespace": "systems",
+                "status": "matched",
+                "resolver": "alias_table",
+                "resolver_version": "1",
+            }
+            for side in ("a", "b")
+        ]
+        relations.append(
+            {
+                "relation_id": f"r-{document}",
+                "document_id": document,
+                "subject_mention_id": f"{document}-a",
+                "object_mention_id": f"{document}-b",
+                "relation_type": "co_occurs_with",
+                "directed": "false",
+                "method": "co_occurrence",
+                "status": "asserted",
+                "confidence": "0.5",
+                "sentence_index": "0",
+                "extractor": "co_occurrence",
+                "extractor_version": "1",
+            }
+        )
+    link_frame = pl.DataFrame(links)
+    relation_frame = pl.DataFrame(relations).with_columns(
+        pl.col("directed") == "true",
+        pl.col("confidence").cast(pl.Float64),
+        pl.col("sentence_index").cast(pl.Int64),
+    )
+    (project / "target").mkdir()
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        con.execute("create schema docs")
+        for name, frame in (("entity_links", link_frame), ("entity_relations", relation_frame)):
+            con.register("incoming", frame.to_arrow())
+            con.execute(f"create table docs.{name} as select * from incoming")
+            con.unregister("incoming")
+    finally:
+        con.close()
+    return project
+
+
+def _export_snapshot(project: Path, out: Path) -> dict[str, bytes]:
+    export_graph(
+        project,
+        linking_model="entity_links",
+        relation_model="entity_relations",
+        entity_name="system",
+        output_dir=out,
+        target=None,
+        profiles_dir=None,
+    )
+    return {
+        path.relative_to(out).as_posix(): path.read_bytes()
+        for path in sorted(out.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_graph_export_never_materializes_the_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ALE-601: both source reads stream, in batches, and the export is the same
+    whatever the batch size -- so a document whose rows straddle a batch edge
+    is joined correctly, which a read small enough to fit one batch could not
+    show.
+
+    The batch is shrunk below one document-pair's worth of rows per batch so the
+    40 documents arrive across many batches; `largest_frame_rows == 0` is the
+    absence of any whole-table frame, at any size.
+    """
+    project = _graph_project(tmp_path, docs=_CORPUS_DOCS)
+    expected = _export_snapshot(project, tmp_path / "whole")
+
+    monkeypatch.setattr(graph_export_module, "_READ_BATCH_ROWS", 7)
+    with _measure_residency(monkeypatch) as seen:
+        streamed = _export_snapshot(project, tmp_path / "streamed")
+
+    assert seen.largest_frame_rows == 0, (
+        f"graph export materialized a {seen.largest_frame_rows}-row frame via "
+        f"{seen.largest_frame_source}. Its reads are zero-row schema probes and "
+        "streamed snapshots (ALE-601); anything else is the corpus."
+    )
+    assert 0 < seen.largest_batch_rows <= 7, (
+        f"graph export held a {seen.largest_batch_rows}-row batch; the read "
+        "batch is what caps what is resident besides one document."
+    )
+    assert streamed == expected

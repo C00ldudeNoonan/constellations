@@ -14,6 +14,16 @@ models:
         language: en
         batch_size: 32
         include_fields: [publisher, published_at]
+        # Mixed-language corpus: replace `model`/`language` above with
+        # `language_routing` (see "NLP providers and language routing" in
+        # docs/reference.md). Each route needs its spaCy model installed.
+        #   language_routing:
+        #     language_field: lang          # or omit to detect from the text
+        #     routes:
+        #       en: {provider: spacy, model: en_core_web_sm}
+        #       de: {provider: spacy, model: de_core_news_sm}
+        #     on_undetected: skip
+        #     on_unrouted: skip
     materialization: full
     tags: [economic_data, nlp, tokens]
     tests:

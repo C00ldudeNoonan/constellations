@@ -5101,6 +5101,63 @@ excluded unless named in `include_fields`, and the raw text and document-ID
 source fields cannot be repeated through that option. See
 `examples/economic_nlp/` for a complete economic-document pipeline.
 
+### NLP providers and language routing
+
+`provider:` names an entry in the NLP provider registry (`spacy` ships). Each
+provider declares which capabilities it can emit (`tokens`, `lemmas`, `pos`,
+`entities`, `sentences`, `confidence`) and, when known, which languages it
+supports. `nlp_tokens` needs tokens, lemmas and POS; `nlp_entities` needs
+entities. An unknown provider, a missing capability or an unsupported language
+is a `stel compile` error, before any source is read or model loaded. Whether a
+model is installed, and which language it reports, is still checked when it
+loads, with the install command in the error. stel never downloads a model.
+
+A separately packaged provider registers through the `stel.nlp_providers.v1`
+entry-point group (the entry-point name is the provider name; the target is an
+`NLPProviderRegistration`). Duplicate names, a plugin claiming `spacy`, and a
+plugin that fails to import fail the run naming the distribution. See
+[ADR-0064](adr/0064-nlp-providers-register-declared-capabilities-and-languages-route-explicitly.md).
+
+For a mixed-language corpus, replace the single `provider`/`model`/`language`
+with `language_routing`:
+
+```yaml
+options:
+  document_id_field: document_id
+  text_field: text
+  language_routing:
+    language_field: lang        # optional; omit to detect from the text
+    routes:
+      en: {provider: spacy, model: en_core_web_sm}
+      de: {provider: spacy, model: de_core_news_sm}
+      zh-cn: {provider: spacy, model: zh_core_web_sm, language: zh}
+    on_undetected: skip         # fail (default) | skip | fallback
+    on_unrouted: fallback       # fail (default) | skip | fallback
+    fallback: {provider: spacy, model: xx_ent_wiki_sm, language: xx}
+```
+
+- A document's language is the `language_field` value (null or blank is
+  undetected) or, without the field, `detect_language` (the `text` extra;
+  deterministic, and text under 10 characters is undetected). Codes are
+  lowercased with `-` as the separator.
+- A route key matches the exact code, then its primary subtag (`zh-tw` uses the
+  `zh` route when there is no `zh-tw`). `language` on a route is the language
+  the model must report and defaults to the key's primary subtag; the fallback
+  must state it.
+- `fail` stops the run, naming the document ID and language but never its text,
+  before any model loads. `skip` emits no rows for the document. `fallback`
+  uses the one `fallback` route, which is required when either policy says
+  `fallback` and rejected otherwise.
+- `language_routing` cannot be combined with `provider`, `model`, `language` or
+  `disable`: those live on each route.
+- Each distinct route loads once and runs over its documents as one batch;
+  output keeps input order. Rows carry the five identity columns of the model
+  that analyzed them plus `nlp_route` (the matched key, or `fallback`),
+  `nlp_input_language` (the language routing acted on, null when none) and
+  `nlp_language_source` (`declared` or `detected`). Without `language_routing`
+  those three columns are not added. A column of that name cannot be projected
+  through `include_fields`.
+
 ### Entity linking to canonical identifiers
 
 `link_entities` resolves entity mentions (for example `nlp_entities` output

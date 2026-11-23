@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `nlp_tokens` and `nlp_entities` run through an NLP provider registry and can
+  route documents by language. `language_routing:` maps language codes to
+  `provider` + `model` routes, takes the language from an upstream
+  `language_field` or detects it, and handles an undeterminable language
+  (`on_undetected`) and a language with no route (`on_unrouted`) with `fail`,
+  `skip` or one `fallback` route. Routed output adds `nlp_route`,
+  `nlp_input_language` and `nlp_language_source`; unrouted output is unchanged.
+  Providers declare capabilities and languages, and `stel compile` rejects an
+  unknown provider, a missing capability or an unsupported language before any
+  model loads. A separately packaged provider registers through the
+  `stel.nlp_providers.v1` entry-point group; spaCy is the only provider that
+  ships (issue #222, ALE-309, ADR-0064).
 - `stel graph-export --format jsonld|turtle` writes the same graph as RDF, one
   standalone file per shard (`.jsonld`, `.ttl`), behind the existing `rdf`
   extra; `jsonl` stays the default. Entities are `urn:stel:entity:<entity_id>`,

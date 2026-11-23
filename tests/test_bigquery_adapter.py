@@ -1362,7 +1362,10 @@ def test_sigterm_unwinds_bigquery_writer_claim(
                     pool.submit(adapter.scalar, "SELECT 2").result()
                 raise
 
-    monkeypatch.setattr(f"stel.cli.{entry_point}", execute)
+    # The command imports its entry point inside its body (issue #818), so the
+    # patch goes on the module that owns it.
+    owner = "adopt" if entry_point == "adopt_project" else "runner"
+    monkeypatch.setattr(f"stel.{owner}.{entry_point}", execute)
     previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
     try:
         result = CliRunner().invoke(cli, [command, "--select", "docs"])

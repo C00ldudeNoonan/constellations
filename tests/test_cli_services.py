@@ -2,9 +2,9 @@
 
 The logic behind the Click commands is now importable without invoking the CLI.
 These tests exercise the shared bootstrap and the watch service directly —
-coverage that previously required spawning the `run --watch` command — and pin
-that `cli.py` still re-exports the moved symbols so command call sites and
-existing imports are unchanged.
+coverage that previously required spawning the `run --watch` command. `cli.py`
+imports these inside its command bodies (issue #818), so it holds no module-level
+alias to them.
 """
 
 from __future__ import annotations
@@ -15,22 +15,11 @@ from pathlib import Path
 import pytest
 from click.exceptions import ClickException
 
-import stel.cli as cli
 from stel.cli_services.context import (
-    CONFIG_ERRORS,
     ConfigClickError,
-    build_dag_or_click,
     load_project_or_click,
 )
 from stel.cli_services.watch import run_watch
-
-
-def test_cli_reexports_point_at_services() -> None:
-    assert cli._run_watch is run_watch
-    assert cli._load is load_project_or_click
-    assert cli._build_dag is build_dag_or_click
-    assert cli.ConfigClickError is ConfigClickError
-    assert cli._CONFIG_ERRORS is CONFIG_ERRORS
 
 
 def test_config_click_error_exits_two() -> None:

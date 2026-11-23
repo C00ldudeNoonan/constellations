@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `stel --version`, `stel --help` and every command's `--help` no longer load
+  the runner, compiler, warehouse adapters or a dataframe library: `cli.py`
+  imports each command's dependencies inside the command body, and a Click
+  option that needs a constant carries it as a literal pinned by a test.
+  `stel --version` drops from about 4.4 s to about 0.45 s on the Windows dev
+  machine. Behavior and messages are unchanged; an import error in one
+  command's dependencies now surfaces when that command runs, not at startup.
+  A contract test (`tests/test_cli_import_budget.py`) asserts module sets in a
+  subprocess, never timings (issue #818, ALE-790, theme ALE-789).
 - `stel graph-export --format graphiti` writes the records graphiti-core's own
   models take (an episode per document, entity nodes, `mentions` edges, and one
   fact per edge with its validity interval), and the new `stel graph-load`

@@ -225,8 +225,15 @@ Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one
 2. Wire through `ctx.obj["project_dir"]` / `profiles_dir` / `target` like the
    existing commands do.
 3. Raise `click.ClickException` from any `*Error` exception you catch.
-4. Update README's CLI section.
-5. **Test at least one complete, valid invocation end to end**, not only the
+4. **Import the command's dependencies inside its body**, not at the top of
+   `cli.py`: the module's docstring states the convention. `stel --help` and
+   `stel --version` must not load the runner, compiler, adapters or a dataframe
+   library, and a Click option that needs a constant carries it as a literal
+   that `tests/test_cli_literals.py` pins. `tests/test_cli_import_budget.py`
+   fails, naming the module, when a module-level import breaks the budget;
+   `--help` on your new command is covered without a new row.
+5. Update README's CLI section.
+6. **Test at least one complete, valid invocation end to end**, not only the
    refusals. Refusal tests are easy to write and easy to make exhaustive, so a
    command can end up with thorough coverage of every way it says no and none
    of the one path an operator actually takes. `stel mcp serve` had exactly

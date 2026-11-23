@@ -28,14 +28,8 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from stel.retrieval import (
-    CollectionSpec,
-    IndexedRow,
-    LanceDBConfig,
-    LanceDBStore,
-    RetrievalError,
-    StoreRole,
-)
+from stel.retrieval import CollectionSpec, IndexedRow, RetrievalError, StoreRole
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 from stel.retrieval.servability import index_extension_advisory
 
 SENTINEL = "gs://distinctive-bucket/prefix?token=distinctive-native-secret"

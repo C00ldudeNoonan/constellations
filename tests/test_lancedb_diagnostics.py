@@ -17,14 +17,8 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from stel.retrieval import (
-    CollectionSpec,
-    IndexedRow,
-    LanceDBStore,
-    RetrievalError,
-    StoreRole,
-    parse_store_config,
-)
+from stel.retrieval import CollectionSpec, IndexedRow, RetrievalError, StoreRole, parse_store_config
+from stel.retrieval.lancedb import LanceDBStore
 
 # Shaped like what LanceDB actually quotes back: an object-store URI carrying
 # a credential-looking query string. None of it may reach the message.

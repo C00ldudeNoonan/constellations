@@ -6,8 +6,9 @@ from typing import Any
 
 import polars as pl
 
+from ...relation_options import parse_relation_options
 from ...transforms import IncrementalContract, TransformContext
-from ..relations import get_relation_extractor, parse_relation_options
+from ..relations import get_relation_extractor
 from ._relations import (
     declared_relation_dependencies,
     declared_relation_incremental_contract,

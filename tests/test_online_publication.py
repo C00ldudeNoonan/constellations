@@ -10,12 +10,13 @@ import pytest
 
 from stel.adapters import create_adapter
 from stel.cli_services.serving import resolve_serving_scope
-from stel.retrieval import LanceDBStore, RetrievalError, ServingCoordinator, StoreRole
+from stel.retrieval import RetrievalError, ServingCoordinator, StoreRole
 from stel.retrieval.coordination import (
     ServingBusyError,
     ServingNotReadyError,
     StaleServingLeaseError,
 )
+from stel.retrieval.lancedb import LanceDBStore
 from stel.retrieval.retention import retire_superseded_generations
 from stel.runner import RunError, run_project
 from tests.support_retrieval import (

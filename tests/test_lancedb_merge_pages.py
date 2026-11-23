@@ -23,12 +23,11 @@ import pytest
 from stel.retrieval import (
     CollectionSpec,
     IndexedRow,
-    LanceDBStore,
     RetrievalFeature,
     StoreRole,
     parse_store_config,
 )
-from stel.retrieval.lancedb import MERGE_PAYLOAD_LIMIT_BYTES, _byte_bounded_slices
+from stel.retrieval.lancedb import MERGE_PAYLOAD_LIMIT_BYTES, LanceDBStore, _byte_bounded_slices
 
 PHYSICAL = "demo__dev__context"
 
@@ -261,7 +260,7 @@ def test_lancedb_proves_exact_receipts_instead(tmp_path: Path) -> None:
 def test_duckdb_still_claims_atomicity(tmp_path: Path) -> None:
     # The withdrawal is specific to the store that had to split, not a
     # general weakening: DuckDB's batch really is one transaction.
-    from stel.retrieval import DuckDBStore
+    from stel.retrieval.duckdb import DuckDBStore
 
     config = parse_store_config(
         {"type": "duckdb", "path": str(tmp_path / "retrieval.duckdb")}

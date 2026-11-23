@@ -13,15 +13,17 @@ from typing import Any
 
 import polars as pl
 
+from ...entity_link_options import (
+    AliasTableResolverOptions,
+    parse_entity_link_options,
+    parse_vocabulary_alias_source,
+)
 from ...transforms import IncrementalContract, TransformContext
 from ..linking import (
-    AliasTableResolverOptions,
     EntityResolver,
     LinkStatus,
     entity_link_id,
     get_resolver,
-    parse_entity_link_options,
-    parse_vocabulary_alias_source,
     vocabulary_alias_rows,
 )
 

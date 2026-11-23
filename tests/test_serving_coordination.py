@@ -14,7 +14,6 @@ from stel.adapters import StateScope, create_adapter, parse_warehouse_config
 from stel.config.profile import WarehouseConfig
 from stel.retrieval import (
     PUBLISHER_FENCING_FEATURES,
-    LanceDBStore,
     RetrievalError,
     ServingBusyError,
     ServingCoordinationError,
@@ -34,6 +33,7 @@ from stel.retrieval.coordination import (
     validate_safe_error_code,
 )
 from stel.retrieval.group_pins import GroupPinRequest, pin_group
+from stel.retrieval.lancedb import LanceDBStore
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
 # `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that

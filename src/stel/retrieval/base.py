@@ -10,12 +10,16 @@ from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType, TracebackType
-from typing import Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 
-import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from ..hashing import canonical_fingerprint
+
+if TYPE_CHECKING:
+    # Annotations only: validating a project must not import pyarrow
+    # (issue #823, ALE-791).
+    import pyarrow as pa
 
 
 class RetrievalError(Exception):

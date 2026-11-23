@@ -26,8 +26,6 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 # the supersession step's and `relations_as_of` agree on what a timestamp is.
 INSTANT_DTYPE = pl.Datetime("us", "UTC")
 
-SUPERSEDE_TRANSFORM_MODULE = "stel.text.transforms.supersede_relations"
-
 # Bump when the closing rule changes: a built-in transform has no project file
 # for `compute_model_code_version` to hash, so this is what re-keys a model
 # whose intervals would now come out differently.

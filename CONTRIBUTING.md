@@ -150,8 +150,10 @@ in stel's installed backend registry.
 The `link_entities` transform dispatches to a resolver selected by its
 `resolver:` option. To add one:
 
-1. Add a strict options model in `src/stel/text/linking.py` that subclasses
-   `_EntityLinkBaseOptions` (shared mention identity, privacy, and projection
+1. Add a strict options model in `src/stel/entity_link_options.py` (it imports
+   no resolver, so the compiler can validate options without loading
+   `stel.text`) that subclasses
+   `EntityLinkBaseOptions` (shared mention identity, privacy, and projection
    fields) with a `resolver: Literal["<name>"]` discriminator, then add it to
    the `EntityLinkConfig` union.
 2. Implement an `EntityResolver` (declaring the mention columns it reads and how
@@ -312,6 +314,22 @@ The current implementation boundaries are:
 
 Extend these boundaries through the existing adapter/provider seams and include
 contract tests for every supported implementation.
+
+Validating a project is configuration work and imports no dataframe library and
+only the active implementations (issue #823, ADR-0066). Three habits keep it so,
+and `tests/test_cli_import_budget.py` fails, naming the module, when one slips:
+
+- A built-in warehouse adapter or retrieval store is a row in `_BUILTIN_ADAPTERS`
+  (`adapters/registry.py`) or `_BUILTIN_STORES` (`retrieval/registry.py`), and its
+  module is imported the first time its type is named. Neither package `__init__`
+  imports an implementation module.
+- What the configuration layer and the compiler validate against, such as the
+  `AgentContextGrain` enum or the `link_entities` and relation option models,
+  lives in a module that imports no implementation (`agent_context_grain.py`,
+  `entity_link_options.py`, `relation_options.py`). Import it from there; the
+  implementation modules do not re-export it.
+- A module the compiler reaches imports polars and pyarrow only under
+  `TYPE_CHECKING` or inside the function that builds a frame.
 
 Warehouse consumers that can scale with relation size must use the typed
 `table_snapshot()` contract rather than assembling SQL or collecting

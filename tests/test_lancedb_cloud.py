@@ -17,9 +17,9 @@ import pytest
 
 from stel.credentials import CredentialReference
 from stel.hashing import canonical_fingerprint
-from stel.retrieval import LanceDBStore, RetrievalError, StoreRole, parse_store_config
+from stel.retrieval import RetrievalError, StoreRole, parse_store_config
 from stel.retrieval.base import RetrievalConfigError
-from stel.retrieval.lancedb import LanceDBConfig
+from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
 
 
 def _config(path: str, **extra: object) -> LanceDBConfig:

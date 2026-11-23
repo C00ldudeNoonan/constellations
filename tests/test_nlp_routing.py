@@ -594,6 +594,22 @@ def test_fail_policy_names_the_document_and_language_not_its_text() -> None:
     assert "['de', 'en']" in message
 
 
+def test_a_declared_value_that_is_not_a_language_code_never_reaches_an_error() -> None:
+    """The language column is upstream data and may hold document text; the
+    default `on_unrouted: fail` would otherwise interpolate it into an error
+    that lands in run artifacts (review of PR #816)."""
+    routing = _routing(language_field="lang")
+    secret = "Patient John Smith, SSN 123-45-6789"
+
+    observed = observed_language(routing, declared=secret, text="x")
+    assert observed is None
+    with pytest.raises(NLPRoutingError) as caught:
+        decide_route(routing, document_id="doc-7", observed=observed)
+
+    assert "John" not in str(caught.value)
+    assert "123-45" not in str(caught.value)
+
+
 def test_declared_language_is_normalized_and_blank_means_undetected() -> None:
     routing = _routing(language_field="lang")
 

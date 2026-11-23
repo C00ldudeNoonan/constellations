@@ -158,7 +158,11 @@ def observed_language(
     if routing.language_field is not None:
         if declared is None or not declared.strip():
             return None
-        return normalize_language_code(declared)
+        code = normalize_language_code(declared)
+        # A declared value is upstream data and may be free text, including
+        # document content; one that is not a language code is treated as
+        # undeclared so its contents never reach an error message or artifact.
+        return code if is_language_code(code) else None
     detected = (detect or detect_language)(text)
     return normalize_language_code(detected) if detected else None
 
@@ -177,7 +181,8 @@ def decide_route(
             routing.on_undetected,
             source,
             observed,
-            f"Document '{document_id}' has no determinable language",
+            f"Document '{document_id}' has no determinable language "
+            "(or a declared value that is not a language code)",
         )
     for key in (observed, primary_language(observed)):
         if key in routing.routes:

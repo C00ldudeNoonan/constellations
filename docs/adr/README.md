@@ -76,6 +76,7 @@ history (issue #311).
 | [0064](0064-nlp-providers-register-declared-capabilities-and-languages-route-explicitly.md) | NLP providers register declared capabilities and languages through a registry (built-in and entry point), and language routing is an explicit project mapping with fail/skip/fallback policies, not environment-chosen models or vendor branches | accepted |
 | [0065](0065-graph-export-graphiti-is-a-record-format-with-a-loader-behind-the-graphiti-extra.md) | Graph export for Graphiti is a record format with a loader (`graph-load`) behind the `graphiti` extra; valid time in the file, transaction time stamped at load | accepted, amends 0055, 0061 and 0063 |
 | [0066](0066-built-in-adapters-and-stores-resolve-by-type-on-first-use.md) | Built-in warehouse adapters and retrieval stores resolve by type on first use, and what validation checks lives in modules that import no implementation, so reading a project imports no dataframe library and only the active adapter | accepted |
+| [0067](0067-summary-pages-are-an-offline-experiment-and-adoption-is-deferred.md) | Summary pages are evaluated offline on frozen governed evidence; a `page:` model type is deferred until a reviewed held-out run | accepted |
 
 ## When to write one
 

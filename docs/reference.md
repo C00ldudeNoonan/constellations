@@ -1404,6 +1404,15 @@ separate from `stel eval` and does not change MCP serving. See the runnable
 reviews remain null; synthetic packing results do not establish a model-quality
 winner or select a production policy.
 
+**Summary page experiments.** The experimental library can build one
+source-linked extractive page per document version, inside one authorization
+scope, and compare passages against pages plus passages under one token
+budget. There is no `page:` model type and MCP serving is unchanged; the
+recorded decision is to defer. See the runnable
+[offline example](../examples/summary_pages/README.md),
+[contract](architecture/summary-pages.md) and
+[ADR 0067](adr/0067-summary-pages-are-an-offline-experiment-and-adoption-is-deferred.md).
+
 **When the experiment ends.** Keep the winner by dropping the axis and
 writing its value into the base model. That is a `code_version` change, so
 run `stel plan` first: the base model's own state is stale and reprocesses,

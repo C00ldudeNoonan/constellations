@@ -764,6 +764,49 @@ def test_cached_response_does_not_consume_reserved_call_budget(tmp_path: Path) -
     assert ledger.snapshot()["api_calls"] == 1
 
 
+@pytest.mark.parametrize("reported_cost, expected_cost", [(None, 1.0), (1.2, 1.2)])
+def test_billed_failure_counts_against_spend_budget(
+    reported_cost: float | None, expected_cost: float
+) -> None:
+    """A billed failure must stop the next call when it exhausts the cap (#795)."""
+    from stel.backends.llm_backend import extract_fields_with_usage
+    from stel.budget import BudgetExceededError, BudgetGuard, BudgetLedger, LLMBudgetConfig
+    from stel.providers import InferenceFailure, ProviderError, ProviderUsage
+
+    calls = 0
+
+    def failing(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise ProviderError("failed", safe_for_display=True).attach_failure(
+            InferenceFailure(
+                error_code="invalid_response",
+                usage=ProviderUsage(
+                    input_tokens=10, output_tokens=2, reported_cost_usd=reported_cost
+                ),
+                billed_requests=2,
+                provider="test",
+                model="test",
+                implementation_identity="test",
+            )
+        )
+
+    ledger = BudgetLedger(LLMBudgetConfig(max_cost_usd=1.0), scope="run")
+    guard = BudgetGuard(None, ledger, cost_estimator=lambda usage: 1.0)
+    with pytest.raises(ProviderError, match="failed"):
+        extract_fields_with_usage(
+            "first", fields_spec=[{"name": "x"}], call_api=failing, budget=guard
+        )
+    assert ledger.snapshot()["input_tokens"] == 10
+    assert ledger.snapshot()["cost_usd"] == expected_cost
+    assert ledger.snapshot()["api_calls"] == 2
+    with pytest.raises(BudgetExceededError, match="max_cost_usd"):
+        extract_fields_with_usage(
+            "second", fields_spec=[{"name": "x"}], call_api=failing, budget=guard
+        )
+    assert calls == 1
+
+
 def test_failed_provider_call_keeps_its_reservation_without_masking_error() -> None:
     """A failed submission may have billed, so its reservation fails safe."""
     from stel.backends.llm_backend import extract_fields_with_usage

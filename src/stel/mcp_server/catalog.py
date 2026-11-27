@@ -54,6 +54,9 @@ class ContextResource:
     context_relation: str
     registry_relation: str
     entity_relations: tuple[str, ...]
+    # `context_entity_edges` descendants of the context model: the facts
+    # `get_entity_neighbors` walks. Empty when the project declares none.
+    edge_relations: tuple[str, ...]
     schema_fields: tuple[ContextField, ...]
     business_filters: tuple[FilterCapability, ...]
     policy_attributes: tuple[PolicyAttribute, ...]
@@ -251,6 +254,11 @@ class ArtifactCatalog:
                 for candidate in _reachable(context_id, successors)
                 if _contract_grain(models.get(candidate)) == "context_entity_links"
             )
+            edge_ids = sorted(
+                candidate
+                for candidate in _reachable(context_id, successors)
+                if _contract_grain(models.get(candidate)) == "context_entity_edges"
+            )
             attributes = serving.get("attributes")
             if not isinstance(attributes, list):
                 attributes = []
@@ -296,6 +304,9 @@ class ArtifactCatalog:
                     registry_relation=_relation_name(registry_model),
                     entity_relations=tuple(
                         _relation_name(models[entity_id]) for entity_id in entity_ids
+                    ),
+                    edge_relations=tuple(
+                        _relation_name(models[edge_id]) for edge_id in edge_ids
                     ),
                     schema_fields=_schema_fields(context_descriptor),
                     business_filters=business_filters,
@@ -393,11 +404,13 @@ def _group_resources(
         for resource in visible[1:]:
             if (resource.access, resource.policy_attributes, resource.context_relation,
                 resource.registry_relation, resource.business_filters, resource.id_field,
-                resource.entity_relations, resource.schema_fields, resource.modes,
+                resource.entity_relations, resource.edge_relations,
+                resource.schema_fields, resource.modes,
                 resource.consistency, resource.store_type) != (
                 first.access, first.policy_attributes, first.context_relation,
                 first.registry_relation, first.business_filters, first.id_field,
-                first.entity_relations, first.schema_fields, first.modes,
+                first.entity_relations, first.edge_relations,
+                first.schema_fields, first.modes,
                 first.consistency, first.store_type,
             ):
                 raise ArtifactCatalogError("A search group's context contracts differ; recompile")

@@ -531,6 +531,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("dbt-ml-agent-context-document", 1, "9a7d138624cf31cbd52ea165510dca30"),
     ("dbt-ml-agent-context-document-version", 1, "f14d8f4b9acb0001224fbbd22286c57c"),
     ("dbt-ml-agent-context-entity", 1, "3e26c34b20f0dcd611feeb3c98a69762"),
+    ("dbt-ml-agent-context-entity-edge", 1, "e0bc59585f903fc7516b709027394c78"),
     ("dbt-ml-agent-context-entity-link", 1, "72d2f5e8f67c079e4b1e9a258b7841c5"),
     ("dbt-ml-agent-context-policy", 1, "91be9ce477d543dd69a1151e7bb89f9a"),
     ("dbt-ml-agent-context-provenance", 1, "4ca78cd7a241eee1e26d544d9880d36b"),

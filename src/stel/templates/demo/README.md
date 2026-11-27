@@ -11,7 +11,7 @@ DuckDB's `vss` and `fts` search extensions, once; after that it runs offline.
 stel build
 ```
 
-That command runs 13 models and then every test they declare, in a few
+That command runs 14 models and then every test they declare, in a few
 seconds. The rest of this page walks through what it built and what you can
 do with it.
 
@@ -25,6 +25,7 @@ raw_docs, raw_tickets
                  ├─ chunk_embeddings ─ knowledge_search
                  └─ entity_mentions
                       ├─ entity_relations
+                      │    └─ context_entity_edges (also reads entity_links)
                       └─ entity_links
                            ├─ context_entity_links
                            ├─ system_health   (SQL)
@@ -43,6 +44,7 @@ raw_docs, raw_tickets
 | `entity_links` | Each mention resolved to its canonical system: "checkout API" is the Payments API. |
 | `entity_relations` | Two systems named in the same sentence. |
 | `context_entity_links` | Which passages are about which system, for agents. |
+| `context_entity_edges` | Which systems are related, and the passage that says so, for agents. |
 | `system_health` | Plain SQL over the above: postmortems and tickets per system. |
 | `system_names` | Each system's name, description, and class, for the star map. |
 
@@ -174,6 +176,11 @@ claude mcp add __PROJECT_NAME__ -e STEL_MCP_PRINCIPAL_ID=me -- stel --project-di
 Then ask: *"Has checkout broken like this before? Cite the postmortem."* An agent
 can also scope a search to what the project declares, such as
 `{"entity_scope": {"class": "datastore"}}` for passages about any datastore.
+
+To ask what a system is related to, an agent calls `get_entity_neighbors`, for
+example `{"model": "knowledge_search", "term": "Payments API", "hops": 2}`. Each
+edge names the two systems, the relation, and the postmortem or runbook section
+that says so; the second hop is reached through a system the first hop found.
 
 ## 7. Make it yours
 

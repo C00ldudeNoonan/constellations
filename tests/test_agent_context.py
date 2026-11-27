@@ -32,12 +32,14 @@ from stel.agent_context import (
     make_entity_id,
     make_provenance_fingerprint,
     policy_fingerprint,
+    project_context_entity_edge,
     project_document_chunk_row,
     project_document_registry_row,
     project_entity_link,
     retrieval_projection_fingerprint,
     validate_agent_context_frame,
     validate_agent_context_relations,
+    validate_context_entity_edges,
 )
 from stel.agent_context_grain import AgentContextGrain
 from stel.config.model import ModelConfig
@@ -925,3 +927,87 @@ def test_citation_round_trip_and_duckdb_as_of_fixture(tmp_path: Path) -> None:
         "char_end": 151,
         "extra": {"paragraph": 3},
     }
+
+
+# ─── context_entity_edges (issue #796, ALE-424) ─────────────────────────────
+
+
+def _edge(context_id: str, **overrides: Any) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "context_id": context_id,
+        "relation_id": "rel-1",
+        "relation_type": "owns",
+        "directed": True,
+        "subject_namespace": "systems",
+        "subject_name": "system",
+        "subject_canonical_id": "Payments API",
+        "object_namespace": "systems",
+        "object_name": "system",
+        "object_canonical_id": "Postgres",
+        "recorded_from": _T0,
+        "valid_from": _T0,
+    }
+    return project_context_entity_edge(**{**arguments, **overrides})
+
+
+def test_an_edge_endpoint_carries_the_entity_id_a_link_carries() -> None:
+    """The shared id is what lets a caller join an edge endpoint to the links
+    `search_context` returns without either side knowing the other's schema."""
+    chunk = _chunk(_document())
+    link = project_entity_link(
+        context_id=chunk["context_id"],
+        entity_namespace="systems",
+        entity_name="system",
+        canonical_id="Payments API",
+        relationship_type="mentions",
+        link_method="deterministic:v1",
+        recorded_from=_T0,
+    )
+    edge = _edge(chunk["context_id"])
+
+    assert edge["subject_entity_id"] == link["entity_id"]
+    assert edge["subject_entity_key"] == link["entity_key"]
+    validate_agent_context_frame(pl.DataFrame([edge]), AgentContextGrain.CONTEXT_ENTITY_EDGES)
+
+
+def test_an_edge_with_no_valid_from_publishes_with_unknown_validity() -> None:
+    edge = _edge(_chunk(_document())["context_id"], valid_from=None)
+
+    assert edge["validity_known"] is False
+    validate_agent_context_frame(pl.DataFrame([edge]), AgentContextGrain.CONTEXT_ENTITY_EDGES)
+    with pytest.raises(ValueError, match="valid_to requires valid_from"):
+        _edge(edge["context_id"], valid_from=None, valid_to=_T0)
+
+
+def test_an_edge_interval_must_run_forward() -> None:
+    edge = _edge(_chunk(_document())["context_id"], valid_to=_T0)
+
+    with pytest.raises(AgentContextValidationError, match="valid"):
+        validate_agent_context_frame(pl.DataFrame([edge]), AgentContextGrain.CONTEXT_ENTITY_EDGES)
+
+
+def test_an_edge_whose_ids_do_not_derive_from_its_content_is_refused() -> None:
+    edge = _edge(_chunk(_document())["context_id"])
+    for field in ("context_entity_edge_id", "subject_entity_id", "object_entity_id"):
+        with pytest.raises(AgentContextValidationError, match=field):
+            validate_agent_context_frame(
+                pl.DataFrame([dict(edge, **{field: "0" * 32})]),
+                AgentContextGrain.CONTEXT_ENTITY_EDGES,
+            )
+
+
+def test_an_edge_naming_an_unresolved_context_fails_publication() -> None:
+    chunk = _chunk(_document())
+    chunks = pl.DataFrame([chunk])
+
+    validate_context_entity_edges(pl.DataFrame([_edge(chunk["context_id"])]), chunks)
+    with pytest.raises(AgentContextValidationError, match="unresolved context_id"):
+        validate_context_entity_edges(pl.DataFrame([_edge("1" * 32)]), chunks)
+
+
+def test_the_edge_contract_is_published_in_the_descriptor() -> None:
+    descriptor = contract_descriptor("context_entity_edges")
+
+    assert descriptor["contract"] == AGENT_CONTEXT_CONTRACT
+    assert descriptor["primary_key"] == ["context_entity_edge_id"]
+    assert descriptor["foreign_keys"] == {"context_id": "document_chunks.context_id"}

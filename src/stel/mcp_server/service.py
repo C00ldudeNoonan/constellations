@@ -68,6 +68,7 @@ from .contracts import (
     ContextLineageRecord,
     DocumentChunk,
     DocumentSource,
+    EntityEdge,
     EntityExpansion,
     EntityScope,
     FreshnessDescriptor,
@@ -75,6 +76,9 @@ from .contracts import (
     GetContextLineageResponse,
     GetDocumentRequest,
     GetDocumentResponse,
+    GetEntityNeighborsRequest,
+    GetEntityNeighborsResponse,
+    GraphEntity,
     LineageReferenceType,
     ListContextModelsRequest,
     ListContextModelsResponse,
@@ -95,6 +99,7 @@ from .grants import (
     WarehouseGrantStore,
     WarehouseIdentityResolver,
 )
+from .neighbors import edge_direction, edge_holds_at, edge_sort_key
 from .repository import (
     ContextRepository,
     ContextRepositoryError,
@@ -122,6 +127,9 @@ class ContextServerSettings(BaseModel):
     max_chunk_bytes: int = Field(default=16_000, ge=64, le=1_000_000)
     max_response_bytes: int = Field(default=256_000, ge=1024, le=10_000_000)
     max_scan_rows: int = Field(default=10_000, ge=1, le=1_000_000)
+    # Ceiling on `get_entity_neighbors`'s `limit`: the edges one call may return
+    # across all hops, so a hub entity cannot flood a context window.
+    max_neighbor_edges: int = Field(default=100, ge=1, le=200)
     timeout_seconds: float = Field(
         default=DEFAULT_CONTEXT_TIMEOUT_SECONDS,
         gt=0,
@@ -856,6 +864,25 @@ class ContextService:
             },
         )
 
+    def get_entity_neighbors(
+        self,
+        request: GetEntityNeighborsRequest,
+        *,
+        caller: CallerInfo | None = None,
+    ) -> GetEntityNeighborsResponse:
+        pending: list[Mapping[str, Any]] = []
+        return self._respond_and_log(
+            lambda: self._get_entity_neighbors(request, pending, caller),
+            lambda error: GetEntityNeighborsResponse(error=error),
+            pending=pending,
+            error_row=lambda error: self._base_log_row("get_entity_neighbors", caller)
+            | {
+                "model_name": request.model,
+                "target_id": request.entity_id or request.term,
+                "error_code": error.code.value,
+            },
+        )
+
     def _respond(
         self,
         operation: Callable[[], ResponseT],
@@ -1566,6 +1593,280 @@ class ContextService:
             )
         raise _not_found_or_denied()
 
+    def _get_entity_neighbors(
+        self,
+        request: GetEntityNeighborsRequest,
+        pending_log: list[Mapping[str, Any]] | None = None,
+        caller: CallerInfo | None = None,
+    ) -> GetEntityNeighborsResponse:
+        """Walk `context_entity_edges` outward from one entity (issue #796).
+
+        Authorization is per edge and happens before an edge can be returned
+        *or* walked through: an edge is served only if the caller may read the
+        registry row and chunk of the context that asserts it, which is the test
+        `search_context` applies to a hit. Walking only authorized edges is what
+        keeps a hidden first-hop edge from revealing a visible second-hop one.
+        A caller who cannot see the model gets the denial search gives.
+
+        The result is bounded three ways. `hops` is at most 3; `limit` caps the
+        edges returned across all hops and `truncated` says when it bit; and
+        every read carries `max_scan_rows`, so a hub whose edges outnumber the
+        scan budget fails with a limit error rather than a quietly partial graph.
+        """
+        started = monotonic()
+        authorized = self._authorize_resource(request.model)
+        resource = authorized.resource
+        if not resource.edge_relations:
+            raise ContextServiceError(
+                MCPErrorCode.CAPABILITY_UNAVAILABLE,
+                "This context model publishes no context_entity_edges, so it has "
+                "no entity neighborhoods to walk",
+            )
+        identity = authorized.warehouse_identity
+        cap = min(request.limit, self._settings.max_neighbor_edges)
+        frontier = self._neighbor_start_ids(request, resource, identity)
+        visited = set(frontier)
+        taken: list[tuple[int, str, Mapping[str, Any], Mapping[str, Any]]] = []
+        seen_edges: set[str] = set()
+        truncated = False
+        for hop in range(1, request.hops + 1):
+            if not frontier:
+                break
+            candidates = {
+                edge_id: row
+                for edge_id, row in self._edges_touching(
+                    resource, frontier, request, identity
+                ).items()
+                if edge_id not in seen_edges and edge_holds_at(row, request.as_of)
+            }
+            readable = self._readable_edge_contexts(
+                resource, authorized, {str(row["context_id"]) for row in candidates.values()}
+            )
+            edges = sorted(
+                (row for row in candidates.values() if str(row["context_id"]) in readable),
+                key=edge_sort_key,
+            )
+            room = cap - len(taken)
+            if len(edges) > room:
+                truncated = True
+                edges = edges[:room]
+            reached: set[str] = set()
+            for row in edges:
+                subject = str(row["subject_entity_id"])
+                source = subject if subject in frontier else str(row["object_entity_id"])
+                target = (
+                    str(row["object_entity_id"]) if source == subject else subject
+                )
+                seen_edges.add(str(row["context_entity_edge_id"]))
+                chunk = readable[str(row["context_id"])]
+                taken.append((hop, source, row, chunk))
+                if target not in visited:
+                    reached.add(target)
+            visited |= reached
+            frontier = reached
+            if truncated:
+                break
+        response_edges = tuple(
+            self._neighbor_edge(hop, source, row, chunk)
+            for hop, source, row, chunk in taken
+        )
+        starts = {
+            source: _graph_entity(
+                row, "subject" if str(row["subject_entity_id"]) == source else "object"
+            )
+            for hop, source, row, _ in taken
+            if hop == 1
+        }
+        if pending_log is not None:
+            pending_log.append(
+                self._base_log_row("get_entity_neighbors", caller)
+                | {
+                    "principal_id": authorized.principal.subject_id,
+                    "tenant_id": _authorizing_tenant(authorized.policy_filters),
+                    "model_name": resource.name,
+                    "target_id": request.entity_id or request.term,
+                    "requested_limit": request.limit,
+                    "result_count": len(response_edges),
+                    "zero_results": not response_edges,
+                    "returned_chunk_ids": sorted(
+                        {_required_string(chunk, "chunk_id") for _, _, _, chunk in taken}
+                    ),
+                    "elapsed_ms": round((monotonic() - started) * 1000, 3),
+                }
+            )
+        return GetEntityNeighborsResponse(
+            start=tuple(starts[key] for key in sorted(starts)),
+            edges=response_edges,
+            hops=request.hops,
+            as_of=request.as_of,
+            truncated=truncated,
+        )
+
+    def _neighbor_start_ids(
+        self,
+        request: GetEntityNeighborsRequest,
+        resource: ContextResource,
+        identity: WarehouseIdentity,
+    ) -> set[str]:
+        """The entity ids a walk starts from.
+
+        An `entity_id` is itself. A `term` is a declared vocabulary label, and
+        names the entities whose `(namespace, key)` is `(vocabulary, label)` --
+        the reading of a row `entity_scope` uses. A label declared in two
+        vocabularies is refused, never guessed at: an agent that asked for
+        "Postgres" and was walked from another system's would not know.
+        """
+        if request.entity_id is not None:
+            return {request.entity_id}
+        term = request.term
+        assert term is not None  # the request validator permits no third case
+        vocabularies = self._catalog.vocabularies
+        if not vocabularies:
+            raise ContextServiceError(
+                MCPErrorCode.CAPABILITY_UNAVAILABLE,
+                "term lookup requires the project to declare `vocabularies:`; "
+                "this one declares none. Pass entity_id instead",
+            )
+        holders = sorted(
+            name
+            for name, vocabulary in vocabularies.items()
+            if any(item.label == term for item in vocabulary.terms)
+        )
+        if not holders:
+            raise ContextServiceError(
+                MCPErrorCode.INVALID_REQUEST,
+                f"'{term}' is not a declared vocabulary term. The declared "
+                "terms are published as a context model's `entity_types`.",
+            )
+        if len(holders) > 1:
+            raise ContextServiceError(
+                MCPErrorCode.INVALID_REQUEST,
+                f"'{term}' is declared in more than one vocabulary "
+                f"({', '.join(holders)}); pass entity_id to say which",
+            )
+        key = canonical_entity_key(term)
+        found: set[str] = set()
+        for relation in resource.edge_relations:
+            for side in ("subject", "object"):
+                rows = self._repository.read_rows(
+                    relation,
+                    identity=identity,
+                    predicates=(
+                        _eq(f"{side}_entity_namespace", holders[0]),
+                        _eq(f"{side}_entity_key", key),
+                        _is_null("recorded_to"),
+                    ),
+                    max_rows=self._settings.max_scan_rows,
+                )
+                found.update(
+                    str(row[f"{side}_entity_id"])
+                    for row in rows
+                    if isinstance(row.get(f"{side}_entity_id"), str)
+                )
+        return found
+
+    def _edges_touching(
+        self,
+        resource: ContextResource,
+        frontier: set[str],
+        request: GetEntityNeighborsRequest,
+        identity: WarehouseIdentity,
+    ) -> dict[str, Mapping[str, Any]]:
+        """Current edges with an endpoint in `frontier`, by edge id.
+
+        Both ends are read: a fact `A owns B` is as much a neighbor of B as of A,
+        and `direction` is what tells the caller which way it points.
+        """
+        values = tuple(sorted(frontier))
+        rows: dict[str, Mapping[str, Any]] = {}
+        for relation in resource.edge_relations:
+            for side in ("subject", "object"):
+                predicates = [
+                    _in(f"{side}_entity_id", values),
+                    _is_null("recorded_to"),
+                ]
+                if request.relation_types:
+                    predicates.append(_in("relation_type", request.relation_types))
+                for row in self._repository.read_rows(
+                    relation,
+                    identity=identity,
+                    predicates=tuple(predicates),
+                    max_rows=self._settings.max_scan_rows,
+                ):
+                    edge_id = row.get("context_entity_edge_id")
+                    if isinstance(edge_id, str):
+                        rows[edge_id] = row
+        return rows
+
+    def _readable_edge_contexts(
+        self,
+        resource: ContextResource,
+        authorized: _AuthorizedResource,
+        context_ids: set[str],
+    ) -> dict[str, Mapping[str, Any]]:
+        """The chunk row of each asserting context the caller may read.
+
+        A context that is missing, ambiguous or denied is absent, so the edges it
+        asserts are neither returned nor walked."""
+        if not context_ids:
+            return {}
+        identity = authorized.warehouse_identity
+        chunks: dict[str, list[Mapping[str, Any]]] = {}
+        for row in self._repository.read_rows(
+            resource.context_relation,
+            identity=identity,
+            predicates=(_in("context_id", tuple(sorted(context_ids))),),
+            max_rows=self._settings.max_scan_rows,
+        ):
+            if isinstance(row.get("context_id"), str):
+                chunks.setdefault(str(row["context_id"]), []).append(row)
+        versions = {
+            str(row["document_version_id"])
+            for rows in chunks.values()
+            for row in rows
+            if isinstance(row.get("document_version_id"), str)
+        }
+        registry = self._registry_by_versions(resource, versions, identity=identity)
+        readable: dict[str, Mapping[str, Any]] = {}
+        for context_id, rows in chunks.items():
+            if len(rows) != 1:
+                continue
+            chunk = rows[0]
+            document = registry.get(str(chunk.get("document_version_id")))
+            if (
+                document is not None
+                and document.get("document_id") == chunk.get("document_id")
+                and self._can_read_pair(resource, authorized.principal, document, chunk)
+            ):
+                readable[context_id] = chunk
+        return readable
+
+    @staticmethod
+    def _neighbor_edge(
+        hop: int,
+        source: str,
+        row: Mapping[str, Any],
+        chunk: Mapping[str, Any],
+    ) -> EntityEdge:
+        subject_is_source = str(row["subject_entity_id"]) == source
+        return EntityEdge(
+            edge_id=_required_string(row, "context_entity_edge_id"),
+            hop=hop,
+            relation_type=_required_string(row, "relation_type"),
+            direction=edge_direction(row, source),
+            source=_graph_entity(row, "subject" if subject_is_source else "object"),
+            target=_graph_entity(row, "object" if subject_is_source else "subject"),
+            relation_id=_required_string(row, "relation_id"),
+            confidence=(
+                float(row["confidence"]) if row.get("confidence") is not None else None
+            ),
+            interval=_interval(row),
+            context_id=_required_string(chunk, "context_id"),
+            document_id=_required_string(chunk, "document_id"),
+            document_version_id=_required_string(chunk, "document_version_id"),
+            citation=_citation(chunk),
+        )
+
     def _business_filter(
         self,
         resource: ContextResource,
@@ -2218,6 +2519,21 @@ def _entity(row: Mapping[str, Any]) -> ContextEntity:
         confidence=(
             float(row["confidence"]) if row.get("confidence") is not None else None
         ),
+    )
+
+
+def _graph_entity(row: Mapping[str, Any], side: str) -> GraphEntity:
+    key = row.get(f"{side}_entity_key")
+    if isinstance(key, str):
+        try:
+            key = json.loads(key)
+        except json.JSONDecodeError:
+            pass
+    return GraphEntity(
+        namespace=_required_string(row, f"{side}_entity_namespace"),
+        name=_required_string(row, f"{side}_entity_name"),
+        entity_id=_required_string(row, f"{side}_entity_id"),
+        entity_key=cast(Any, key),
     )
 
 

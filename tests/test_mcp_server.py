@@ -23,7 +23,10 @@ from stel.adapters.base import (
 )
 from stel.agent_context import (
     FreshnessStatus,
+    canonical_entity_key,
     contract_descriptor,
+    make_entity_id,
+    project_context_entity_edge,
     project_entity_link,
 )
 from stel.agent_context_grain import AgentContextGrain
@@ -45,6 +48,7 @@ from stel.mcp_server.contracts import (
     FilterOperator,
     GetContextLineageRequest,
     GetDocumentRequest,
+    GetEntityNeighborsRequest,
     LineageReferenceType,
     ListContextModelsRequest,
     MCPErrorCode,
@@ -52,7 +56,7 @@ from stel.mcp_server.contracts import (
     SearchContextResponse,
 )
 from stel.mcp_server.grants import WarehouseIdentityResolver
-from stel.mcp_server.repository import ContextRepositoryError
+from stel.mcp_server.repository import ContextRepositoryError, ContextRepositoryLimitError
 from stel.mcp_server.server import create_mcp_server
 from stel.mcp_server.service import (
     ContextSearch,
@@ -242,10 +246,12 @@ def _artifact_catalog(
     vocabularies: Mapping[str, Vocabulary] | None = None,
     stale_after_seconds: int | None = None,
     class_declarations: list[str | dict[str, str]] | None = None,
+    with_edges: bool = True,
 ) -> ArtifactCatalog:
     registry_id = "model.context_demo.document_registry"
     chunks_id = "model.context_demo.document_chunks"
     links_id = "model.context_demo.context_entity_links"
+    edges_id = "model.context_demo.context_entity_edges"
     embed_id = "model.context_demo.context_embeddings"
     search_id = "search_index.context_demo.context_search"
     manifest = {
@@ -336,6 +342,16 @@ def _artifact_catalog(
             ],
         },
     }
+    if with_edges:
+        manifest["models"].append(
+            _context_model(
+                "context_entity_edges",
+                edges_id,
+                AgentContextGrain.CONTEXT_ENTITY_EDGES,
+            )
+        )
+        manifest["dag"]["execution_order"].append(edges_id)
+        manifest["dag"]["edges"].append([chunks_id, edges_id])
     if with_public_model:
         public_id = "search_index.context_demo.public_search"
         manifest["models"].append(
@@ -655,6 +671,7 @@ def _service(
     vocabularies: Mapping[str, Vocabulary] | None = None,
     stale_after_seconds: int | None = None,
     class_declarations: list[str | dict[str, str]] | None = None,
+    with_edges: bool = True,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
@@ -663,6 +680,7 @@ def _service(
             vocabularies=vocabularies,
             stale_after_seconds=stale_after_seconds,
             class_declarations=class_declarations,
+            with_edges=with_edges,
         ),
         repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
@@ -1671,7 +1689,7 @@ def test_lineage_is_authorized_and_uses_safe_artifact_identities() -> None:
 
 
 @pytest.mark.anyio
-async def test_mcp_protocol_discovers_exactly_four_read_only_tools() -> None:
+async def test_mcp_protocol_discovers_exactly_five_read_only_tools() -> None:
     from mcp import Client
 
     
@@ -1688,6 +1706,7 @@ async def test_mcp_protocol_discovers_exactly_four_read_only_tools() -> None:
                 "search_context",
                 "get_document",
                 "get_context_lineage",
+                "get_entity_neighbors",
             }
             search_tool = next(
                 tool for tool in tools.tools if tool.name == "search_context"
@@ -3224,3 +3243,434 @@ def test_group_catalog_lists_one_resource_and_keeps_members_addressable() -> Non
     entry["version"] = "wrong"
     with pytest.raises(ArtifactCatalogError, match="invalid"):
         _group_resources({"search_groups": [entry]}, resources)
+
+
+# ─── get_entity_neighbors (issue #796, ALE-424) ─────────────────────────────
+
+_RECORDED = datetime(2026, 7, 1, tzinfo=UTC)
+_NS = "markets"
+_JAN = datetime(2026, 1, 1, tzinfo=UTC)
+_JUNE = datetime(2026, 6, 1, tzinfo=UTC)
+_TICK = timedelta(microseconds=1)
+
+
+def _eid(label: str) -> str:
+    return make_entity_id(_NS, "instrument", canonical_entity_key(label))
+
+
+def _edge_row(
+    context_id: str,
+    relation_id: str,
+    relation_type: str,
+    subject: str,
+    obj: str,
+    *,
+    directed: bool = True,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+) -> Mapping[str, Any]:
+    return project_context_entity_edge(
+        context_id=context_id,
+        relation_id=relation_id,
+        relation_type=relation_type,
+        directed=directed,
+        subject_namespace=_NS,
+        subject_name="instrument",
+        subject_canonical_id=subject,
+        object_namespace=_NS,
+        object_name="instrument",
+        object_canonical_id=obj,
+        recorded_from=_RECORDED,
+        valid_from=valid_from,
+        valid_to=valid_to,
+    )
+
+
+def _neighbor_edges() -> tuple[Mapping[str, Any], ...]:
+    """Apple -> Technology -> Fed funds rate -> FOMC meeting, plus a side branch
+    that only a hidden context asserts and a visible fact hanging off it."""
+    return (
+        _edge_row(
+            CONTEXT_ALLOWED_1, "r1", "sector_member_of", "Apple", "Technology",
+            valid_from=_JAN,
+        ),
+        _edge_row(
+            CONTEXT_ALLOWED_2, "r2", "driven_by", "Technology", "Fed funds rate",
+            valid_from=_JAN, valid_to=_JUNE,
+        ),
+        _edge_row(CONTEXT_ALLOWED_1, "r3", "reported_at", "Fed funds rate", "FOMC meeting"),
+        _edge_row(
+            CONTEXT_HIDDEN, "r4", "competes_with", "Apple", "HiddenCo",
+            directed=False, valid_from=_JAN,
+        ),
+        _edge_row(
+            CONTEXT_ALLOWED_1, "r5", "supplies", "HiddenCo", "Ghost", valid_from=_JAN,
+        ),
+    )
+
+
+def _neighbor_service(
+    *,
+    edges: Sequence[Mapping[str, Any]] | None = None,
+    repository: FakeRepository | None = None,
+    **kwargs: Any,
+) -> ContextService:
+    rows = dict(_fixture_rows())
+    rows["context_entity_edges"] = tuple(edges if edges is not None else _neighbor_edges())
+    service, _ = _service(repository=repository or FakeRepository(rows), **kwargs)
+    return service
+
+
+def _neighbors(service: ContextService, **arguments: Any) -> Any:
+    arguments.setdefault("model", "context_search")
+    try:
+        return service.get_entity_neighbors(GetEntityNeighborsRequest(**arguments))
+    finally:
+        service.close()
+
+
+def _labels(response: Any) -> list[tuple[int, str, str, str]]:
+    return [
+        (
+            edge.hop,
+            edge.relation_type,
+            edge.source.entity_key[1],
+            edge.target.entity_key[1],
+        )
+        for edge in response.edges
+    ]
+
+
+def test_two_hops_return_typed_cited_edges() -> None:
+    response = _neighbors(_neighbor_service(), entity_id=_eid("Apple"), hops=2)
+
+    assert response.error is None
+    assert _labels(response) == [
+        (1, "sector_member_of", "Apple", "Technology"),
+        (2, "driven_by", "Technology", "Fed funds rate"),
+    ]
+    first, second = response.edges
+    assert first.direction == "outgoing"
+    assert first.context_id == CONTEXT_ALLOWED_1
+    assert first.document_id == DOC_ALLOWED
+    assert first.document_version_id == VERSION_ALLOWED
+    # The citation is the authorized chunk's, not anything the edge table says.
+    assert first.citation.chunk_index == 0
+    assert second.citation.chunk_index == 1
+    assert [entity.entity_key[1] for entity in response.start] == ["Apple"]
+    assert response.truncated is False
+
+
+def test_an_edge_is_oriented_from_the_entity_it_was_reached_from() -> None:
+    response = _neighbors(_neighbor_service(), entity_id=_eid("Technology"))
+
+    assert _labels(response) == [
+        (1, "driven_by", "Technology", "Fed funds rate"),
+        (1, "sector_member_of", "Technology", "Apple"),
+    ]
+    by_type = {edge.relation_type: edge for edge in response.edges}
+    assert by_type["driven_by"].direction == "outgoing"
+    assert by_type["sector_member_of"].direction == "incoming"
+
+
+def test_an_undirected_edge_reads_the_same_from_either_end() -> None:
+    service = _neighbor_service(
+        edges=(_edge_row(CONTEXT_ALLOWED_1, "u", "co_occurs_with", "A", "B", directed=False),)
+    )
+    response = _neighbors(service, entity_id=_eid("B"))
+
+    assert [edge.direction for edge in response.edges] == ["undirected"]
+    assert _labels(response) == [(1, "co_occurs_with", "B", "A")]
+
+
+def test_a_hidden_first_hop_cannot_reveal_a_visible_second_hop() -> None:
+    """r4 is asserted only by a context the caller may not read, and r5, which
+    they may read, hangs off it. Neither may appear: filtering only the final
+    response would let the hidden edge decide what the second hop reaches."""
+    response = _neighbors(_neighbor_service(), entity_id=_eid("Apple"), hops=3)
+
+    assert response.error is None
+    seen = {
+        label
+        for edge in response.edges
+        for label in (edge.source.entity_key[1], edge.target.entity_key[1])
+    }
+    assert "HiddenCo" not in seen
+    assert "Ghost" not in seen
+    assert [edge.relation_type for edge in response.edges] == [
+        "sector_member_of",
+        "driven_by",
+        "reported_at",
+    ]
+
+
+def test_the_visible_fact_is_served_when_walked_to_directly() -> None:
+    """The control for the test above: r5 is not hidden, only unreachable
+    through a hidden edge, so starting at HiddenCo (whose r4 stays hidden)
+    still returns it."""
+    response = _neighbors(_neighbor_service(), entity_id=_eid("HiddenCo"))
+
+    assert [edge.relation_id for edge in response.edges] == ["r5"]
+
+
+def test_as_of_is_half_open_and_leaves_out_unknown_validity() -> None:
+    def types(**arguments: Any) -> list[str]:
+        response = _neighbors(
+            _neighbor_service(), entity_id=_eid("Apple"), hops=3, **arguments
+        )
+        assert response.error is None
+        return [edge.relation_type for edge in response.edges]
+
+    assert types() == ["sector_member_of", "driven_by", "reported_at"]
+    # r2 is [Jan 1, Jun 1): still holding the instant before it ends ...
+    assert types(as_of=_JUNE - _TICK) == ["sector_member_of", "driven_by"]
+    # ... and gone at the instant it ends, so the walk cannot reach past Technology.
+    assert types(as_of=_JUNE) == ["sector_member_of"]
+    # Known from `valid_from` inclusive, and not a moment before.
+    assert types(as_of=_JAN) == ["sector_member_of", "driven_by"]
+    assert types(as_of=_JAN - _TICK) == []
+
+
+def test_as_of_agrees_with_relations_as_of() -> None:
+    """The service's interval rule and the one `supersede_relations` publishes
+    for must not drift: each is checked against the other at the boundaries."""
+    import polars as pl
+
+    from stel.mcp_server.neighbors import edge_holds_at
+    from stel.relation_validity import INSTANT_DTYPE, relations_as_of
+
+    spans = [(None, None), (_JAN, None), (_JAN, _JUNE), (_JUNE, None)]
+    frame = pl.DataFrame(
+        {
+            "i": list(range(len(spans))),
+            "valid_from": [start for start, _ in spans],
+            "valid_to": [end for _, end in spans],
+        },
+        schema={"i": pl.Int64, "valid_from": INSTANT_DTYPE, "valid_to": INSTANT_DTYPE},
+    )
+    instants = (_JAN, _JUNE, datetime(2026, 3, 1, tzinfo=UTC), datetime(2025, 1, 1, tzinfo=UTC))
+    for instant in instants:
+        expected = set(
+            relations_as_of(frame, instant, include_unknown_validity=False)["i"].to_list()
+        )
+        got = {
+            index
+            for index, (start, end) in enumerate(spans)
+            if edge_holds_at({"valid_from": start, "valid_to": end}, instant)
+        }
+        assert got == expected, instant
+
+
+def test_without_as_of_unknown_validity_is_kept_and_reported() -> None:
+    response = _neighbors(_neighbor_service(), entity_id=_eid("Fed funds rate"))
+
+    unknown = next(edge for edge in response.edges if edge.relation_type == "reported_at")
+    assert unknown.interval.validity_known is False
+    assert unknown.interval.valid_from is None
+
+
+def test_relation_types_keep_only_those_edges() -> None:
+    response = _neighbors(
+        _neighbor_service(),
+        entity_id=_eid("Apple"),
+        hops=3,
+        relation_types=("sector_member_of", "reported_at"),
+    )
+
+    # `driven_by` is filtered out, so the walk cannot reach `reported_at` either.
+    assert [edge.relation_type for edge in response.edges] == ["sector_member_of"]
+
+
+def test_a_caller_without_access_gets_the_denial_search_gives() -> None:
+    def denied(call: Any) -> Any:
+        service, _ = _service(principal=Principal("intruder", tenant_id="other"))
+        try:
+            return call(service).error
+        finally:
+            service.close()
+
+    search = denied(
+        lambda service: service.search_context(
+            SearchContextRequest(model="context_search", query="x", mode="text")
+        )
+    )
+    neighbors = denied(
+        lambda service: service.get_entity_neighbors(
+            GetEntityNeighborsRequest(model="context_search", entity_id=_eid("Apple"))
+        )
+    )
+
+    assert search is not None
+    assert neighbors == search
+
+
+def test_an_unknown_model_is_indistinguishable_from_a_denied_one() -> None:
+    response = _neighbors(_neighbor_service(), model="nope", entity_id=_eid("Apple"))
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.NOT_FOUND_OR_DENIED
+
+
+def test_a_denied_neighbors_request_logs_nothing() -> None:
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        principal=Principal("intruder", tenant_id="other"), repository=repository
+    )
+    response = _neighbors(service, entity_id=_eid("Apple"))
+
+    assert response.error is not None
+    assert repository.logged == []
+
+
+def test_an_edge_whose_context_is_missing_or_mismatched_fails_closed() -> None:
+    rows = dict(_fixture_rows())
+    # CONTEXT_ALLOWED_2's chunk claims a document its registry row does not.
+    rows["document_chunks"] = tuple(
+        {**row, "document_id": DOC_HIDDEN} if row["context_id"] == CONTEXT_ALLOWED_2 else row
+        for row in rows["document_chunks"]
+    )
+    rows["context_entity_edges"] = (
+        _edge_row("9" * 32, "m1", "owns", "Apple", "Missing"),
+        _edge_row(CONTEXT_ALLOWED_2, "m2", "owns", "Apple", "Mismatched"),
+        _edge_row(CONTEXT_ALLOWED_1, "m3", "owns", "Apple", "Fine"),
+    )
+    service, _ = _service(repository=FakeRepository(rows))
+    response = _neighbors(service, entity_id=_eid("Apple"))
+
+    assert [edge.target.entity_key[1] for edge in response.edges] == ["Fine"]
+
+
+def _hub(size: int) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        _edge_row(CONTEXT_ALLOWED_1, f"h{n}", "linked_to", "Hub", f"Leaf{n:02d}")
+        for n in range(size)
+    )
+
+
+def test_limit_truncates_deterministically_and_says_so() -> None:
+    hub = _hub(8)
+
+    def run(order: Sequence[Mapping[str, Any]], limit: int) -> Any:
+        return _neighbors(_neighbor_service(edges=order), entity_id=_eid("Hub"), limit=limit)
+
+    first = run(hub, 3)
+    second = run(tuple(reversed(hub)), 3)
+
+    assert first.truncated is True
+    assert len(first.edges) == 3
+    assert [edge.edge_id for edge in first.edges] == [edge.edge_id for edge in second.edges]
+    fits = run(hub, 8)
+    assert fits.truncated is False
+    assert len(fits.edges) == 8
+
+
+def test_the_server_ceiling_bounds_limit() -> None:
+    response = _neighbors(
+        _neighbor_service(
+            edges=_hub(5), settings=ContextServerSettings(max_neighbor_edges=2)
+        ),
+        entity_id=_eid("Hub"),
+        limit=200,
+    )
+
+    assert len(response.edges) == 2
+    assert response.truncated is True
+
+
+def test_a_cycle_ends_and_repeats_no_edge() -> None:
+    ring = (
+        _edge_row(CONTEXT_ALLOWED_1, "c1", "next", "A", "B"),
+        _edge_row(CONTEXT_ALLOWED_1, "c2", "next", "B", "C"),
+        _edge_row(CONTEXT_ALLOWED_1, "c3", "next", "C", "A"),
+    )
+    response = _neighbors(_neighbor_service(edges=ring), entity_id=_eid("A"), hops=3)
+
+    assert response.truncated is False
+    assert len({edge.edge_id for edge in response.edges}) == len(response.edges) == 3
+
+
+def test_a_scan_limit_is_an_error_not_a_partial_graph() -> None:
+    class Overflowing(FakeRepository):
+        def read_rows(self, relation: str, **kwargs: Any) -> Any:
+            if relation == "context_entity_edges":
+                raise ContextRepositoryLimitError("too many rows")
+            return super().read_rows(relation, **kwargs)
+
+    response = _neighbors(
+        _neighbor_service(repository=Overflowing(_fixture_rows())),
+        entity_id=_eid("Apple"),
+    )
+
+    assert response.edges == ()
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.RESPONSE_LIMIT
+
+
+def _neighbor_vocabularies() -> dict[str, Vocabulary]:
+    terms = [VocabularyTerm(label="Apple"), VocabularyTerm(label="Technology")]
+    return {_NS: Vocabulary(terms=terms)}
+
+
+def test_a_declared_term_starts_the_walk() -> None:
+    response = _neighbors(
+        _neighbor_service(vocabularies=_neighbor_vocabularies()), term="Apple"
+    )
+
+    assert response.error is None
+    assert _labels(response) == [(1, "sector_member_of", "Apple", "Technology")]
+
+
+def test_an_undeclared_or_ambiguous_term_is_refused() -> None:
+    undeclared = _neighbors(
+        _neighbor_service(vocabularies=_neighbor_vocabularies()), term="Nokia"
+    )
+    assert undeclared.error is not None
+    assert undeclared.error.code is MCPErrorCode.INVALID_REQUEST
+
+    both = {**_neighbor_vocabularies(), "other": Vocabulary(terms=[VocabularyTerm(label="Apple")])}
+    ambiguous = _neighbors(_neighbor_service(vocabularies=both), term="Apple")
+    assert ambiguous.error is not None
+    assert ambiguous.error.code is MCPErrorCode.INVALID_REQUEST
+    assert "more than one vocabulary" in ambiguous.error.message
+
+    none = _neighbors(_neighbor_service(), term="Apple")
+    assert none.error is not None
+    assert none.error.code is MCPErrorCode.CAPABILITY_UNAVAILABLE
+
+
+def test_a_model_without_edges_says_so() -> None:
+    service, _ = _service(with_edges=False)
+    response = _neighbors(service, entity_id=_eid("Apple"))
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.CAPABILITY_UNAVAILABLE
+
+
+def test_an_unknown_entity_is_an_empty_answer_not_an_error() -> None:
+    response = _neighbors(_neighbor_service(), entity_id="7" * 32)
+
+    assert response.error is None
+    assert response.edges == ()
+    assert response.start == ()
+
+
+def test_neighbors_logs_the_call_with_its_tool_name() -> None:
+    repository = FakeRepository({**_fixture_rows(), "context_entity_edges": _neighbor_edges()})
+    _neighbors(_neighbor_service(repository=repository), entity_id=_eid("Apple"))
+
+    row = repository.logged[-1]
+    assert row["tool"] == "get_entity_neighbors"
+    assert row["result_count"] == 1
+    assert row["returned_chunk_ids"] == [CHUNK_ALLOWED_1]
+
+
+def test_a_request_names_exactly_one_start_and_a_timezone() -> None:
+    for arguments in (
+        {},
+        {"entity_id": _eid("Apple"), "term": "Apple"},
+        {"entity_id": "not-an-id"},
+        {"entity_id": _eid("Apple"), "hops": 4},
+        {"entity_id": _eid("Apple"), "as_of": datetime(2026, 1, 1)},
+    ):
+        with pytest.raises(ValueError):
+            GetEntityNeighborsRequest(model="context_search", **arguments)

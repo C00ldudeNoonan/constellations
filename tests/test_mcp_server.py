@@ -3665,12 +3665,13 @@ def test_neighbors_logs_the_call_with_its_tool_name() -> None:
 
 
 def test_a_request_names_exactly_one_start_and_a_timezone() -> None:
-    for arguments in (
+    cases: tuple[dict[str, Any], ...] = (
         {},
         {"entity_id": _eid("Apple"), "term": "Apple"},
         {"entity_id": "not-an-id"},
         {"entity_id": _eid("Apple"), "hops": 4},
         {"entity_id": _eid("Apple"), "as_of": datetime(2026, 1, 1)},
-    ):
+    )
+    for arguments in cases:
         with pytest.raises(ValueError):
-            GetEntityNeighborsRequest(model="context_search", **arguments)
+            GetEntityNeighborsRequest.model_validate({"model": "context_search", **arguments})

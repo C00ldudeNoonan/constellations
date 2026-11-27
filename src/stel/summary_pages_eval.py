@@ -77,6 +77,20 @@ def _validate(cases: Sequence[PageCase]) -> None:
             raise AssemblyError("Unknown question class")
 
 
+def _authorize(
+    item: Evidence, principal: Principal, authorization: AuthorizationProvider,
+    attributes: Sequence[PolicyAttribute],
+) -> None:
+    registry, chunk = item.rows()
+    try:
+        permitted = authorization.can_read(principal, registry, attributes=attributes)
+        permitted = permitted and authorization.can_read(principal, chunk, attributes=attributes)
+    except Exception:
+        raise AssemblyError("Evidence authorization failed") from None
+    if not permitted:
+        raise AssemblyError("Evidence is unavailable or denied")
+
+
 def _by_document(case: AssemblyCase) -> list[list[Evidence]]:
     """Frozen candidates plus neighbors, grouped per document version, in rank order."""
     groups: dict[tuple[str, str], dict[str, Evidence]] = {}
@@ -105,6 +119,11 @@ def compare_page_arms(
     if summarizer.live and not allow_live:
         raise AssemblyError("A live summarizer requires explicit opt-in")
     policy = AssemblyPolicy(token_budget=token_budget)
+    # Authorize every source before any summarizer call: a live summarizer must
+    # never receive text the principal cannot read, even if the run then aborts.
+    for item in cases:
+        for source in (*item.case.candidates, *item.case.neighbors):
+            _authorize(source, principal, authorization, policy_attributes)
     cache: dict[str, SummaryPage] = {}
     calls = 0
     built_seconds = 0.0
@@ -129,7 +148,7 @@ def compare_page_arms(
         for item, pages in plans for arm in ARMS
     ]
     source_chars = sum(page.source_chars for page in cache.values())
-    page_chars = sum(len(page.text) for page in cache.values())
+    page_chars = sum(len(page.render()) for page in cache.values())
     kept = sum(len(page.claims) for page in cache.values())
     rejected = sum(page.rejected_claims for page in cache.values())
     build = {
@@ -170,8 +189,10 @@ def _row(
     chunk_text = "\n".join(
         block.text for block in context.evidence if block.context_id not in packed_pages)
     served = [page for page in pages if page.page_id in packed_pages]
+    rendered = {page.page_id: page.render() for page in served}
     covered = {fact for fact, literal in item.facts.items()
-               if literal in chunk_text or any(literal in page.text for page in served)}
+               if literal in chunk_text
+               or any(literal in rendered[page.page_id] for page in served)}
     page_only = {fact for fact in covered if item.facts[fact] not in chunk_text}
     # Facts reached only through a page must resolve to the cited source chunk.
     sources = [c for chunks in _by_document(case) for c in chunks]
@@ -198,6 +219,14 @@ def _row(
 
 
 def _aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Per split, so development tuning never inflates a held-out figure."""
+    return {
+        split: _aggregate_split([row for row in rows if row["split"] == split])
+        for split in ("development", "holdout") if any(row["split"] == split for row in rows)
+    }
+
+
+def _aggregate_split(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in ("all", "broad", "multi_section", "exact_identifier"):
         group: dict[str, Any] = {}

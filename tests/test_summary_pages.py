@@ -155,11 +155,11 @@ def test_a_page_is_denied_to_a_principal_outside_its_sources_scope():
         assemble("b")
 
 
-def _compare(cases=None, summarizer=SUMMARIZER, allow_live=False):
+def _compare(cases=None, summarizer=SUMMARIZER, allow_live=False, principal=None):
     return compare_page_arms(
         cases or fixture_cases(), summarizer=summarizer, allow_live=allow_live,
         token_budget=20000, benchmark_id="fixture/v1", corpus_id="corpus/v1",
-        principal=Principal("t"), authorization=ClaimAuthorizationProvider(),
+        principal=principal or Principal("t"), authorization=ClaimAuthorizationProvider(),
         policy_attributes=(), tokenizer_identity="t/v1", count_tokens=len,
         instructions="Use evidence.",
     )
@@ -168,12 +168,12 @@ def _compare(cases=None, summarizer=SUMMARIZER, allow_live=False):
 def test_comparison_reports_both_arms_cost_and_defers():
     artifact = _compare().artifact()
     assert artifact["decision"].startswith("defer")
-    arms = artifact["aggregate"]["all"]
+    arms = artifact["aggregate"]["holdout"]["all"]
     pages, raw = arms["passages_plus_pages"], arms["passages"]
     assert pages["mean_fact_coverage"] > raw["mean_fact_coverage"]
     assert pages["mean_token_count"] > raw["mean_token_count"]
     assert pages["unresolved_page_facts"] == 0
-    classes = artifact["aggregate"]
+    classes = artifact["aggregate"]["holdout"]
     assert all(classes[key]["passages"]["cases"] == 1
                for key in ("broad", "multi_section", "exact_identifier"))
     # Exact identifiers gain nothing from pages and pay their tokens anyway.
@@ -197,12 +197,32 @@ def test_a_live_summarizer_needs_opt_in_and_a_mixed_scope_case_aborts():
         _compare(summarizer=live)
     assert live.calls == 0
     case = fixture_cases()[0]
-    mixed = (_chunk(0, tenant="a"), _chunk(1, tenant="b"))
+    mixed = (_chunk(0, tenant="a"), _chunk(1))  # readable by tenant a, different scope
     leaky = replace(case, case=replace(case.case, candidates=mixed, neighbors=()))
     with pytest.raises(AssemblyError, match="authorization scope"):
-        _compare([leaky])
+        _compare([leaky], principal=Principal("t", tenant_id="a"))
+
+
+def test_denied_sources_never_reach_the_summarizer():
+    """A live summarizer must not see text the principal cannot read."""
+    spy = _Scripted(lambda c: [Claim(c[0][0], "Alpha is first.")])
+    case = fixture_cases()[0]
+    denied = replace(case, case=replace(
+        case.case, candidates=(_chunk(0, tenant="a"),), neighbors=(_chunk(1, tenant="a"),)))
+    with pytest.raises(AssemblyError, match="denied"):
+        _compare([denied], summarizer=spy)
+    assert spy.calls == 0
+
+
+def test_aggregates_keep_development_and_holdout_apart():
+    cases = fixture_cases()
+    dev = replace(cases[0], case=replace(cases[0].case, case_id="dev", split="development"))
+    aggregate = _compare([dev, *cases[1:]]).artifact()["aggregate"]
+    assert set(aggregate) == {"development", "holdout"}
+    assert aggregate["development"]["all"]["passages"]["cases"] == 1
+    assert aggregate["holdout"]["all"]["passages"]["cases"] == 2
 
 
 def test_example_comparison_runs_offline():
     comparison = build_comparison(counter=len, tokenizer_identity="t/v1", token_budget=20000)
-    assert comparison.artifact()["aggregate"]["all"]["passages"]["cases"] == 3
+    assert comparison.artifact()["aggregate"]["holdout"]["all"]["passages"]["cases"] == 3

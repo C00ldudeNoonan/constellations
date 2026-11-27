@@ -86,13 +86,12 @@ class SummaryPage:
     source_chars: int
     _scope: Mapping[str, Any]
 
-    @property
-    def text(self) -> str:
+    def render(self) -> str:
+        """The page text; iterates every claim, so it is a method, not a property."""
         return "\n".join(f"[{claim.context_id}] {claim.quote}" for claim in self.claims)
 
-    @property
     def size_ratio(self) -> float:
-        return len(self.text) / self.source_chars
+        return len(self.render()) / self.source_chars
 
     def evidence(self) -> Evidence:
         """The page as one governed row pair, carrying its sources' scope."""
@@ -104,7 +103,7 @@ class SummaryPage:
             "document_id": page_document, "document_version_id": self.page_id,
             "context_id": self.page_id,
             "chunk_id": canonical_fingerprint(self.page_id, domain="stel-summary-page-chunk"),
-            "chunk_index": 0, "text": self.text, "source_uri": f"summary-page://{self.page_id}",
+            "chunk_index": 0, "text": self.render(), "source_uri": f"summary-page://{self.page_id}",
             **self._scope,
         }
         return Evidence.from_rows(row, row)
@@ -119,7 +118,7 @@ class SummaryPage:
             "source_context_ids": [source[0] for source in self.sources],
             "claim_context_ids": [claim.context_id for claim in self.claims],
             "rejected_claims": self.rejected_claims,
-            "source_chars": self.source_chars, "page_chars": len(self.text),
+            "source_chars": self.source_chars, "page_chars": len(self.render()),
         }
 
 

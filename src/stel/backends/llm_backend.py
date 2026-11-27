@@ -675,16 +675,24 @@ def extract_fields_with_usage(
         )
     admission = budget.provider_call() if budget is not None else nullcontext(None)
     with admission as reservation:
-        with _gate(max_concurrent):
-            raw = fn(
-                text,
-                resolved_model,
-                system,
-                fields_spec,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                max_retries=max_retries,
-            )
+        try:
+            with _gate(max_concurrent):
+                raw = fn(
+                    text,
+                    resolved_model,
+                    system,
+                    fields_spec,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    max_retries=max_retries,
+                )
+        except ProviderError as error:
+            if reservation is not None and error.failure is not None:
+                reservation.settle(
+                    error.failure.usage.to_metrics(),
+                    actual_calls=error.failure.billed_requests,
+                )
+            raise
 
         # Injected test fakes may still return bare fields (the pre-#75 contract);
         # the real call returns (fields, usage).

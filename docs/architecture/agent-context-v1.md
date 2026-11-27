@@ -125,7 +125,7 @@ and a context's `context_id` are the same identifier only when a project
 configures them to be, so `project_context_entity_edge` takes the context as a
 required argument and `validate_context_entity_edges` fails publication for an
 edge whose context does not exist, rather than leaving it to be skipped silently
-at serving time. See [ADR-0068](../adr/0068-entity-neighborhoods-are-served-from-a-declared-edge-grain-authorized-per-context.md).
+at serving time. See [ADR-0069](../adr/0069-entity-neighborhoods-are-served-from-a-declared-edge-grain-authorized-per-context.md).
 
 #### Projecting `link_entities` output into this grain
 

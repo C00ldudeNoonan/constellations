@@ -1,4 +1,4 @@
-# ADR-0068: Entity neighborhoods are served from a declared edge grain, authorized per context
+# ADR-0069: Entity neighborhoods are served from a declared edge grain, authorized per context
 
 - **Status:** accepted
 - **Date:** 2026-11-27

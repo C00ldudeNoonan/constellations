@@ -358,6 +358,10 @@ budget stops the model with the distinct `budget_exceeded` status: `full`
 materializations publish nothing, and incremental runs keep only chunks that
 already committed with their state. Token and spend caps are measured from
 responses, so the stopping call may overshoot the cap by at most one response.
+When a failed inference response carries provider usage, its tokens and reported
+or estimated cost are charged before another call is admitted. A failure with
+no usage metadata cannot be priced by stel; check provider billing for charges
+that were not reported, including any SDK-internal retries.
 Native `llm:` workers reserve uncached calls before submitting them, so
 `max_concurrent` cannot multiply an API-call cap. When an input-token,
 output-token, or spend cap is active, provider admission on that ledger is
@@ -1440,6 +1444,42 @@ re-key the serving model itself (a new embedding model, a different
 `id_field`): point a second profile target at its own dataset and store,
 `stel run --target experiment`, and compare across targets. It costs a full
 build; it never touches production state.
+
+### Selecting a variant by quality, cost and latency
+
+`stel.variant_selection` turns a variant experiment into a reviewable
+recommendation. It is a Python API over evidence you supply, not a command: it
+makes no provider call, reads no document, and writes only its artifact, so a
+live experiment stays an explicit, budgeted act you run yourself.
+
+1. Run each candidate (a model choice x an extraction strategy) over the same
+   development documents under a run budget (`max_cost_usd`), and score it with
+   your reviewed judgments. Build one `Candidate` each: per-document
+   `found`/`emitted`/`gold` counts, the identities of its model, provider
+   implementation, prompt, schema and config, the corpus and judgment versions,
+   the pricing assumption, and a `Measurement` for each of the cold build, the
+   warm cached rebuild and the changed-document rebuild. A measurement's cost
+   includes billed failures and retries (counted separately) and is `measured`,
+   `estimated` or `unknown`, never silently zero.
+2. `compare_development` reports each candidate's precision and recall with
+   document-level bootstrap intervals, the observed Pareto frontier over
+   precision, recall, cold cost and elapsed time, and which candidates clear
+   the quality floors on their **lower** bound. It selects the cheapest of
+   those. Frontier members whose intervals overlap are listed as `tied`: the
+   frontier describes the sample and is not evidence that one is better.
+3. `validate_holdout` scores only that frozen selection on sources absent from
+   development. It never picks a replacement; a failure is reported as failed.
+4. `recommend` returns `adopt` only for a feasible selection that passed the
+   holdout on at least `min_documents` documents; otherwise `defer` with the
+   reasons. An adopt carries a unified diff between the current and selected
+   config for a person to review. Nothing applies it, and configs naming
+   credentials or credential variables are refused.
+
+`variant_selection.json` (artifact version 1, written under the target path)
+records the identities, counts, usage, money and its basis, the experiment's
+spend against its budget, the frontier, ties, holdout and recommendation. Hold
+the holdout back until the selection is frozen: the module cannot tell whether
+you looked at it first.
 
 ## Profiles
 

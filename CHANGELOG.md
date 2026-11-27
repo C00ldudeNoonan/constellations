@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Experimental offline library for source-linked summary pages
+  (`stel.summary_pages`, `stel.summary_pages_eval`): one extractive page per
+  document version, built only inside one authorization scope, every claim a
+  verbatim quote of a cited chunk, identity-keyed invalidation, and a
+  passages-versus-pages comparison under one token budget. No model type, CLI
+  or serving change; the recorded decision is to defer (ADR 0067; issue #826,
+  ALE-285, theme ALE-48).
 - `stel orphans` (`stel ls --orphans`), `stel plan --pending` and the
   `run --watch` re-run lines no longer fuse columns when a name reaches the
   fixed width (32 characters for the first two). They size the name column from

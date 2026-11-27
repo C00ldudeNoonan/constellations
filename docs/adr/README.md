@@ -76,6 +76,7 @@ history (issue #311).
 | [0064](0064-nlp-providers-register-declared-capabilities-and-languages-route-explicitly.md) | NLP providers register declared capabilities and languages through a registry (built-in and entry point), and language routing is an explicit project mapping with fail/skip/fallback policies, not environment-chosen models or vendor branches | accepted |
 | [0065](0065-graph-export-graphiti-is-a-record-format-with-a-loader-behind-the-graphiti-extra.md) | Graph export for Graphiti is a record format with a loader (`graph-load`) behind the `graphiti` extra; valid time in the file, transaction time stamped at load | accepted, amends 0055, 0061 and 0063 |
 | [0066](0066-built-in-adapters-and-stores-resolve-by-type-on-first-use.md) | Built-in warehouse adapters and retrieval stores resolve by type on first use, and what validation checks lives in modules that import no implementation, so reading a project imports no dataframe library and only the active adapter | accepted |
+| [0068](0068-variant-selection-is-an-offline-library-and-adoption-is-deferred-to-a-live-run.md) | Variant selection by quality, cost and latency is an offline library over supplied evidence with a frozen-selection holdout and a reviewable diff; adoption of any live result is deferred until a reviewed benchmark exists | accepted |
 
 ## When to write one
 

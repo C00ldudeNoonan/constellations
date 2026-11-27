@@ -40,8 +40,20 @@ Decision = Literal["adopt", "defer"]
 
 # Config handed to the diff must not carry credentials or the names of the
 # environment variables that hold them (AGENTS.md security invariants).
-_SECRET_KEY = re.compile(r"(api[_-]?key|secret|token|password|credential|_env$)", re.I)
+# `max_tokens` is a limit, not a credential: only a field *named* token matches.
+_SECRET_KEY = re.compile(r"(api[_-]?key|secret|password|credential|_env$|(^|[_-])token$)", re.I)
 _TIED = "statistically tied with "
+# What defines the variant that ran; a holdout must match all of it.
+_EXECUTION_IDENTITIES = (
+    "provider",
+    "model",
+    "implementation_identity",
+    "strategy",
+    "prompt_identity",
+    "schema_identity",
+    "config_identity",
+    "pricing_assumption",
+)
 
 
 class VariantSelectionError(ValueError):
@@ -204,7 +216,14 @@ class DevelopmentComparison:
 
 @dataclass(frozen=True)
 class HoldoutValidation:
+    """A holdout result bound to the development comparison that froze its selection."""
+
     result: Result
+    precision_floor: float
+    recall_floor: float
+    seed: int
+    resamples: int
+    development_sources: frozenset[str]
 
     @property
     def passed(self) -> bool:
@@ -368,8 +387,9 @@ def validate_holdout(development: DevelopmentComparison, candidate: Candidate) -
     if development.selected is None or candidate.name != development.selected:
         raise VariantSelectionError("holdout must use the frozen development selection")
     chosen = next(r for r in development.results if r.name == candidate.name).candidate
-    if candidate.config_identity != chosen.config_identity:
-        raise VariantSelectionError("holdout configuration differs from development")
+    for label in _EXECUTION_IDENTITIES:
+        if getattr(candidate, label) != getattr(chosen, label):
+            raise VariantSelectionError(f"holdout {label} differs from development")
     if candidate.judgment_identity != chosen.judgment_identity:
         raise VariantSelectionError("holdout must use the development judgment identity")
     if candidate.corpus_identity == chosen.corpus_identity:
@@ -383,7 +403,12 @@ def validate_holdout(development: DevelopmentComparison, candidate: Candidate) -
             recall_floor=development.recall_floor,
             seed=development.seed,
             resamples=development.resamples,
-        )
+        ),
+        development.precision_floor,
+        development.recall_floor,
+        development.seed,
+        development.resamples,
+        development.sources,
     )
 
 
@@ -428,6 +453,26 @@ def recommend(
     answer to thin evidence. A tie with another frontier member is noted, not
     held against the selection: the selection is the cheapest feasible one.
     """
+    if holdout is not None and (
+        (holdout.precision_floor, holdout.recall_floor, holdout.seed, holdout.resamples)
+        != (
+            development.precision_floor,
+            development.recall_floor,
+            development.seed,
+            development.resamples,
+        )
+        or holdout.development_sources != development.sources
+    ):
+        raise VariantSelectionError(
+            "holdout was validated against a different development comparison"
+        )
+    if holdout is not None and development.selected is not None:
+        chosen = next(r for r in development.results if r.name == development.selected).candidate
+        if any(
+            getattr(holdout.result.candidate, label) != getattr(chosen, label)
+            for label in _EXECUTION_IDENTITIES
+        ):
+            raise VariantSelectionError("holdout ran a different variant than the selection")
     blocking: list[str] = []
     n_dev = len(development.results[0].candidate.documents)
     if development.selected is None:

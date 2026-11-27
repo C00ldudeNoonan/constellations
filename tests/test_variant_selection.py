@@ -134,7 +134,7 @@ def test_holdout_is_scored_for_the_frozen_selection_only() -> None:
     assert dev.selected == "a"
     with pytest.raises(VariantSelectionError, match="frozen"):
         validate_holdout(dev, _cand("b", prefix="h", corpus="hold-v1"))
-    with pytest.raises(VariantSelectionError, match="configuration differs"):
+    with pytest.raises(VariantSelectionError, match="config_identity differs"):
         validate_holdout(dev, _cand("a", prefix="h", corpus="hold-v1", config="cfg-other"))
     with pytest.raises(VariantSelectionError, match="overlap"):
         validate_holdout(dev, _cand("a", prefix="d", corpus="hold-v1"))
@@ -165,6 +165,7 @@ def test_adopt_emits_a_config_diff_and_names_the_ties() -> None:
 def test_defer_when_holdout_fails_is_missing_or_sample_is_thin() -> None:
     dev, failed = _adopt_inputs(hold_found=5)
     assert not failed.passed
+
     def rec_for(holdout, minimum: int = 30):
         return recommend(
             dev, holdout, baseline_config=BASE, selected_config=PICK, min_documents=minimum
@@ -207,3 +208,33 @@ def test_artifact_records_identities_money_basis_and_leaks_nothing(tmp_path: Pat
     assert loaded["holdout"]["passed"] is True
     assert loaded["recommendation"]["decision"] == "adopt"
     assert [p.name for p in tmp_path.rglob("*") if p.is_file()] == ["variant_selection.json"]
+
+
+def test_max_tokens_is_not_a_credential_but_a_token_field_is() -> None:
+    diff = config_diff({"llm": {"max_tokens": 10}}, {"llm": {"max_tokens": 20}}, label="x")
+    assert '"max_tokens": 20' in diff
+    with pytest.raises(VariantSelectionError, match="credentials"):
+        config_diff({}, {"llm": {"access_token": "t"}}, label="x")
+
+
+def test_holdout_must_match_every_execution_identity() -> None:
+    dev = _compare(_cand("a", cost=1.0), _cand("b", cost=2.0))
+    for field_name in ("implementation_identity", "model", "prompt_identity", "strategy"):
+        other = replace(_cand("a", prefix="h", corpus="hold-v1"), **{field_name: "changed"})
+        with pytest.raises(VariantSelectionError, match=field_name):
+            validate_holdout(dev, other)
+
+
+def test_a_holdout_from_another_comparison_cannot_support_adoption() -> None:
+    _, hold = _adopt_inputs()
+    looser = compare_development(
+        (_cand("a", cost=1.0, secs=20), _cand("b", cost=2.0, secs=5)),
+        precision_floor=0.5,
+        recall_floor=0.5,
+        seed=0,
+        resamples=200,
+        experiment=SPEND,
+    )
+    assert looser.selected == "a"
+    with pytest.raises(VariantSelectionError, match="different development comparison"):
+        recommend(looser, hold, baseline_config=BASE, selected_config=PICK, min_documents=30)

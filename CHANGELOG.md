@@ -1,7 +1,32 @@
 # Changelog
 
-## Unreleased
+## v0.27.0 - 2026-11-27
 
+- The MCP server gains a fifth tool, `get_entity_neighbors`: it walks the cited,
+  typed relations a project publishes as `context_entity_edges` outward from one
+  entity (by `entity_id` or a declared vocabulary `term`), up to three hops,
+  with `relation_types`, `limit` (capped by `max_neighbor_edges`) and `as_of`
+  validity filters. Authorization is per edge, by the same test `search_context`
+  applies to a hit. The demo project ships a `context_entity_edges` model
+  (issue #796, ALE-424, ADR-0069, theme ALE-418).
+- Experimental offline library for choosing pipeline variants by measured
+  quality, cost and latency (`stel.variant_selection`): the observed Pareto
+  frontier, quality-floor feasibility on bootstrap lower bounds, the cheapest
+  feasible variant, a frozen-selection holdout check, and an adopt/defer
+  recommendation with a reviewable config diff. No CLI or model type change; the
+  recorded decision defers adopting any live result until a reviewed benchmark
+  exists (ADR 0068; issue #795, ALE-286). One behavior change: a provider call
+  that fails after being billed now settles its budget reservation, so a failed
+  attempt counts against a spend cap.
+- `stel mcp serve` serves segmented search groups: the catalog lists a group
+  once, `search_context` routes validated partition filters to the matching
+  members, pins them before reading and fuses their results by document rank,
+  and an unfiltered query searches every member. A query selecting more members
+  than `--max-group-fanout` (default 16) fails rather than omitting any. Results
+  name the member and generation that served them (ADR-0037, constellations#793).
+- The `cryptography>=50.0.0` floor moved from the base install to the extras
+  that pull it in (`bigquery`, `gcs`, `gdrive`, `vertex`, `mcp`), so a base
+  install no longer depends on it (constellations#788).
 - Experimental offline library for source-linked summary pages
   (`stel.summary_pages`, `stel.summary_pages_eval`): one extractive page per
   document version, built only inside one authorization scope, every claim a

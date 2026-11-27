@@ -22,7 +22,7 @@
     },
     "backend:llm": {
       "extraction.backend": "8ab5e0ec8db1481b",
-      "extraction.backend_implementation": "52a86326478dd12a",
+      "extraction.backend_implementation": "4b1207f67f686454",
       "extraction.inference": "4a404b088580f445",
       "extraction.options": "01322121aebb532a"
     },
@@ -162,11 +162,5 @@
       "transform_code_hash": "5cf5f1773b155e4e"
     }
   },
-  "intended_changes": [
-    {
-      "case": "backend:llm",
-      "field": "extraction.backend_implementation",
-      "reason": "Issue #759 changes the BigQuery adapter modules in the LLM backend's transitive source fingerprint. Review affected models with stel plan and adopt their state after verifying their extraction output is unchanged."
-    }
-  ]
+  "intended_changes": []
 }

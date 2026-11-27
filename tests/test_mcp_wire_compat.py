@@ -14,7 +14,7 @@ them imports `mcp`: a test written against the SDK's client would move with
 the SDK and could not tell the upgrade it was guarding had changed anything.
 
 What is pinned is what an operator documents (docs/mcp.md) or a client reads:
-the four tool names, each tool's argument and result contract, the shape of the
+the five tool names, each tool's argument and result contract, the shape of the
 `mcp_context/v2` responses, the refusals at the HTTP boundary, the OAuth
 discovery document, and the client identity a query-log row records. What is
 not pinned is the SDK's own wording: `serverInfo.version` is the SDK's version
@@ -71,6 +71,7 @@ TOOL_NAMES = {
     "search_context",
     "get_document",
     "get_context_lineage",
+    "get_entity_neighbors",
 }
 
 # Each tool as a client reads it from `tools/list`: argument name -> the
@@ -140,6 +141,28 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
         },
         "required": ["model", "reference_type", "reference_id"],
         "result": ["schema_version", "record", "error"],
+    },
+    "get_entity_neighbors": {
+        "arguments": {
+            "model": REQUIRED,
+            "entity_id": None,
+            "term": None,
+            "hops": 1,
+            "relation_types": None,
+            "as_of": None,
+            "limit": 25,
+            "schema_version": "mcp_context/v2",
+        },
+        "required": ["model"],
+        "result": [
+            "schema_version",
+            "start",
+            "edges",
+            "hops",
+            "as_of",
+            "truncated",
+            "error",
+        ],
     },
 }
 
@@ -641,14 +664,14 @@ def test_an_unknown_method_is_a_protocol_error_not_a_tool_result(
     assert raised.value.code in (-32601, -32602)
 
 
-# ─── the four tools ────────────────────────────────────────────────────────
+# ─── the five tools ────────────────────────────────────────────────────────
 
 
-def test_exactly_four_tools_are_advertised(client: WireClient) -> None:
+def test_exactly_five_tools_are_advertised(client: WireClient) -> None:
     tools = client.rpc("tools/list")["tools"]
 
     assert {tool["name"] for tool in tools} == TOOL_NAMES
-    assert len(tools) == 4
+    assert len(tools) == 5
     # Every tool says what it is for: a client shows this to its model.
     assert all(tool["description"].strip() for tool in tools)
 

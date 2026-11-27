@@ -2,6 +2,7 @@
 # find its injected `Context`, and `Context` is imported inside
 # `create_mcp_server` (the `mcp` extra is optional), so the annotations have to
 # be evaluated where it is in scope rather than looked up later by name.
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +16,8 @@ from .contracts import (
     GetContextLineageResponse,
     GetDocumentRequest,
     GetDocumentResponse,
+    GetEntityNeighborsRequest,
+    GetEntityNeighborsResponse,
     LineageReferenceType,
     ListContextModelsRequest,
     ListContextModelsResponse,
@@ -201,6 +204,55 @@ def create_mcp_server(
                     model=model,
                     reference_type=reference_type,
                     reference_id=reference_id,
+                ),
+                caller=_caller_info(ctx, transport),
+            )
+
+    @app.tool()
+    def get_entity_neighbors(
+        ctx: Context,
+        model: str,
+        entity_id: str | None = None,
+        term: str | None = None,
+        hops: int = 1,
+        relation_types: list[str] | None = None,
+        as_of: datetime | None = None,
+        limit: int = 25,
+        schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION,
+    ) -> GetEntityNeighborsResponse:
+        """What an entity is related to, and through which cited passages.
+
+        Name the start entity with exactly one of `entity_id` (the id
+        `search_context` and `get_context_lineage` return in `entities`) or
+        `term` (a declared vocabulary label; one declared in two vocabularies is
+        refused). Returns typed edges up to `hops` (1 to 3) away. Each edge names
+        its `source` (where the walk reached it from) and `target` (where it
+        leads), whether the fact points `outgoing`, `incoming` or is
+        `undirected`, its validity `interval`, and the `citation` of the passage
+        that asserts it.
+
+        `relation_types` keeps only those relation types. `as_of` (a
+        timezone-aware instant) keeps only edges whose interval holds then,
+        `valid_from <= as_of < valid_to`; an edge with unknown validity is left
+        out when `as_of` is set and reported with its unknown interval when not.
+
+        An edge is returned, and walked through, only if the caller may read the
+        passage that asserts it. `limit` caps the edges across all hops;
+        `truncated` is true when authorized edges were withheld to honor it, and
+        a hub entity too large to scan is refused with a limit error rather than
+        returned incomplete.
+        """
+        with serving_request(ctx.request_context):
+            return service.get_entity_neighbors(
+                GetEntityNeighborsRequest(
+                    schema_version=schema_version,
+                    model=model,
+                    entity_id=entity_id,
+                    term=term,
+                    hops=hops,
+                    relation_types=tuple(relation_types or ()),
+                    as_of=as_of,
+                    limit=limit,
                 ),
                 caller=_caller_info(ctx, transport),
             )

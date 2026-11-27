@@ -479,9 +479,102 @@ _CONTEXT_ENTITY_LINKS = ContractRelation(
     ),
 )
 
+_CONTEXT_ENTITY_EDGES = ContractRelation(
+    grain=AgentContextGrain.CONTEXT_ENTITY_EDGES,
+    primary_key=("context_entity_edge_id",),
+    foreign_keys={"context_id": "document_chunks.context_id"},
+    fields=(
+        _field(
+            "context_entity_edge_id",
+            "string",
+            description="Stable identity of one asserted fact in one context.",
+        ),
+        _field(
+            "context_id",
+            "string",
+            description=(
+                "The document/chunk context that asserts the fact; the context the "
+                "caller must be authorized to read before the edge is served."
+            ),
+        ),
+        _field(
+            "relation_id",
+            "string",
+            description="The extractor's stable identity for the relation.",
+        ),
+        _field(
+            "relation_type",
+            "string",
+            description="Relation semantic, such as owns or co_occurs_with.",
+        ),
+        _field(
+            "directed",
+            "boolean",
+            description="False for a symmetric relation such as co-occurrence.",
+        ),
+        _field(
+            "subject_entity_namespace",
+            "string",
+            description="Namespace of the subject entity, shared with context_entity_links.",
+        ),
+        _field(
+            "subject_entity_name",
+            "string",
+            description="dbt Semantic Layer-compatible name of the subject entity.",
+        ),
+        _field(
+            "subject_entity_id",
+            "string",
+            description="Stable namespaced identity of the subject entity key.",
+        ),
+        _field(
+            "subject_entity_key",
+            "json",
+            description="Canonical type-preserving serialized subject entity key.",
+        ),
+        _field(
+            "object_entity_namespace",
+            "string",
+            description="Namespace of the object entity, shared with context_entity_links.",
+        ),
+        _field(
+            "object_entity_name",
+            "string",
+            description="dbt Semantic Layer-compatible name of the object entity.",
+        ),
+        _field(
+            "object_entity_id",
+            "string",
+            description="Stable namespaced identity of the object entity key.",
+        ),
+        _field(
+            "object_entity_key",
+            "json",
+            description="Canonical type-preserving serialized object entity key.",
+        ),
+        _field(
+            "confidence",
+            "float",
+            nullable=True,
+            description="Optional extractor confidence from 0 through 1.",
+        ),
+        *_TEMPORAL_FIELDS,
+        _field(
+            "edge_provenance_fingerprint",
+            "string",
+            description="One-way identity of edge derivation provenance.",
+        ),
+    ),
+)
+
 _RELATIONS = {
     relation.grain: relation
-    for relation in (_DOCUMENT_REGISTRY, _DOCUMENT_CHUNKS, _CONTEXT_ENTITY_LINKS)
+    for relation in (
+        _DOCUMENT_REGISTRY,
+        _DOCUMENT_CHUNKS,
+        _CONTEXT_ENTITY_LINKS,
+        _CONTEXT_ENTITY_EDGES,
+    )
 }
 
 
@@ -614,6 +707,16 @@ def make_context_entity_link_id(
     )
 
 
+def make_context_entity_edge_id(context_id: str, relation_id: str) -> str:
+    return canonical_fingerprint(
+        {
+            "context_id": _stable_id(context_id, "context_id"),
+            "relation_id": _non_empty(relation_id, "relation_id"),
+        },
+        domain="dbt-ml-agent-context-entity-edge",
+    )
+
+
 def entity_link_method(resolver: str, resolver_version: str) -> str:
     """Canonical ``link_method`` identity for a ``link_entities`` resolver, e.g.
     ``entity_link:alias_table:1``. Recording the resolver and its version keeps
@@ -686,6 +789,79 @@ def project_entity_link(
         "recorded_from": recorded_from,
         "recorded_to": recorded_to,
         "link_provenance_fingerprint": make_provenance_fingerprint(dict(provenance)),
+    }
+
+
+def project_context_entity_edge(
+    *,
+    context_id: str,
+    relation_id: str,
+    relation_type: str,
+    directed: bool,
+    subject_namespace: str,
+    subject_name: str,
+    subject_canonical_id: str,
+    object_namespace: str,
+    object_name: str,
+    object_canonical_id: str,
+    recorded_from: datetime,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+    confidence: float | None = None,
+    recorded_to: datetime | None = None,
+    provenance: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project one asserted relation between two linked entities into a governed
+    ``context_entity_edges`` row (issue #796, ALE-424).
+
+    ``context_id`` is the context that *asserts* the fact. It is a required
+    argument rather than something inferred from the extractor's
+    ``document_id``: the two are the same identifier only when the project
+    configures the extractor that way, and attaching a fact to the wrong context
+    would let the wrong caller's grants decide who may read it. Each endpoint's
+    ``canonical_id`` is encoded exactly as ``project_entity_link`` encodes it, so
+    an endpoint carries the identical ``entity_id`` as that context's links.
+
+    A relation with no ``valid_from`` publishes with unknown validity, as the
+    document grains do; ``valid_to`` without ``valid_from`` is refused.
+    """
+    subject_key = canonical_entity_key(_non_empty(subject_canonical_id, "subject_canonical_id"))
+    object_key = canonical_entity_key(_non_empty(object_canonical_id, "object_canonical_id"))
+    subject_id = make_entity_id(subject_namespace, subject_name, subject_key)
+    object_id = make_entity_id(object_namespace, object_name, object_key)
+    if confidence is not None and not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    if valid_from is None and valid_to is not None:
+        raise ValueError("valid_to requires valid_from")
+    if provenance is None:
+        provenance = {
+            "context_id": context_id,
+            "relation_id": relation_id,
+            "relation_type": relation_type,
+            "subject_entity_id": subject_id,
+            "object_entity_id": object_id,
+        }
+    return {
+        "context_entity_edge_id": make_context_entity_edge_id(context_id, relation_id),
+        "context_id": context_id,
+        "relation_id": _non_empty(relation_id, "relation_id"),
+        "relation_type": _non_empty(relation_type, "relation_type"),
+        "directed": bool(directed),
+        "subject_entity_namespace": subject_namespace,
+        "subject_entity_name": subject_name,
+        "subject_entity_id": subject_id,
+        "subject_entity_key": subject_key,
+        "object_entity_namespace": object_namespace,
+        "object_entity_name": object_name,
+        "object_entity_id": object_id,
+        "object_entity_key": object_key,
+        "confidence": confidence,
+        "validity_known": valid_from is not None,
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "recorded_from": recorded_from,
+        "recorded_to": recorded_to,
+        "edge_provenance_fingerprint": make_provenance_fingerprint(dict(provenance)),
     }
 
 
@@ -1122,6 +1298,22 @@ def validate_agent_context_relations(
             )
 
 
+def validate_context_entity_edges(
+    context_entity_edges: pl.DataFrame,
+    document_chunks: pl.DataFrame,
+) -> None:
+    """Every edge names a context that exists. An edge whose context cannot be
+    found would be unservable, so it fails publication rather than waiting to be
+    silently skipped."""
+    validate_agent_context_frame(context_entity_edges, AgentContextGrain.CONTEXT_ENTITY_EDGES)
+    contexts = set(document_chunks["context_id"].to_list())
+    for row in context_entity_edges.iter_rows(named=True):
+        if row["context_id"] not in contexts:
+            raise AgentContextValidationError(
+                "context_entity_edges contains an unresolved context_id"
+            )
+
+
 def _validate_row_semantics(
     row: Mapping[str, Any],
     grain: AgentContextGrain,
@@ -1157,6 +1349,9 @@ def _validate_row_semantics(
         if row["chunk_content_hash"] != content_hash(row["text"]):
             _invalid(grain, position, "chunk_content_hash does not match text")
         _validate_citation(row, position, grain)
+    elif grain is AgentContextGrain.CONTEXT_ENTITY_EDGES:
+        _validate_temporal(row, position, grain)
+        _validate_edge_row(row, position, grain)
     else:
         _validate_canonical_json(row, "entity_key", position, grain)
         _validate_stable_id(
@@ -1189,6 +1384,34 @@ def _validate_row_semantics(
         confidence = row.get("confidence")
         if confidence is not None and not 0 <= confidence <= 1:
             _invalid(grain, position, "confidence must be between 0 and 1")
+
+
+def _validate_edge_row(row: Mapping[str, Any], position: int, grain: AgentContextGrain) -> None:
+    _validate_stable_id(row, "edge_provenance_fingerprint", position, grain)
+    _validate_stable_id(row, "context_id", position, grain)
+    for side in ("subject", "object"):
+        _validate_canonical_json(row, f"{side}_entity_key", position, grain)
+        _expect_id(
+            row,
+            f"{side}_entity_id",
+            make_entity_id(
+                row[f"{side}_entity_namespace"],
+                row[f"{side}_entity_name"],
+                row[f"{side}_entity_key"],
+            ),
+            position,
+            grain,
+        )
+    _expect_id(
+        row,
+        "context_entity_edge_id",
+        make_context_entity_edge_id(row["context_id"], row["relation_id"]),
+        position,
+        grain,
+    )
+    confidence = row.get("confidence")
+    if confidence is not None and not 0 <= confidence <= 1:
+        _invalid(grain, position, "confidence must be between 0 and 1")
 
 
 def _validate_temporal(row: Mapping[str, Any], position: int, grain: AgentContextGrain) -> None:

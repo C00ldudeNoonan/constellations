@@ -100,7 +100,7 @@ def test_init_names_every_file_after_the_project(tmp_path: Path) -> None:
 def test_every_model_builds_and_every_test_passes(
     first_run: tuple[Path, list[str]],
 ) -> None:
-    """The README says `stel build` runs 13 models and their tests."""
+    """The README says `stel build` runs 14 models and their tests."""
     built, failed_models = first_run
     assert failed_models == []
     models = {
@@ -111,9 +111,9 @@ def test_every_model_builds_and_every_test_passes(
             f"where table_schema = '{NAME}' and table_name not like 'stel_%'",
         )
     }
-    # Twelve tables; the thirteenth model is the search index, which lives in
+    # Thirteen tables; the fourteenth model is the search index, which lives in
     # the same file under the retrieval store's own name.
-    assert len(models) == 12, sorted(models)
+    assert len(models) == 13, sorted(models)
     failed = [r for r in run_project_tests(built) if not r.passed]
     assert failed == [], [(r.test_name, r.message) for r in failed]
 
@@ -483,6 +483,31 @@ def test_an_agent_can_scope_a_search_to_a_declared_class(built: Path) -> None:
         linked = {entity["entity_key"][1] for entity in hit["entities"]}
         assert linked & datastores, hit["citation"]
         assert hit["citation"]["source_uri"].startswith("data/")
+
+
+def test_an_agent_can_walk_two_hops_of_cited_relations(built: Path) -> None:
+    """The README's step 6: `get_entity_neighbors` from a declared term, every
+    edge typed and cited back to the passage that asserts it (ALE-424)."""
+    found = _call(
+        built,
+        "get_entity_neighbors",
+        {"model": "knowledge_search", "term": "Payments API", "hops": 2, "limit": 50},
+    )
+    assert found["error"] is None
+    edges = found["edges"]
+    assert {edge["hop"] for edge in edges} == {1, 2}
+    assert {edge["relation_type"] for edge in edges} == {"co_occurs_with"}
+    assert [entity["entity_key"][1] for entity in found["start"]] == ["Payments API"]
+    reached = {
+        edge["target"]["entity_id"] for edge in edges if edge["hop"] == 1
+    } | {edge["source"]["entity_id"] for edge in edges if edge["hop"] == 1}
+    for edge in edges:
+        assert edge["citation"]["source_uri"].startswith("data/")
+        assert edge["context_id"] and edge["document_version_id"]
+        if edge["hop"] == 2:
+            # A second hop is reached *through* a first-hop entity.
+            assert edge["source"]["entity_id"] in reached
+    assert found["truncated"] is False
 
 
 def _readme_commands(readme: str) -> list[list[str]]:

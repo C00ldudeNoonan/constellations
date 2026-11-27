@@ -6,7 +6,7 @@ stel exposes a read-only MCP stdio server for document context governed by
 - use stel MCP for document discovery, retrieval, citations, and provenance;
 - use dbt MCP for governed metrics, Semantic Layer queries, and dbt metadata.
 
-The initial server exposes exactly four tools:
+The server exposes exactly five tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -14,6 +14,7 @@ The initial server exposes exactly four tools:
 | `search_context` | Query the portable stel search API and return governed context. |
 | `get_document` | Fetch one authorized document version as bounded, paginated chunks. |
 | `get_context_lineage` | Trace an authorized document, context, chunk, or search result. |
+| `get_entity_neighbors` | Walk the cited, typed relations around one entity, up to three hops. |
 
 There are no build, mutation, metric-query, answer-generation, path-read, or
 source-URL-read tools.
@@ -51,7 +52,9 @@ uv run stel run
 An exposed search index must descend from `agent_context/v1`
 `document_registry` and `document_chunks` relations. Its `id_field` must be
 `context_id` or `chunk_id`. Optional `context_entity_links` descendants add dbt
-entity types and links to responses.
+entity types and links to responses, and optional `context_entity_edges`
+descendants of `document_chunks` publish the relations
+[`get_entity_neighbors`](#entity-neighborhoods) walks.
 
 Those `document_registry`/`document_chunks` relations must come from
 `transform: {type: python}` models that declare `agent_context:` — the
@@ -628,7 +631,7 @@ answers every protocol revision the SDK serves, from `2024-11-05` through
 `2026-07-28`, on stdio, `streamable-http` and `sse`. The newest revision has no
 `initialize` handshake: the client states who it is in each request, and a
 client that states nothing is logged with no client name or version rather than
-a placeholder. The four tools and their `mcp_context/v1` responses are the same
+a placeholder. The five tools and their `mcp_context/v2` responses are the same
 on every revision.
 
 Operator-visible differences from the SDK 1.x server:
@@ -742,6 +745,75 @@ arrive JSON-shaped: a `date` or `timestamp` attribute is an ISO string.
 `returned: false` withholds an attribute from both this response and
 `stel search`. It is the only control over what leaves the governed boundary,
 so an attribute declared for filtering alone should say so.
+
+## Entity neighborhoods
+
+`search_context` finds the passages that mention an entity. `get_entity_neighbors`
+answers the next question, *what is this entity related to, and where does it
+say so?*, without a graph store: it walks the facts a project publishes as
+`context_entity_edges` outward from one entity and returns each as a typed,
+cited edge.
+
+```json
+{"model": "knowledge_search", "term": "Payments API", "hops": 2}
+```
+
+Name the start with exactly one of `entity_id` (the id `search_context` returns
+in a result's `entities`) or `term` (a label the project declares under
+`vocabularies:`; one declared in two vocabularies is refused, never guessed).
+`hops` is 1 to 3. `relation_types` keeps only those relation types, and a
+relation type filtered out cannot be walked through. `limit` (default 25, at
+most `max_neighbor_edges`, default 100) caps the edges across all hops.
+
+Each edge carries its `relation_type`; `source`, the entity the walk reached it
+from, and `target`, where it leads; `direction`, which says whether the fact
+points `outgoing` from `source`, `incoming` to it, or is `undirected`; its
+validity `interval`; and the document, version, context and `citation` of the
+passage that asserts it. Edges are ordered by hop, relation type and entity
+ids, so two calls over the same data agree.
+
+`as_of` (a timezone-aware instant) keeps only the edges whose interval holds
+then, `valid_from <= as_of < valid_to` with a null end open: the same half-open
+rule `relations_as_of` applies, so at the instant a newer fact begins only the
+newer fact holds. An edge with unknown validity (no `valid_from`) holds at no
+instant, so `as_of` leaves it out; without `as_of` it is returned and its
+`interval.validity_known` is `false`. `observed_at` is not belief time: the
+tool answers "what held", not "what did we believe".
+
+**Authorization is per edge.** An edge is returned, and walked through, only if
+the caller may read the registry row and the chunk of the context that asserts
+it, the same test `search_context` applies to a hit. An edge whose context is
+missing, ambiguous, mismatched or denied is never returned and never extends
+the walk, so a hidden first-hop edge cannot reveal a visible second-hop one. A
+caller with no access to the model gets the denial `search_context` gives, and
+a denied request logs nothing. `entity_scope` is not offered on this tool:
+declared scope would have to decide which intermediate entities the walk may
+cross, and filtering only the answer would let an excluded entity shape it
+invisibly. Pass `relation_types` and `term` to narrow a walk instead.
+
+**Bounded output.** `limit` caps the edges returned and `truncated` is `true`
+whenever authorized edges were withheld to honor it, so a short list is never
+mistaken for the whole neighborhood; the walk stops at the hop where the cap
+bites. Every read carries `max_scan_rows`, so a hub whose edges outnumber the
+scan budget fails with a `response_limit` error rather than a quietly partial
+graph. A start entity with no authorized edges returns an empty answer, which
+a caller cannot tell from an entity with none.
+
+### Publishing edges
+
+Declare a Python transform model with
+`agent_context: {contract: agent_context/v1, grain: context_entity_edges}` that
+descends from `document_chunks`. `stel.agent_context.project_context_entity_edge`
+builds each row. Its `context_id` is a required argument: an extractor's
+`document_id` is the same identifier only when the project configures it that
+way (the demo does, with `document_id_field: context_id`), and attaching a fact
+to the wrong context would let the wrong grants decide who reads it. Each
+endpoint is encoded exactly as `project_entity_link` encodes a link, so it
+carries the `entity_id` that context's links carry. See
+[Agent context contract v1](architecture/agent-context-v1.md#context_entity_edges)
+for the columns, and `validate_context_entity_edges` for the check that every
+edge names a context that exists. A project that declares no edges model is
+unchanged: the tool answers `capability_unavailable` for it.
 
 ## Lean and full results
 

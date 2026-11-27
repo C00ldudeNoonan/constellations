@@ -14,3 +14,4 @@ class AgentContextGrain(StrEnum):
     DOCUMENT_REGISTRY = "document_registry"
     DOCUMENT_CHUNKS = "document_chunks"
     CONTEXT_ENTITY_LINKS = "context_entity_links"
+    CONTEXT_ENTITY_EDGES = "context_entity_edges"

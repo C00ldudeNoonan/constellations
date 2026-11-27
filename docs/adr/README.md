@@ -78,6 +78,7 @@ history (issue #311).
 | [0066](0066-built-in-adapters-and-stores-resolve-by-type-on-first-use.md) | Built-in warehouse adapters and retrieval stores resolve by type on first use, and what validation checks lives in modules that import no implementation, so reading a project imports no dataframe library and only the active adapter | accepted |
 | [0067](0067-summary-pages-are-an-offline-experiment-and-adoption-is-deferred.md) | Summary pages are evaluated offline on frozen governed evidence; a `page:` model type is deferred until a reviewed held-out run | accepted |
 | [0068](0068-variant-selection-is-an-offline-library-and-adoption-is-deferred-to-a-live-run.md) | Variant selection by quality, cost and latency is an offline library over supplied evidence with a frozen-selection holdout and a reviewable diff; adoption of any live result is deferred until a reviewed benchmark exists | accepted |
+| [0069](0069-entity-neighborhoods-are-served-from-a-declared-edge-grain-authorized-per-context.md) | Entity neighborhoods are served from a declared `context_entity_edges` grain whose every edge names the context that asserts it, and an edge is returned and walked only when the caller may read that context | accepted |
 
 ## When to write one
 

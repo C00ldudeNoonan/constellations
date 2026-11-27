@@ -6960,7 +6960,7 @@ still reports the real published row count, matching what a full scan would
 have found.
 
 **`mcp_query_log`** (issues #329, #528) — one row per served tool call, for
-all four tools: `logged_at`, `tool`, `request_id`, `client_name`,
+all five tools: `logged_at`, `tool`, `request_id`, `client_name`,
 `client_version`, `transport`, `principal_id`, `tenant_id`, `model_name`,
 `target_id`, `mode`, `query_fingerprint`, `requested_limit`,
 `candidate_limit`, `filters`, `result_count`, `zero_results`,

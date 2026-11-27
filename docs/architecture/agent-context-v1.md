@@ -99,6 +99,34 @@ entities without duplicating registry rows.
 | `recorded_to` | timestamp | yes | Exclusive UTC system-time boundary; null means current. |
 | `link_provenance_fingerprint` | string | no | One-way identity of link derivation provenance. |
 
+### `context_entity_edges`
+
+One row per fact a context asserts between two entities (issue #796, ALE-424).
+Primary key: `context_entity_edge_id`. Foreign key:
+`context_id -> document_chunks.context_id`. `get_entity_neighbors` reads this
+grain; it is optional, and a project without it behaves as before.
+
+| Field | Logical type | Null | Meaning |
+| --- | --- | --- | --- |
+| `context_entity_edge_id` | string | no | Stable identity from `(context_id, relation_id)`. |
+| `context_id` | string | no | The context that asserts the fact, and the one a caller must be authorized to read. |
+| `relation_id` | string | no | The extractor's stable relation identity. |
+| `relation_type` | string | no | Relation semantic, for example `owns`. |
+| `directed` | boolean | no | False for a symmetric relation such as co-occurrence. |
+| `subject_entity_namespace`, `subject_entity_name`, `subject_entity_id`, `subject_entity_key` | string, string, string, JSON | no | The subject, encoded as `context_entity_links` encodes an entity. |
+| `object_entity_namespace`, `object_entity_name`, `object_entity_id`, `object_entity_key` | string, string, string, JSON | no | The object, likewise. |
+| `confidence` | float | yes | Extractor confidence in `[0, 1]`. |
+| `validity_known`, `valid_from`, `valid_to` | boolean, timestamp, timestamp | no, yes, yes | Business-time interval, with the same rules as the document grains: half-open, a null end open, no `valid_to` without `valid_from`. |
+| `recorded_from`, `recorded_to` | timestamp | no, yes | System-time boundary; null `recorded_to` is current. |
+| `edge_provenance_fingerprint` | string | no | One-way identity of edge derivation provenance. |
+
+The edge's `context_id` is explicit, never inferred. An extractor's `document_id`
+and a context's `context_id` are the same identifier only when a project
+configures them to be, so `project_context_entity_edge` takes the context as a
+required argument and `validate_context_entity_edges` fails publication for an
+edge whose context does not exist, rather than leaving it to be skipped silently
+at serving time. See [ADR-0069](../adr/0069-entity-neighborhoods-are-served-from-a-declared-edge-grain-authorized-per-context.md).
+
 #### Projecting `link_entities` output into this grain
 
 The `link_entities` transform (see the main README) resolves entity mentions to

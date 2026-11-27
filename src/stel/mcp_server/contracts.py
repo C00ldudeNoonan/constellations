@@ -492,3 +492,103 @@ class GetContextLineageResponse(BaseModel):
     schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
     record: ContextLineageRecord | None = None
     error: ToolError | None = None
+
+
+class EdgeDirection(StrEnum):
+    """An edge's orientation relative to the entity it was reached from."""
+
+    OUTGOING = "outgoing"
+    INCOMING = "incoming"
+    UNDIRECTED = "undirected"
+
+
+class GraphEntity(BaseModel):
+    model_config = _STRICT_CONFIG
+
+    namespace: str
+    name: str
+    entity_id: str
+    entity_key: JsonValue
+
+
+class EntityEdge(BaseModel):
+    """One asserted fact between two entities, with the passage that asserts it.
+
+    `source` is the entity the walk reached the edge from and `target` the one it
+    leads to, so a caller can follow `target` without reading `direction`;
+    `direction` says whether the fact itself points from `source` to `target`,
+    the other way, or is symmetric. `document_id`, `document_version_id`,
+    `context_id` and `citation` come from the authorized context row, never from
+    the edge table.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    edge_id: str
+    hop: int
+    relation_type: str
+    direction: EdgeDirection
+    source: GraphEntity
+    target: GraphEntity
+    relation_id: str
+    confidence: float | None
+    interval: ContextInterval
+    context_id: str
+    document_id: str
+    document_version_id: str
+    citation: CitationDescriptor
+
+
+class GetEntityNeighborsRequest(BaseModel):
+    """Entity-neighborhood request: exactly one of `entity_id` or `term`."""
+
+    model_config = _STRICT_CONFIG
+
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
+    model: str = Field(min_length=1, max_length=128)
+    entity_id: str | None = None
+    term: str | None = Field(default=None, min_length=1, max_length=256)
+    hops: int = Field(default=1, ge=1, le=3)
+    relation_types: tuple[str, ...] = Field(default=(), max_length=32)
+    as_of: datetime | None = None
+    limit: int = Field(default=25, ge=1, le=200)
+
+    @field_validator("entity_id")
+    @classmethod
+    def _validate_entity_id(cls, value: str | None) -> str | None:
+        if value is not None and not _STABLE_ID_PATTERN.fullmatch(value):
+            raise ValueError("stable IDs must be 32 lowercase hexadecimal characters")
+        return value
+
+    @field_validator("as_of")
+    @classmethod
+    def _validate_as_of(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("as_of must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> GetEntityNeighborsRequest:
+        if (self.entity_id is None) == (self.term is None):
+            raise ValueError("name exactly one of entity_id or term")
+        return self
+
+
+class GetEntityNeighborsResponse(BaseModel):
+    """The edges within `hops` of the start entity.
+
+    `truncated` is True whenever authorized edges were withheld to honor `limit`,
+    so a short list is never mistaken for the whole neighborhood. `edges` are
+    ordered by hop, then relation type, then entity ids, so two calls over the
+    same data agree.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    schema_version: Literal["mcp_context/v2"] = MCP_CONTEXT_SCHEMA_VERSION
+    start: tuple[GraphEntity, ...] = ()
+    edges: tuple[EntityEdge, ...] = ()
+    hops: int | None = None
+    as_of: datetime | None = None
+    truncated: bool = False
+    error: ToolError | None = None
